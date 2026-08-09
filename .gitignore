@@ -1,0 +1,39 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+node_modules/
+
+# Local chat-selection files may identify private Telegram dialogs.
+config.yml
+config.yaml
+
+# Telegram sessions contain reusable account authorization credentials.
+*.session
+*.session-journal
+*.session-shm
+*.session-wal
+
+# Archive state and downloaded private data.
+data/*
+!data/.gitkeep
+downloads/*
+!downloads/.gitkeep
+
+# SQLite sidecars and partial downloads.
+*.db-shm
+*.db-wal
+*.db
+*.sqlite
+*.sqlite3
+*.part

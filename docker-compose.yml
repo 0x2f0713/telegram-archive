@@ -1,0 +1,44 @@
+services:
+  telegram-archiver:
+    build: .
+    image: telegram-archiver:local
+    env_file:
+      - .env
+    environment:
+      TG_SESSION_NAME: /app/data/telegram_session
+      DATABASE_URL: sqlite:////app/data/archive.db
+      DOWNLOAD_DIR: /app/downloads
+    volumes:
+      - archive-data:/app/data
+      - archive-downloads:/app/downloads
+    command: listen
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 45s
+
+  telegram-web:
+    build: .
+    image: telegram-archiver:local
+    profiles:
+      - web
+    env_file:
+      - .env
+    environment:
+      TG_SESSION_NAME: /app/data/telegram_session
+      DATABASE_URL: sqlite:////app/data/archive.db
+      DOWNLOAD_DIR: /app/downloads
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: 8686
+    volumes:
+      - archive-data:/app/data
+      - archive-downloads:/app/downloads
+    ports:
+      - "127.0.0.1:${WEB_HOST_PORT:-8686}:8686"
+    command: web
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 45s
+
+volumes:
+  archive-data:
+  archive-downloads:

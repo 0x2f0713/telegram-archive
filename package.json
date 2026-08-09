@@ -1,0 +1,16 @@
+{
+  "name": "telegram-archiver-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Locally bundled dashboard assets for Telegram Archiver",
+  "scripts": {
+    "build:web": "esbuild app/web/frontend/dashboard.js --bundle --minify --sourcemap --outdir=app/web/static/assets --entry-names=dashboard --asset-names=fonts/[name]-[hash] --loader:.woff2=file"
+  },
+  "dependencies": {
+    "@fontsource-variable/geist": "^5.3.0",
+    "gsap": "^3.15.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}

@@ -1,0 +1,5 @@
+chats:
+  - id: -1001234567890
+    enabled: true
+  - id: -1009876543210
+    enabled: false

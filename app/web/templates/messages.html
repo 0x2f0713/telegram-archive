@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Messages | Telegram Archiver{% endblock %}
+{% block content %}
+<header class="page-heading explorer-heading">
+  <div><p class="eyebrow">Archive explorer</p><h1>Find the exact record.</h1><p>Search content, sender names, filenames, chat titles, dates, and download outcomes.</p></div>
+  <div class="heading-actions"><span class="result-count">{{ "{:,}".format(messages.total) }} results</span><a class="button secondary" href="{{ export_url }}">Export this view</a></div>
+</header>
+
+<form class="filter-panel" method="get" action="/messages" role="search" data-loading-form>
+  <div class="field field-search"><label for="q">Search archive</label><input id="q" name="q" type="search" value="{{ query.search }}" placeholder="Caption, sender, filename, or chat" autocomplete="off"><small>Press <kbd>/</kbd> anywhere on this page to focus search.</small></div>
+  <div class="field"><label for="chat">Chat</label><select id="chat" name="chat"><option value="">All chats</option>{% for chat in chats %}<option value="{{ chat.telegram_chat_id }}" {% if query.chat_id == chat.telegram_chat_id %}selected{% endif %}>{{ chat.title }}</option>{% endfor %}</select></div>
+  <div class="field"><label for="status">Download state</label><select id="status" name="status"><option value="">All states</option>{% for status, count in status_options %}<option value="{{ status }}" {% if query.status == status %}selected{% endif %}>{{ status|replace('_', ' ') }} ({{ count }})</option>{% endfor %}</select></div>
+  <div class="field"><label for="media_type">Media type</label><select id="media_type" name="media_type"><option value="">All media</option>{% for media_type, count in media_options %}<option value="{{ media_type }}" {% if query.media_type == media_type %}selected{% endif %}>{{ media_type }} ({{ count }})</option>{% endfor %}</select></div>
+  <div class="field"><label for="since">From date</label><input id="since" name="since" type="date" value="{{ query.since.isoformat() if query.since else '' }}"></div>
+  <div class="field"><label for="until">Through date</label><input id="until" name="until" type="date" value="{{ query.until.isoformat() if query.until else '' }}"></div>
+  <div class="field"><label for="sort">Sort records</label><select id="sort" name="sort"><option value="newest" {% if query.sort == 'newest' %}selected{% endif %}>Newest first</option><option value="oldest" {% if query.sort == 'oldest' %}selected{% endif %}>Oldest first</option><option value="largest" {% if query.sort == 'largest' %}selected{% endif %}>Largest media first</option><option value="most_retried" {% if query.sort == 'most_retried' %}selected{% endif %}>Most retried first</option></select></div>
+  <label class="checkbox-field"><input name="media_only" type="checkbox" value="true" {% if query.media_only %}checked{% endif %}><span>Media only</span></label>
+  <div class="filter-actions"><button class="button primary" type="submit">Apply filters</button><a class="button text-button" href="/messages">Clear all</a></div>
+</form>
+
+<nav class="quick-filters" aria-label="Common message filters"><span>Quick views</span><a href="/messages?status=failed&media_only=true">Failed media</a><a href="/messages?status=completed&media_only=true">Completed files</a><a href="/messages?media_type=photo&media_only=true">Photos</a><a href="/messages?media_type=video&media_only=true">Videos</a></nav>
+
+{% if messages.items %}
+<div class="table-shell desktop-results">
+  <table class="data-table messages-table">
+    <thead><tr><th scope="col">Chat and sender</th><th scope="col">Message</th><th scope="col">Media</th><th scope="col">State</th><th scope="col">Date</th></tr></thead>
+    <tbody>{% for message in messages.items %}<tr><td><a class="row-title" href="/messages/{{ message.id }}">{{ message.chat_title }}</a><span class="row-subtitle">{{ message.sender_name or ('Sender ' ~ message.sender_id if message.sender_id else 'Unknown sender') }}</span></td><td class="message-cell">{{ (message.text or message.filename or 'Media message')|truncate(150) }}</td><td>{{ message.media_type or 'None' }}{% if message.media_size is not none %}<span class="row-subtitle">{{ message.media_size|bytes }}</span>{% endif %}</td><td><span class="status status-{{ message.download_status }}"><i aria-hidden="true"></i>{{ message.download_status|replace('_', ' ') }}</span></td><td><time datetime="{{ message.message_date.isoformat() }}">{{ message.message_date|datetime }}</time></td></tr>{% endfor %}</tbody>
+  </table>
+</div>
+
+<div class="mobile-message-list" aria-label="Message results">
+  {% for message in messages.items %}<a href="/messages/{{ message.id }}" class="mobile-message-card"><span class="mobile-card-top"><b>{{ message.chat_title }}</b><span class="status status-{{ message.download_status }}"><i aria-hidden="true"></i>{{ message.download_status|replace('_', ' ') }}</span></span><strong>{{ message.sender_name or 'Unknown sender' }}</strong><p>{{ (message.text or message.filename or 'Media message')|truncate(180) }}</p><span class="mobile-card-foot"><span>{{ message.media_type or 'text' }}{% if message.media_size is not none %}, {{ message.media_size|bytes }}{% endif %}</span><time datetime="{{ message.message_date.isoformat() }}">{{ message.message_date|datetime }}</time></span></a>{% endfor %}
+</div>
+
+<nav class="pagination" aria-label="Message pages"><div>{% if previous_url %}<a class="button secondary" href="{{ previous_url }}" rel="prev">Previous</a>{% endif %}</div><span>Page {{ messages.page }} of {{ messages.pages }}</span><div>{% if next_url %}<a class="button secondary" href="{{ next_url }}" rel="next">Next</a>{% endif %}</div></nav>
+{% else %}
+<div class="empty-state"><span class="empty-mark" aria-hidden="true"></span><strong>No messages match this view.</strong><p>Clear a filter, widen the date range, or run a sync if the archive is still empty.</p><a class="button secondary" href="/messages">Clear filters</a></div>
+{% endif %}
+{% endblock %}

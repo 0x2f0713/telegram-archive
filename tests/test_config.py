@@ -1,0 +1,54 @@
+from pathlib import Path
+
+import pytest
+
+from app.config import ConfigurationError, Settings
+
+
+def test_web_default_port_is_8686() -> None:
+    assert Settings(_env_file=None).web_port == 8686
+
+
+def test_environment_configuration_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TARGET_CHATS", "-1001, -1002,-1001")
+    monkeypatch.setenv("DOWNLOAD_PHOTOS", "false")
+    monkeypatch.setenv("MAX_FILE_SIZE_MB", "25")
+    settings = Settings(_env_file=None)
+
+    assert settings.configured_chat_ids == (-1001, -1002)
+    assert settings.download_photos is False
+    assert settings.max_file_size_bytes == 25 * 1024 * 1024
+
+
+def test_yaml_and_environment_chat_configuration(tmp_path: Path) -> None:
+    yaml_file = tmp_path / "chats.yml"
+    yaml_file.write_text(
+        "chats:\n  - id: -1002\n    enabled: true\n  - id: -1003\n    enabled: false\n",
+        encoding="utf-8",
+    )
+    settings = Settings(_env_file=None, target_chats="-1001,-1002", config_file=yaml_file)
+
+    assert settings.configured_chat_ids == (-1001, -1002)
+
+
+def test_invalid_target_chat_has_clear_error() -> None:
+    settings = Settings(_env_file=None, target_chats="not-an-id")
+
+    with pytest.raises(ConfigurationError, match="invalid Telegram chat ID"):
+        _ = settings.configured_chat_ids
+
+
+def test_missing_credentials_do_not_expose_secrets() -> None:
+    settings = Settings(_env_file=None)
+
+    with pytest.raises(ConfigurationError, match="TG_API_ID and TG_API_HASH"):
+        settings.require_telegram_credentials()
+
+
+def test_yaml_enabled_must_be_boolean(tmp_path: Path) -> None:
+    yaml_file = tmp_path / "chats.yml"
+    yaml_file.write_text("chats:\n  - id: -1001\n    enabled: 'false'\n", encoding="utf-8")
+    settings = Settings(_env_file=None, config_file=yaml_file)
+
+    with pytest.raises(ConfigurationError, match="must be true or false"):
+        _ = settings.configured_chat_ids

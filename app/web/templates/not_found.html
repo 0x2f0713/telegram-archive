@@ -1,0 +1,5 @@
+{% extends "base.html" %}
+{% block title %}Not found | Telegram Archiver{% endblock %}
+{% block content %}
+<section class="not-found"><span class="not-found-code">404</span><div><p class="eyebrow">Unknown archive route</p><h1>This path is not in the index.</h1><p><code>/{{ unknown_path }}</code> does not match a dashboard page or stored message. Return to a known view without changing the archive.</p><div class="hero-actions"><a class="button primary" href="/">Return to overview</a><a class="button text-button" href="/messages">Search messages</a></div></div></section>
+{% endblock %}

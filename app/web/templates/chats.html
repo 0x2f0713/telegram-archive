@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}Chat selection | Telegram Archiver{% endblock %}
+{% block content %}
+<header class="page-heading chat-selection-heading">
+  <div>
+    <p class="eyebrow">Archive coverage</p>
+    <h1>Choose what stays.</h1>
+    <p>Select individual dialogs, every dialog your account can access, or the legacy environment configuration. Saved choices are shared by sync, listen, web, and TUI.</p>
+  </div>
+  <div class="heading-actions">
+    <span class="selection-mode-badge">{{ selection.mode|capitalize }} mode</span>
+    <span class="result-count">{{ configured_chat_ids|length }} selected · {{ chats|length }} accessible</span>
+    <a class="button secondary" href="/chats?refresh=true">Refresh Telegram</a>
+  </div>
+</header>
+
+{% if selection_saved %}
+<div class="selection-feedback success" role="status" aria-live="polite">
+  <strong>Chat selection saved.</strong>
+  <span>Restart a running sync or listener process to apply the new targets.</span>
+</div>
+{% endif %}
+
+{% if discovery_error %}
+<div class="selection-feedback error" role="alert">
+  <strong>Telegram dialog refresh is unavailable.</strong>
+  <span>{{ discovery_error }}</span>
+  <a href="/auth/telegram">Check Telegram account</a>
+</div>
+{% endif %}
+
+<form class="selection-form" method="post" action="/chats/selection" data-chat-selection>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <fieldset class="selection-modes">
+    <legend>Selection source</legend>
+    <label class="selection-mode-card">
+      <input type="radio" name="mode" value="specific" {% if selection.mode == 'specific' %}checked{% endif %}>
+      <span class="mode-copy"><strong>Specific chats</strong><small>Only the dialogs checked below are archived.</small></span>
+      <span class="mode-mark" aria-hidden="true"></span>
+    </label>
+    <label class="selection-mode-card selection-mode-all">
+      <input type="radio" name="mode" value="all" {% if selection.mode == 'all' %}checked{% endif %}>
+      <span class="mode-copy"><strong>All accessible chats</strong><small>Includes every current dialog and new dialogs found at worker startup.</small></span>
+      <span class="mode-mark" aria-hidden="true"></span>
+    </label>
+    <label class="selection-mode-card">
+      <input type="radio" name="mode" value="environment" {% if selection.mode == 'environment' %}checked{% endif %}>
+      <span class="mode-copy"><strong>Environment defaults</strong><small>Use TARGET_CHATS and enabled YAML entries ({{ environment_chat_ids|length }} configured).</small></span>
+      <span class="mode-mark" aria-hidden="true"></span>
+    </label>
+  </fieldset>
+
+  <div class="all-mode-warning" data-all-mode-warning {% if selection.mode != 'all' %}hidden{% endif %}>
+    <strong>Broad coverage is active.</strong>
+    <p>This includes private chats as well as groups and channels, but only when Telegram exposes them to this authenticated account. Restart workers after changing this mode.</p>
+  </div>
+
+  <section class="chat-picker" aria-labelledby="chat-picker-title">
+    <div class="chat-picker-toolbar">
+      <div>
+        <p class="eyebrow">Accessible dialogs</p>
+        <h2 id="chat-picker-title">Select archive targets</h2>
+      </div>
+      <label class="chat-picker-search">
+        <span>Filter accessible chats</span>
+        <input type="search" placeholder="Filter by title, type, username, or ID" autocomplete="off" data-chat-filter>
+      </label>
+      <div class="chat-picker-actions">
+        <button type="button" class="button secondary" data-select-visible>Select visible</button>
+        <button type="button" class="button text-button" data-clear-visible>Clear visible</button>
+      </div>
+    </div>
+
+    <div class="selection-summary" aria-live="polite" aria-atomic="true" data-selection-summary>
+      {{ configured_chat_ids|length }} of {{ chats|length }} accessible dialogs selected
+      {% if not dialogs_refreshed %} · cached list{% endif %}
+    </div>
+
+    {% if chats %}
+    <div class="chat-choice-list" data-chat-choice-list>
+      {% for chat in chats %}
+      {% set is_specific = chat.telegram_chat_id in specific_chat_ids %}
+      {% set is_environment = chat.telegram_chat_id in environment_chat_ids %}
+      {% set is_effective = chat.telegram_chat_id in configured_chat_ids %}
+      {% set is_specific_draft = is_specific if selection.mode == 'specific' else is_effective %}
+      <article class="chat-choice" data-chat-choice data-search="{{ chat.title }} {{ chat.username or '' }} {{ chat.type }} {{ chat.telegram_chat_id }}" data-specific-selected="{{ 'true' if is_specific_draft else 'false' }}" data-environment-selected="{{ 'true' if is_environment else 'false' }}">
+        <label class="choice-toggle">
+          <input type="checkbox" name="chat_id" value="{{ chat.telegram_chat_id }}" {% if is_effective %}checked{% endif %}>
+          <span class="choice-check" aria-hidden="true"></span>
+          <span class="chat-identity">
+            <span class="chat-type">{{ chat.type }}</span>
+            <strong>{{ chat.title }}</strong>
+            <small class="chat-handle">{{ '@' ~ chat.username if chat.username else 'No public username' }}</small>
+            <code class="chat-id">Telegram ID {{ chat.telegram_chat_id }}</code>
+          </span>
+          <span class="choice-metrics"><span><b>{{ "{:,}".format(chat.message_count) }}</b> messages</span><span><b>{{ "{:,}".format(chat.completed_count) }}</b> files</span><span><b>{{ "{:,}".format(chat.failed_count) }}</b> failed</span></span>
+          <span class="choice-state">{{ 'Selected' if is_effective else 'Not selected' }}</span>
+        </label>
+        <div class="choice-actions">
+          <button type="button" data-copy-value="{{ chat.telegram_chat_id }}">Copy ID</button>
+          <a href="/messages?chat={{ chat.telegram_chat_id }}">View messages</a>
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+    <p class="chat-filter-empty" data-chat-filter-empty hidden>No accessible chats match that filter.</p>
+    {% else %}
+    <div class="empty-state compact-empty">
+      <p>No accessible dialogs are available yet. Connect the Telegram account or refresh this page after joining a chat.</p>
+      <a class="button secondary" href="/auth/telegram">Check Telegram account</a>
+    </div>
+    {% endif %}
+  </section>
+
+  <footer class="selection-save-bar">
+    <div>
+      <strong data-selection-mode-label>{{ selection.mode|capitalize }} mode</strong>
+      <span>Changes take effect on the next sync or listener start.</span>
+    </div>
+    <button class="button primary" type="submit" data-save-selection {% if discovery_error %}disabled aria-disabled="true"{% endif %}>Save selection</button>
+  </footer>
+</form>
+{% endblock %}
