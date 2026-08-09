@@ -20,6 +20,10 @@ from app.database.selection import ChatSelectionRepository
 from app.database.session import Database
 from app.services.archive import ArchiveService
 from app.services.chat_selection import ChatSelectionService
+from app.services.content_types import (
+    ALL_CONTENT_TYPES,
+    normalize_content_types,
+)
 from app.services.downloader import MediaDownloader
 from app.telegram.client import (
     TelegramAccessError,
@@ -71,11 +75,30 @@ def _parse_day(value: str | None, option: str, *, end_exclusive: bool = False) -
     return parsed + timedelta(days=1) if end_exclusive else parsed
 
 
-def _archive_stack(settings: Settings) -> tuple[Database, ArchiveRepository, ArchiveService]:
+def _parse_content_types(value: str | None) -> frozenset[str] | None:
+    if value is None:
+        return None
+    selected = normalize_content_types((value,))
+    return None if selected == ALL_CONTENT_TYPES else selected
+
+
+def _archive_stack(
+    settings: Settings,
+    content_types: frozenset[str] | None = None,
+) -> tuple[Database, ArchiveRepository, ArchiveService]:
     database = Database(settings.database_url)
     repository = ArchiveRepository(database)
     downloader = MediaDownloader(settings, repository)
-    return database, repository, ArchiveService(settings, repository, downloader)
+    return (
+        database,
+        repository,
+        ArchiveService(
+            settings,
+            repository,
+            downloader,
+            content_types,
+        ),
+    )
 
 
 @app.command("login")
@@ -136,6 +159,14 @@ def sync_command(
     limit: int | None = typer.Option(None, "--limit", min=1, help="Maximum messages per chat."),
     since: str | None = typer.Option(None, "--since", help="Include messages on/after YYYY-MM-DD."),
     until: str | None = typer.Option(None, "--until", help="Include messages through YYYY-MM-DD."),
+    content_types: str | None = typer.Option(
+        None,
+        "--types",
+        help=(
+            "Comma-separated content types: text, photo, video, video_note, voice, "
+            "audio, animation, sticker, document, other. Defaults to all."
+        ),
+    ),
 ) -> None:
     """Incrementally archive historical messages from configured chats."""
 
@@ -145,8 +176,9 @@ def sync_command(
         until_date = _parse_day(until, "--until", end_exclusive=True)
         if since_date and until_date and since_date >= until_date:
             raise ConfigurationError("--since must be on or before --until")
+        selected_types = _parse_content_types(content_types)
 
-        database, repository, archive = _archive_stack(settings)
+        database, repository, archive = _archive_stack(settings, selected_types)
         client = create_client(settings)
         try:
             await database.initialize()
@@ -174,6 +206,8 @@ def sync_command(
                 limit=limit,
                 since=since_date,
                 until=until_date,
+                concurrency=settings.download_concurrency,
+                content_types=selected_types,
             )
             console.print(
                 f"[green]Sync complete:[/green] {result.messages} messages processed, "
@@ -187,12 +221,19 @@ def sync_command(
 
 
 @app.command("listen")
-def listen_command() -> None:
+def listen_command(
+    content_types: str | None = typer.Option(
+        None,
+        "--types",
+        help="Comma-separated Telegram content types to archive. Defaults to all.",
+    ),
+) -> None:
     """Monitor configured chats and archive new messages and edits."""
 
     async def command() -> None:
         settings = _settings()
-        database, repository, archive = _archive_stack(settings)
+        selected_types = _parse_content_types(content_types)
+        database, repository, archive = _archive_stack(settings, selected_types)
         client = create_client(settings)
         try:
             await database.initialize()
@@ -341,12 +382,19 @@ def stats_command() -> None:
 
 
 @app.command("retry-failed")
-def retry_failed_command() -> None:
+def retry_failed_command(
+    content_types: str | None = typer.Option(
+        None,
+        "--types",
+        help="Retry only these comma-separated Telegram media types. Defaults to all.",
+    ),
+) -> None:
     """Retry media downloads currently marked failed."""
 
     async def command() -> None:
         settings = _settings()
-        database, repository, archive = _archive_stack(settings)
+        selected_types = _parse_content_types(content_types)
+        database, repository, archive = _archive_stack(settings, selected_types)
         client = create_client(settings)
         try:
             await database.initialize()

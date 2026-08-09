@@ -8,8 +8,9 @@ from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import func, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.database.models import Chat, Message, utc_now
+from app.database.models import Chat, ContentSyncCheckpoint, Message, utc_now
 from app.database.session import Database
 from app.telegram.entities import ChatInfo, MessageData
 
@@ -33,6 +34,7 @@ class RetryCandidate:
     telegram_message_id: int
     media_path: str | None
     download_status: str
+    media_type: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +131,70 @@ class ArchiveRepository:
                 )
                 .values(last_synced_message_id=message_id, updated_at=utc_now())
             )
+
+    async def get_content_checkpoints(
+        self,
+        telegram_chat_id: int,
+        content_types: Sequence[str],
+    ) -> dict[str, int | None]:
+        """Return a high-water mark for each explicit content category."""
+
+        checkpoints = {content_type: None for content_type in content_types}
+        if not checkpoints:
+            return checkpoints
+        async with self.database.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        ContentSyncCheckpoint.content_type,
+                        ContentSyncCheckpoint.last_scanned_message_id,
+                    ).where(
+                        ContentSyncCheckpoint.telegram_chat_id == telegram_chat_id,
+                        ContentSyncCheckpoint.content_type.in_(tuple(checkpoints)),
+                    )
+                )
+            ).all()
+        checkpoints.update({content_type: message_id for content_type, message_id in rows})
+        return checkpoints
+
+    async def advance_content_checkpoints(
+        self,
+        telegram_chat_id: int,
+        content_types: Sequence[str],
+        message_id: int,
+    ) -> None:
+        """Advance selected category marks monotonically in one SQLite statement."""
+
+        if not content_types:
+            return
+        now = utc_now()
+        statement = sqlite_insert(ContentSyncCheckpoint).values(
+            [
+                {
+                    "telegram_chat_id": telegram_chat_id,
+                    "content_type": content_type,
+                    "last_scanned_message_id": message_id,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                for content_type in content_types
+            ]
+        )
+        statement = statement.on_conflict_do_update(
+            index_elements=(
+                ContentSyncCheckpoint.telegram_chat_id,
+                ContentSyncCheckpoint.content_type,
+            ),
+            set_={
+                "last_scanned_message_id": func.max(
+                    ContentSyncCheckpoint.last_scanned_message_id,
+                    statement.excluded.last_scanned_message_id,
+                ),
+                "updated_at": now,
+            },
+        )
+        async with self.database.sessions() as session, session.begin():
+            await session.execute(statement)
 
     async def upsert_message(self, data: MessageData) -> tuple[MessageSnapshot, bool]:
         async with self.database.sessions() as session, session.begin():
@@ -258,6 +324,7 @@ class ArchiveRepository:
                             Message.telegram_message_id,
                             Message.media_path,
                             Message.download_status,
+                            Message.media_type,
                         )
                         .where(
                             Message.id > last_id,

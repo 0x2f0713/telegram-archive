@@ -413,6 +413,9 @@ function setupOperationMonitor() {
   const retries = monitor.querySelector("[data-operation-retries]");
   const elapsed = monitor.querySelector("[data-operation-elapsed]");
   const error = monitor.querySelector("[data-operation-error]");
+  const downloadDetails = monitor.querySelector("[data-operation-download-details]");
+  const downloadList = monitor.querySelector("[data-operation-download-list]");
+  const downloadSummary = monitor.querySelector("[data-operation-download-summary]");
   const logs = monitor.querySelector("[data-operation-logs]");
   const stopForm = monitor.querySelector("[data-operation-stop-form]");
   let timer = 0;
@@ -422,6 +425,55 @@ function setupOperationMonitor() {
     "status-failed", "status-cancelled", "status-interrupted",
   ];
   const formatted = (value) => new Intl.NumberFormat().format(value || 0);
+  const humanBytes = (value) => {
+    let size = Number(value) || 0;
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let unit = 0;
+    while (size >= 1024 && unit < units.length - 1) {
+      size /= 1024;
+      unit += 1;
+    }
+    return `${size.toFixed(1)} ${units[unit]}`;
+  };
+  const renderDownloadTasks = (tasks) => {
+    if (!downloadList) return;
+    downloadList.replaceChildren();
+    const entries = Array.isArray(tasks) ? tasks : [];
+    const active = entries.filter((task) => task.status !== "completed").length;
+    if (downloadSummary) {
+      downloadSummary.textContent = `${active} active · ${entries.length} shown`;
+    }
+    if (!entries.length) {
+      const empty = document.createElement("p");
+      empty.className = "operation-download-empty";
+      empty.textContent = "No media transfer is active.";
+      downloadList.append(empty);
+      return;
+    }
+    entries.forEach((task) => {
+      const current = Number(task.current) || 0;
+      const total = Number(task.total) || 0;
+      const percent = Number(task.percent) || (total ? current / total * 100 : 0);
+      const row = document.createElement("article");
+      row.className = "operation-download-progress";
+      const head = document.createElement("div");
+      head.className = "operation-download-progress-head";
+      const filename = document.createElement("strong");
+      filename.textContent = task.filename || "Unnamed media";
+      const percentage = document.createElement("span");
+      percentage.textContent = `${percent.toFixed(1)}%`;
+      head.append(filename, percentage);
+      const bar = document.createElement("progress");
+      bar.value = current;
+      bar.max = total || 1;
+      bar.setAttribute("aria-label", `Download progress for ${task.filename || "media"}`);
+      bar.textContent = `${percent.toFixed(1)}%`;
+      const stats = document.createElement("small");
+      stats.textContent = `${humanBytes(current)} / ${humanBytes(total)} · ${humanBytes(task.speed || 0)}/s · ${task.status || "downloading"}`;
+      row.append(head, bar, stats);
+      downloadList.append(row);
+    });
+  };
   const renderLogs = (entries) => {
     if (!logs) return;
     logs.replaceChildren();
@@ -483,6 +535,7 @@ function setupOperationMonitor() {
       error.hidden = !operation.error;
       if (operation.error) error.textContent = operation.error;
     }
+    renderDownloadTasks(operation.download_tasks);
     renderLogs(payload.logs || []);
     if (operation.terminal) {
       window.clearInterval(timer);
@@ -530,8 +583,54 @@ function setupOperationMonitor() {
 }
 
 function setupOperationForms() {
+  document.querySelectorAll("[data-content-type-picker]").forEach((picker) => {
+    const checkboxes = [...picker.querySelectorAll('input[name="content_type"]')];
+    const error = picker.querySelector("[data-content-type-error]");
+    const disclosure = picker.closest("[data-content-disclosure]");
+    const update = () => {
+      const checked = checkboxes.filter((input) => input.checked);
+      picker.classList.toggle("is-invalid", checked.length === 0);
+      if (error && checked.length > 0) error.hidden = true;
+      if (disclosure) {
+        const summary = disclosure.querySelector("summary");
+        const label = disclosure.dataset.contentLabel || "Content types";
+        if (summary) {
+          summary.textContent = checked.length === checkboxes.length
+            ? `${label} · all selected`
+            : `${label} · ${checked.length} of ${checkboxes.length} selected`;
+        }
+      }
+    };
+    picker.querySelectorAll("[data-content-select]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const mode = button.dataset.contentSelect;
+        checkboxes.forEach((input) => {
+          input.checked = mode === "all"
+            || (mode === "media" && input.dataset.downloadable === "true")
+            || (mode === "text" && input.value === "text");
+        });
+        update();
+      });
+    });
+    checkboxes.forEach((input) => input.addEventListener("change", update));
+    update();
+  });
+
   document.querySelectorAll("[data-operation-start-form]").forEach((form) => {
-    form.addEventListener("submit", () => {
+    form.addEventListener("submit", (event) => {
+      const emptyPicker = [...form.querySelectorAll("[data-content-type-picker]")].find(
+        (picker) => !picker.querySelector('input[name="content_type"]:checked'),
+      );
+      if (emptyPicker) {
+        event.preventDefault();
+        emptyPicker.classList.add("is-invalid");
+        const error = emptyPicker.querySelector("[data-content-type-error]");
+        if (error) error.hidden = false;
+        const disclosure = emptyPicker.closest("details");
+        if (disclosure) disclosure.open = true;
+        emptyPicker.querySelector('input[name="content_type"]')?.focus();
+        return;
+      }
       const button = form.querySelector("button[type='submit']");
       if (!button) return;
       button.disabled = true;
@@ -543,6 +642,12 @@ function setupOperationForms() {
     if (!button) return;
     button.disabled = true;
     button.textContent = "Requesting safe stop…";
+  });
+  document.querySelector("[data-operation-resume-form]")?.addEventListener("submit", (event) => {
+    const button = event.currentTarget.querySelector("button[type='submit']");
+    if (!button) return;
+    button.disabled = true;
+    button.textContent = "Resuming…";
   });
 }
 

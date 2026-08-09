@@ -56,8 +56,11 @@ def media_filename(message: MessageData) -> str:
         extension = {
             "photo": ".jpg",
             "video": ".mp4",
+            "video_note": ".mp4",
             "animation": ".mp4",
-            "audio": ".ogg",
+            "voice": ".ogg",
+            "audio": ".mp3",
+            "sticker": ".webp",
         }.get(message.media_type or "", "")
     return sanitize_filename(
         f"{message.telegram_message_id}_{message.media_type or 'media'}{extension}"

@@ -30,6 +30,13 @@ from app.config import ConfigurationError, Settings
 from app.database.dashboard import DashboardRepository, DashboardService, MessageQuery
 from app.database.selection import ChatSelectionRepository
 from app.services.chat_selection import ChatDiscovery, ChatSelectionService
+from app.services.content_types import (
+    ALL_CONTENT_TYPES,
+    CONTENT_TYPE_OPTIONS,
+    ContentTypeSelectionError,
+    canonical_content_type_list,
+    normalize_content_types,
+)
 from app.services.operations import (
     OPERATION_COMMANDS,
     OperationConflictError,
@@ -464,6 +471,7 @@ def create_router(settings: Settings) -> APIRouter:
         job: int | None = Query(default=None, ge=1),
         started: bool = False,
         stopped: bool = False,
+        error: str | None = Query(default=None, max_length=500),
     ) -> HTMLResponse:
         manager: OperationManager = request.app.state.operations
         repository: DashboardRepository = request.app.state.dashboard
@@ -497,20 +505,29 @@ def create_router(settings: Settings) -> APIRouter:
                 "operation_logs": logs,
                 "recent_operations": recent,
                 "selected_chats": chats,
+                "content_type_options": CONTENT_TYPE_OPTIONS,
                 "operation_started": started,
                 "operation_stopped": stopped,
+                "operation_error_message": error,
             }
         )
         return templates.TemplateResponse(request, "operations.html", context)
 
     @router.post("/operations/start")
     async def start_operation(request: Request) -> RedirectResponse:
-        values = await _form_values(request, max_bytes=8192, max_fields=20)
+        values = await _form_values(request, max_bytes=8192, max_fields=30)
         _require_csrf(request, values)
         command = values.get("command", [""])[0].strip().casefold()
         if command not in OPERATION_COMMANDS:
             raise HTTPException(status_code=400, detail="Unsupported operation command")
         parameters: dict[str, object] = {}
+        if command in {"sync", "listen", "retry-failed"} and values.get("content_types_present"):
+            try:
+                selected_types = normalize_content_types(values.get("content_type", []))
+            except ContentTypeSelectionError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if selected_types != ALL_CONTENT_TYPES:
+                parameters["content_types"] = canonical_content_type_list(selected_types)
         if command == "sync":
             raw_chat = values.get("chat", [""])[0].strip()
             raw_limit = values.get("limit", [""])[0].strip()
@@ -553,7 +570,12 @@ def create_router(settings: Settings) -> APIRouter:
         try:
             operation = await manager.start_job(command, parameters)
         except OperationConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            # A normal browser submission should return to the Operations page
+            # with an actionable explanation instead of an opaque JSON/HTML 409.
+            return RedirectResponse(
+                f"/operations?{urlencode({'error': str(exc)})}",
+                status_code=303,
+            )
         return RedirectResponse(
             f"/operations?job={operation['id']}&started=true",
             status_code=303,
@@ -569,6 +591,37 @@ def create_router(settings: Settings) -> APIRouter:
         except OperationNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return RedirectResponse(f"/operations?job={job_id}&stopped=true", status_code=303)
+
+    @router.post("/operations/{job_id}/resume")
+    async def resume_sync_operation(request: Request, job_id: int) -> RedirectResponse:
+        """Resume a previous sync with its original safe, validated parameters."""
+        values = await _form_values(request)
+        _require_csrf(request, values)
+        manager: OperationManager = request.app.state.operations
+        try:
+            previous = await manager.get(job_id)
+        except OperationNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if previous["command"] != "sync":
+            raise HTTPException(status_code=400, detail="Only historical sync operations can resume")
+        if previous["active"]:
+            raise HTTPException(status_code=400, detail="This sync operation is already active")
+        if previous["status"] not in {"cancelled", "interrupted", "failed"}:
+            raise HTTPException(status_code=400, detail="Only unfinished sync operations can resume")
+        parameters = previous.get("parameters")
+        if not isinstance(parameters, dict):
+            raise HTTPException(status_code=400, detail="This sync operation has no resumable parameters")
+        try:
+            operation = await manager.start_job("sync", dict(parameters))
+        except OperationConflictError as exc:
+            return RedirectResponse(
+                f"/operations?job={job_id}&{urlencode({'error': str(exc)})}",
+                status_code=303,
+            )
+        return RedirectResponse(
+            f"/operations?job={operation['id']}&started=true",
+            status_code=303,
+        )
 
     @router.get("/auth/telegram", response_class=HTMLResponse)
     async def telegram_auth_page(request: Request) -> HTMLResponse:

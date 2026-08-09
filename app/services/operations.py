@@ -22,10 +22,16 @@ from app.database.repository import ArchiveRepository
 from app.database.session import Database
 from app.services.archive import ArchiveService, RetryProgress
 from app.services.chat_selection import ChatSelectionService
+from app.services.content_types import (
+    ALL_CONTENT_TYPES,
+    canonical_content_type_list,
+    normalize_content_types,
+)
 from app.services.downloader import MediaDownloader
 from app.telegram.client import connect_authorized, create_client
 from app.telegram.history import SyncProgress, sync_history
 from app.telegram.listener import ListenerProgress, RealtimeListener
+from app.utils.logging import format_bytes
 
 logger = logging.getLogger(__name__)
 OPERATION_COMMANDS = frozenset({"sync", "listen", "retry-failed", "doctor"})
@@ -46,6 +52,16 @@ PERSISTED_PROGRESS_FIELDS = frozenset(
         "error",
         "started_at",
         "finished_at",
+    }
+)
+RUNTIME_PROGRESS_FIELDS = frozenset(
+    {
+        "download_filename",
+        "download_current",
+        "download_total",
+        "download_percent",
+        "download_speed",
+        "download_tasks",
     }
 )
 
@@ -225,7 +241,7 @@ class OperationManager:
         runtime = self._runtime.get(record.id)
         if runtime:
             for key, value in runtime.overlay.items():
-                if key in PERSISTED_PROGRESS_FIELDS:
+                if key in PERSISTED_PROGRESS_FIELDS or key in RUNTIME_PROGRESS_FIELDS:
                     payload[key] = value
         payload["terminal"] = payload["status"] not in ACTIVE_OPERATION_STATUSES
         payload["active"] = payload["status"] in ACTIVE_OPERATION_STATUSES
@@ -322,7 +338,11 @@ class OperationManager:
             return
         previous_phase = runtime.overlay.get("phase")
         runtime.overlay.update(
-            {key: value for key, value in values.items() if key in PERSISTED_PROGRESS_FIELDS}
+            {
+                key: value
+                for key, value in values.items()
+                if key in PERSISTED_PROGRESS_FIELDS or key in RUNTIME_PROGRESS_FIELDS
+            }
         )
         now = monotonic()
         should_flush = force or previous_phase != runtime.overlay.get("phase")
@@ -347,11 +367,97 @@ class OperationManager:
         }
         await self._progress(job_id, **updates)
 
-    def _archive_stack(self) -> tuple[Database, ArchiveRepository, ArchiveService]:
+    @staticmethod
+    def _content_types(parameters: Mapping[str, Any]) -> frozenset[str] | None:
+        raw_values = parameters.get("content_types")
+        if raw_values is None:
+            return None
+        if isinstance(raw_values, str):
+            values = (raw_values,)
+        elif isinstance(raw_values, (list, tuple)):
+            values = tuple(str(value) for value in raw_values)
+        else:
+            raise ConfigurationError("content_types must be a list of Telegram content types")
+        selected = normalize_content_types(values)
+        return None if selected == ALL_CONTENT_TYPES else selected
+
+    def _archive_stack(
+        self,
+        content_types: frozenset[str] | None = None,
+        download_progress: Callable[[str, int, int], None] | None = None,
+    ) -> tuple[Database, ArchiveRepository, ArchiveService]:
         database = Database(self.settings.database_url)
         repository = ArchiveRepository(database)
         downloader = MediaDownloader(self.settings, repository)
-        return database, repository, ArchiveService(self.settings, repository, downloader)
+        return (
+            database,
+            repository,
+            ArchiveService(
+                self.settings,
+                repository,
+                downloader,
+                content_types,
+                download_progress,
+            ),
+        )
+
+    @staticmethod
+    def _download_reporter(context: OperationContext) -> Callable[[str, int, int], None]:
+        """Bridge Telethon's synchronous callback into throttled operation updates."""
+        last_report: dict[str, float] = {}
+        states: dict[str, tuple[int, float, float]] = {}
+        tasks: dict[str, dict[str, Any]] = {}
+
+        def report(filename: str, current: int, total: int) -> None:
+            now = monotonic()
+            previous_report = last_report.get(filename, 0.0)
+            if current < total and now - previous_report < 0.2:
+                return
+            last_report[filename] = now
+            last_current, last_time, previous_speed = states.get(filename, (0, now, 0.0))
+            elapsed = max(0.001, now - last_time)
+            instantaneous_speed = max(0, current - last_current) / elapsed
+            speed = instantaneous_speed if not previous_speed else (
+                previous_speed * 0.7 + instantaneous_speed * 0.3
+            )
+            states[filename] = (current, now, speed)
+            percent = round(current / total * 100, 1) if total else None
+            status = "completed" if total and current >= total else "downloading"
+            tasks[filename] = {
+                "filename": filename,
+                "current": current,
+                "total": total,
+                "percent": percent,
+                "speed": round(speed),
+                "status": status,
+            }
+            # Keep the active list useful without allowing a long sync to grow
+            # the in-memory operation payload without bound.
+            while len(tasks) > 8:
+                oldest = next(iter(tasks))
+                if tasks[oldest]["status"] == "downloading":
+                    break
+                tasks.pop(oldest)
+            snapshot = list(tasks.values())
+            task = asyncio.create_task(
+                context.progress(
+                    force=current >= total,
+                    phase="downloading",
+                    detail=(
+                        f"Downloading {filename} ({percent or 0:.1f}%, "
+                        f"{format_bytes(round(speed))}/s)"
+                    ),
+                    download_filename=filename,
+                    download_current=current,
+                    download_total=total,
+                    download_percent=percent,
+                    download_speed=round(speed),
+                    download_tasks=snapshot,
+                )
+            )
+            task.add_done_callback(lambda completed: completed.exception())
+
+        return report
 
     async def _selected_chats(self, client: Any, repository: ArchiveRepository) -> dict[int, Any]:
         chats = await ChatSelectionService(self.settings, repository).resolve_with_client(client)
@@ -380,7 +486,10 @@ class OperationManager:
         return since, until
 
     async def _run_sync(self, context: OperationContext) -> None:
-        database, repository, archive = self._archive_stack()
+        content_types = self._content_types(context.parameters)
+        database, repository, archive = self._archive_stack(
+            content_types, self._download_reporter(context)
+        )
         client = self.client_factory(self.settings)
         try:
             await database.initialize()
@@ -402,6 +511,11 @@ class OperationManager:
             if limit is not None and limit < 1:
                 raise ConfigurationError("Message limit must be at least 1")
             since, until = self._parse_sync_dates(context.parameters)
+            if content_types is not None:
+                await context.log(
+                    "Selected content types: "
+                    + ", ".join(canonical_content_type_list(content_types))
+                )
             await context.progress(
                 force=True,
                 phase="repairing",
@@ -458,6 +572,8 @@ class OperationManager:
                 limit=limit,
                 since=since,
                 until=until,
+                concurrency=self.settings.download_concurrency,
+                content_types=content_types,
                 stop_event=context.stop_event,
                 progress=sync_progress,
             )
@@ -479,7 +595,10 @@ class OperationManager:
             await database.close()
 
     async def _run_retry_failed(self, context: OperationContext) -> None:
-        database, repository, archive = self._archive_stack()
+        content_types = self._content_types(context.parameters)
+        database, repository, archive = self._archive_stack(
+            content_types, self._download_reporter(context)
+        )
         client = self.client_factory(self.settings)
         try:
             await database.initialize()
@@ -522,7 +641,10 @@ class OperationManager:
             await database.close()
 
     async def _run_listener(self, context: OperationContext) -> None:
-        database, repository, archive = self._archive_stack()
+        content_types = self._content_types(context.parameters)
+        database, repository, archive = self._archive_stack(
+            content_types, self._download_reporter(context)
+        )
         client = self.client_factory(self.settings)
         try:
             await database.initialize()

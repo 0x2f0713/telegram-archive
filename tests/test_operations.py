@@ -68,6 +68,16 @@ async def test_operation_progress_history_and_single_job_exclusion(tmp_path: Pat
             chats_total=2,
             messages_processed=25,
             downloads_completed=3,
+            download_tasks=[
+                {
+                    "filename": "clip.mp4",
+                    "current": 512,
+                    "total": 1024,
+                    "percent": 50.0,
+                    "speed": 256,
+                    "status": "downloading",
+                }
+            ],
         )
         await context.log("First test chat completed")
         await release.wait()
@@ -87,6 +97,16 @@ async def test_operation_progress_history_and_single_job_exclusion(tmp_path: Pat
     assert running["phase"] == "syncing"
     assert running["progress_percent"] == 50.0
     assert running["messages_processed"] == 25
+    assert running["download_tasks"] == [
+        {
+            "filename": "clip.mp4",
+            "current": 512,
+            "total": 1024,
+            "percent": 50.0,
+            "speed": 256,
+            "status": "downloading",
+        }
+    ]
     with pytest.raises(OperationConflictError, match="already active"):
         await manager.start_job("sync")
 
@@ -102,6 +122,28 @@ async def test_operation_progress_history_and_single_job_exclusion(tmp_path: Pat
     assert recent[0]["status"] == "completed"
     await manager.shutdown()
     await database.close()
+
+
+async def test_download_reporter_tracks_each_task_with_speed(tmp_path: Path) -> None:
+    updates: list[dict[str, object]] = []
+
+    class Context:
+        async def progress(self, **values: object) -> None:
+            updates.append(values)
+
+    reporter = OperationManager._download_reporter(Context())  # type: ignore[arg-type]
+    reporter("one.bin", 512, 1024)
+    await asyncio.sleep(0)
+    reporter("two.bin", 1024, 2048)
+    await asyncio.sleep(0)
+
+    assert updates
+    tasks = updates[-1]["download_tasks"]
+    assert isinstance(tasks, list)
+    assert {task["filename"] for task in tasks} == {"one.bin", "two.bin"}
+    assert all("speed" in task and "percent" in task for task in tasks)
+    assert "/s)" in str(updates[-1]["detail"])
+    assert " B/s" not in str(updates[-1]["detail"])
 
 
 async def test_operation_safe_stop_and_restart_recovery(tmp_path: Path) -> None:
@@ -139,3 +181,34 @@ async def test_operation_safe_stop_and_restart_recovery(tmp_path: Path) -> None:
     assert recovered["terminal"] is True
     await manager.shutdown()
     await database.close()
+
+
+def test_operation_content_type_parameters_are_canonical_and_all_is_unfiltered(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    database = Database(settings.database_url)
+    manager = OperationManager(settings, database)
+
+    assert manager._content_types({"content_types": ["images", "voice-messages"]}) == (
+        frozenset({"photo", "voice"})
+    )
+    assert (
+        manager._content_types(
+            {
+                "content_types": [
+                    "text",
+                    "photo",
+                    "video",
+                    "video_note",
+                    "voice",
+                    "audio",
+                    "animation",
+                    "sticker",
+                    "document",
+                    "other",
+                ]
+            }
+        )
+        is None
+    )

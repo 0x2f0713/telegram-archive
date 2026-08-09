@@ -117,11 +117,18 @@ Useful bounded forms are:
 python -m app sync --chat -1001234567890
 python -m app sync --limit 100
 python -m app sync --since 2026-01-01 --until 2026-01-31
+python -m app sync --types text,photo,video,voice
 ```
 
 `--limit` applies per chat. Date boundaries use Telegram message timestamps interpreted in UTC; `--until` includes the entire named day. A range sync deduplicates against SQLite but intentionally does not move the normal full-sync checkpoint, preventing a partial date range from creating a history gap.
 
+`--types` accepts `text`, `photo`, `video`, `video_note`, `voice`, `audio`, `animation`, `sticker`, `document`, and `other`. Common aliases such as `image`, `gif`, `pdf`, and `round-video` are accepted. A captioned video matches both `text` and `video`: a text-only run stores its message/caption metadata but does not download the unselected video. `other` archives the available metadata for polls, contacts, locations, service events, and non-downloadable media.
+
+Explicit category selections maintain independent per-chat checkpoints. A later photo-only run therefore does not lose photos merely because an earlier video-only run scanned beyond them. Selecting all categories, or omitting `--types`, uses the normal full-archive checkpoint. Existing message/file deduplication remains authoritative in both modes.
+
 Each message is committed separately and a per-chat high-water mark is advanced only after valid metadata is stored. Restarting a full sync begins after that mark. The unique `(telegram_chat_id, telegram_message_id)` database constraint is the final deduplication guarantee. Albums remain separate message rows sharing the same `grouped_id`, so every album item is preserved.
+
+Historical sync keeps up to `DOWNLOAD_CONCURRENCY` messages in flight so independent media transfers can overlap; the default is a conservative `2`. Results are settled oldest-first and the checkpoint advances in that same order, even if a newer download finishes first. This preserves crash-safe resume while avoiding the previous one-file-at-a-time bottleneck. Increase the value gradually only when the network and Telegram account remain stable—small values such as `2` to `4` are recommended, and every `FloodWait` is still honored.
 
 At the beginning of a normal sync, failed/in-progress downloads and completed records whose files are missing are repaired before new history is fetched. A failed download can also be retried explicitly:
 
@@ -133,6 +140,7 @@ python -m app retry-failed
 
 ```bash
 python -m app listen
+python -m app listen --types photo,video,video_note
 ```
 
 The listener handles `NewMessage` and `MessageEdited` events only for chats selected when the listener starts. Edits update text and edit timestamps; existing completed media is not downloaded twice. Telethon automatically reconnects transient sessions, and the outer listener adds bounded exponential reconnect delay. Restart the listener after changing chat selection.
@@ -160,7 +168,9 @@ IGNORED_EXTENSIONS=.exe
 KEYWORDS=release,invoice
 ```
 
-Animations use the video switch; voice messages use the audio switch. An empty allow-list permits all extensions except ignored ones. The ignore-list takes precedence. Keywords are comma-separated, case-insensitive substrings checked against message text/captions. Filtering never suppresses message metadata—only media download. Unknown file size is allowed because Telethon may not expose a size before download; the final byte count is always recorded.
+Animations and video notes use the global video switch; voice messages use the global audio switch; stickers use the document switch. An empty allow-list permits all extensions except ignored ones. The ignore-list takes precedence. Keywords are comma-separated, case-insensitive substrings checked against message text/captions. Extension, size, keyword, and global media-policy decisions suppress only the file transfer for messages included by the active content selection. Unknown file size is allowed because Telethon may not expose a size before download; the final byte count is always recorded.
+
+The environment switches are global policy boundaries. Per-operation `--types` and the web content picker narrow them further; they cannot enable a category disabled globally. `retry-failed --types voice,audio` similarly limits a repair run to those failed media categories.
 
 Downloads are deliberately low-concurrency and retry with exponential delay. Telegram `FloodWait` durations are honored exactly rather than bypassed. Unsupported media is recorded and skipped without crashing the sync.
 
@@ -169,6 +179,7 @@ Downloads are deliberately low-concurrency and retry with exponential delay. Tel
 The default database is `data/archive.db`. Automatic schema initialization creates:
 
 - `chats`: Telegram identity, title, username, entity type, timestamps, and the full-sync checkpoint.
+- `content_sync_checkpoints`: independent high-water marks for explicit per-chat content-type syncs.
 - `messages`: Telegram identity, sender/text/timestamps/reply/album fields, media metadata, local path, and download state/error/attempts.
 - `archive_selection_policy`: the optional singleton override (`specific` or `all`). No row means environment/YAML mode.
 - `selected_chats`: explicit Telegram IDs used by `specific` mode.
@@ -208,9 +219,9 @@ Open [http://127.0.0.1:8686](http://127.0.0.1:8686). The dashboard provides arch
 
 The Operations page exposes the application workflows that previously required a terminal:
 
-- **Sync** supports all selected chats or one selected chat, an optional per-chat limit, and inclusive `since`/`until` dates. It shows the active chat, chats completed, messages processed, downloads, repairs, elapsed time, and an operator event log.
-- **Listen** runs the real-time listener inside the web process, reports new messages/downloads as they arrive, reconnects normally, and remains active until safely stopped.
-- **Retry failed** reports candidate and completed counts while retrying failed media only.
+- **Sync** supports all selected chats or one selected chat, an optional per-chat limit, inclusive `since`/`until` dates, and a Telegram content-type picker. It shows the active chat, chats completed, messages processed, downloads, repairs, elapsed time, and an operator event log.
+- **Listen** runs the real-time listener inside the web process, applies its selected content categories, reports new messages/downloads as they arrive, reconnects normally, and remains active until safely stopped.
+- **Retry failed** can narrow recovery to selected media categories and reports candidate and completed counts.
 - **Doctor** reports configuration, SQLite, download storage, authorization, and selected-chat checks without exposing credentials.
 
 Only one web operation runs at a time. Start and stop actions are allowlisted application calls protected by the same Basic Auth and CSRF boundary as chat selection; the browser cannot supply a shell command. Job state and bounded logs are stored in SQLite, so completed history survives page reloads. If the web process exits during a job, that job is marked `interrupted` at restart; the next sync resumes from message checkpoints and completed files. Do not run a separate CLI `sync`, `listen`, `retry-failed`, or `doctor` against the same Telethon session while a web operation is active.

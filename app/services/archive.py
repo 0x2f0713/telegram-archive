@@ -12,6 +12,7 @@ from telethon.errors import FloodWaitError, RPCError
 
 from app.config import Settings
 from app.database.repository import ArchiveRepository
+from app.services.content_types import message_content_types
 from app.services.downloader import MediaDownloader
 from app.services.filenames import output_path
 from app.services.filters import MediaFilter
@@ -19,6 +20,7 @@ from app.telegram.entities import ChatInfo, message_data
 from app.utils.logging import format_bytes
 
 logger = logging.getLogger(__name__)
+DownloadProgressCallback = Callable[[str, int, int], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,18 +60,31 @@ class ArchiveService:
         settings: Settings,
         repository: ArchiveRepository,
         downloader: MediaDownloader,
+        content_types: frozenset[str] | None = None,
+        download_progress: DownloadProgressCallback | None = None,
     ) -> None:
         self.settings = settings
         self.repository = repository
         self.downloader = downloader
-        self.media_filter = MediaFilter(settings)
+        self.content_types = content_types
+        self.download_progress = download_progress
+        self.media_filter = MediaFilter(settings, content_types)
         # A fixed lock stripe set prevents unbounded memory growth in a listener
         # that may process millions of distinct message identities.
         self._message_locks = tuple(asyncio.Lock() for _ in range(256))
 
+    def matches_message(self, raw_message: object) -> bool:
+        """Return whether this operation selected any facet of the message."""
+
+        return self.content_types is None or bool(
+            message_content_types(raw_message) & self.content_types
+        )
+
     async def process_message(
         self, raw_message: object, chat: ChatInfo, *, edited: bool = False
     ) -> ProcessResult:
+        if not self.matches_message(raw_message):
+            return ProcessResult(False, False, True)
         data = message_data(raw_message, chat)
         key = (data.telegram_chat_id, data.telegram_message_id)
         lock = self._message_locks[hash(key) % len(self._message_locks)]
@@ -107,7 +122,12 @@ class ArchiveService:
                 )
                 return ProcessResult(created, False, True)
 
-            result = await self.downloader.download(record, data.raw_message, target)
+            progress = None
+            if self.download_progress:
+                def progress(current: int, total: int) -> None:
+                    self.download_progress(target.name, current, total)
+
+            result = await self.downloader.download(record, data.raw_message, target, progress)
             if result.completed and result.path and result.size is not None:
                 logger.info(
                     "[%s] Downloaded %s (%s)",
@@ -181,6 +201,19 @@ class ArchiveService:
                             attempted=attempted,
                             completed=completed,
                             detail="Skipped a candidate outside the active chat selection",
+                        )
+                    )
+                continue
+            if not self.media_filter.media_type_selected(candidate.media_type):
+                if progress:
+                    await progress(
+                        RetryProgress(
+                            phase="repairing",
+                            current=current,
+                            total=total,
+                            attempted=attempted,
+                            completed=completed,
+                            detail="Skipped a media type outside this operation selection",
                         )
                     )
                 continue

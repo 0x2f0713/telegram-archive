@@ -76,6 +76,22 @@ class SelectedChat(Base):
     )
 
 
+class ContentSyncCheckpoint(Base):
+    """Per-chat high-water mark for one explicitly selected content category."""
+
+    __tablename__ = "content_sync_checkpoints"
+
+    telegram_chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    content_type: Mapped[str] = mapped_column(String(32), primary_key=True)
+    last_scanned_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
 class Message(Base):
     __tablename__ = "messages"
     __table_args__ = (

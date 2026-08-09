@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from app.config import Settings
 from app.database.repository import ArchiveRepository, MessageSnapshot
 
 logger = logging.getLogger(__name__)
+DownloadProgressCallback = Callable[[int, int], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +39,7 @@ class MediaDownloader:
         record: MessageSnapshot,
         raw_message: object,
         target: Path,
+        progress: DownloadProgressCallback | None = None,
     ) -> DownloadResult:
         temp_path = target.with_name(f"{target.name}.part")
         async with self._semaphore:
@@ -44,7 +47,12 @@ class MediaDownloader:
                 try:
                     await self.repository.mark_download_start(record.id, target)
                     await asyncio.to_thread(self._prepare_target, target, temp_path)
-                    downloaded_path = await raw_message.download_media(file=str(temp_path))  # type: ignore[attr-defined]
+                    download_kwargs = {"file": str(temp_path)}
+                    if progress is not None:
+                        download_kwargs["progress_callback"] = progress
+                    downloaded_path = await raw_message.download_media(  # type: ignore[attr-defined]
+                        **download_kwargs
+                    )
                     if not downloaded_path or not await asyncio.to_thread(temp_path.is_file):
                         raise OSError("Telegram returned no completed media file")
                     size = await asyncio.to_thread(self._finalize, temp_path, target)

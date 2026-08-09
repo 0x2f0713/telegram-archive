@@ -346,6 +346,23 @@ async def test_web_operations_run_with_progress_csrf_and_safe_stop(tmp_path: Pat
                     "until": "2026-08-09",
                 },
             )
+            empty_types = await client.post(
+                "/operations/start",
+                data={
+                    "csrf_token": application.state.csrf_token,
+                    "command": "sync",
+                    "content_types_present": "1",
+                },
+            )
+            unknown_type = await client.post(
+                "/operations/start",
+                data={
+                    "csrf_token": application.state.csrf_token,
+                    "command": "sync",
+                    "content_types_present": "1",
+                    "content_type": "executable",
+                },
+            )
             started = await client.post(
                 "/operations/start",
                 data={
@@ -355,6 +372,8 @@ async def test_web_operations_run_with_progress_csrf_and_safe_stop(tmp_path: Pat
                     "limit": "50",
                     "since": "2026-08-01",
                     "until": "2026-08-09",
+                    "content_types_present": "1",
+                    "content_type": ["voice", "photo"],
                 },
             )
             sync_id = int(started.headers["location"].split("job=")[1].split("&")[0])
@@ -363,6 +382,13 @@ async def test_web_operations_run_with_progress_csrf_and_safe_stop(tmp_path: Pat
                 if sync_status.json()["operation"]["terminal"]:
                     break
                 await asyncio.sleep(0.01)
+            await application.state.operations._progress(
+                sync_id,
+                force=True,
+                status="cancelled",
+                phase="cancelled",
+                detail="Stopped safely by the operator",
+            )
             sync_page = await client.get(f"/operations?job={sync_id}")
 
             listener_started = await client.post(
@@ -387,18 +413,33 @@ async def test_web_operations_run_with_progress_csrf_and_safe_stop(tmp_path: Pat
                 if final_listener.json()["operation"]["terminal"]:
                     break
                 await asyncio.sleep(0.01)
+            resumed = await client.post(
+                f"/operations/{sync_id}/resume",
+                data={"csrf_token": application.state.csrf_token},
+            )
 
     assert page.status_code == 200
     assert "Run the archive" in page.text
     assert "Start sync" in page.text
+    assert "Text &amp; captions" in page.text
+    assert "Photos &amp; images" in page.text
+    assert "Voice messages" in page.text
+    assert "Documents &amp; PDFs" in page.text
     assert rejected.status_code == 403
     assert invalid_range.status_code == 400
+    assert empty_types.status_code == 400
+    assert "Select at least one" in empty_types.text
+    assert unknown_type.status_code == 400
+    assert "Unknown content type" in unknown_type.text
     assert started.status_code == 303
+    assert "Resume sync" in sync_page.text
+    assert resumed.status_code == 303
     assert captured == {
         "chat": -1001234567890,
         "limit": 50,
         "since": "2026-08-01",
         "until": "2026-08-09",
+        "content_types": ["photo", "voice"],
     }
     assert sync_status.json()["operation"]["status"] == "completed"
     assert sync_status.json()["operation"]["messages_processed"] == 12

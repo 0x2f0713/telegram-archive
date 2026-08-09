@@ -1,4 +1,23 @@
 {% extends "base.html" %}
+{% macro content_picker(scope, media_only=false) %}
+<fieldset class="content-type-picker" data-content-type-picker>
+  <legend>Content types</legend>
+  <div class="content-type-picker-head">
+    <p>{% if media_only %}Choose which failed media categories to retry.{% else %}A message is included when it matches any checked category.{% endif %}</p>
+    <div><button type="button" data-content-select="all">Select all</button>{% if not media_only %}<button type="button" data-content-select="media">Media only</button><button type="button" data-content-select="text">Text only</button>{% endif %}</div>
+  </div>
+  <div class="content-type-grid">
+    {% for option in content_type_options %}{% if not media_only or option.downloadable %}
+    <label class="content-type-choice" for="{{ scope }}-type-{{ option.key }}">
+      <input id="{{ scope }}-type-{{ option.key }}" type="checkbox" name="content_type" value="{{ option.key }}" data-downloadable="{{ 'true' if option.downloadable else 'false' }}" checked>
+      <span class="content-type-check" aria-hidden="true"></span>
+      <span><strong>{{ option.label }}</strong><small>{{ option.description }}</small></span>
+    </label>
+    {% endif %}{% endfor %}
+  </div>
+  <p class="content-type-error" data-content-type-error role="alert" hidden>Select at least one content type.</p>
+</fieldset>
+{% endmacro %}
 {% block title %}Operations | Telegram Archiver{% endblock %}
 {% block content %}
 <header class="page-heading operations-heading">
@@ -21,9 +40,23 @@
 <div class="selection-feedback success" role="status" aria-live="polite">
   <strong>Operation started.</strong><span>Progress updates automatically on this page.</span>
 </div>
+{% elif operation_error_message %}
+<div class="selection-feedback error" role="alert" aria-live="assertive">
+  <strong>Operation could not start.</strong><span>{{ operation_error_message }}</span>
+</div>
 {% elif operation_stopped %}
 <div class="selection-feedback" role="status" aria-live="polite">
   <strong>Safe stop requested.</strong><span>The current transaction or file transfer will settle before the worker exits.</span>
+</div>
+{% endif %}
+{% if active_operation %}
+<div class="selection-feedback" role="status" aria-live="polite">
+  <strong>Commands are temporarily locked.</strong>
+  <span>Operation #{{ active_operation.id }} ({{ active_operation.command|replace('-', ' ') }}) is {{ active_operation.status }}. Wait for it to finish or use “Stop safely” before starting another command.</span>
+</div>
+{% elif not selected_chats %}
+<div class="selection-feedback" role="alert">
+  <strong>No chats selected.</strong><span>Choose at least one accessible chat on <a href="/chats">Chats</a> and save the selection before starting sync or listener.</span>
 </div>
 {% endif %}
 
@@ -37,6 +70,21 @@
     <span class="operation-status status-{{ focus_operation.status }}" data-operation-status>{{ focus_operation.status }}</span>
   </div>
   <p class="operation-detail" data-operation-detail>{{ focus_operation.detail or 'Preparing operation status' }}</p>
+  <details class="operation-download-disclosure" data-operation-download-details {% if focus_operation.get('download_tasks') %}open{% endif %}>
+    <summary><span>Download tasks</span><strong data-operation-download-summary>{{ focus_operation.get('download_tasks', [])|length }} active</strong></summary>
+    <div class="operation-download-list" data-operation-download-list>
+      {% for task in focus_operation.get('download_tasks', []) %}
+      <article class="operation-download-progress" data-download-task>
+        <div class="operation-download-progress-head"><strong data-download-filename>{{ task.filename }}</strong><span data-download-percent>{{ task.percent or 0 }}%</span></div>
+        <progress data-download-bar value="{{ task.current or 0 }}" max="{{ task.total or 1 }}" aria-label="Download progress for {{ task.filename }}">{{ task.percent or 0 }}%</progress>
+        <small data-download-stats>{{ task.current or 0 }} / {{ task.total or 0 }} bytes · {{ task.speed or 0 }} B/s · {{ task.status }}</small>
+      </article>
+      {% else %}
+      <p class="operation-download-empty" data-operation-download-empty>No media transfer is active.</p>
+      {% endfor %}
+    </div>
+  </details>
+  {% if focus_operation.command in ('sync', 'listen', 'retry-failed') %}<p class="operation-content-scope"><strong>Content</strong><span>{% if focus_operation.parameters.get('content_types') %}{{ focus_operation.parameters.get('content_types')|join(' · ')|replace('_', ' ') }}{% else %}All Telegram content types{% endif %}</span></p>{% endif %}
   <div class="operation-progress-wrap">
     {% if focus_operation.progress_total %}
     <progress data-operation-progress value="{{ focus_operation.progress_current }}" max="{{ focus_operation.progress_total }}" aria-label="Operation progress">{{ focus_operation.progress_percent }}%</progress>
@@ -65,6 +113,11 @@
     <form method="post" action="/operations/{{ focus_operation.id }}/stop" data-operation-stop-form>
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button class="button danger-button" type="submit">Stop safely</button>
+    </form>
+    {% elif focus_operation.command == 'sync' and focus_operation.status in ('cancelled', 'interrupted', 'failed') and not active_operation %}
+    <form method="post" action="/operations/{{ focus_operation.id }}/resume" data-operation-resume-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button primary" type="submit">Resume sync</button>
     </form>
     {% endif %}
     <a class="button text-button" href="/operations?job={{ focus_operation.id }}">Refresh details</a>
@@ -97,6 +150,7 @@
     <form class="operation-command-card sync-command-card" method="post" action="/operations/start" data-operation-start-form>
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="hidden" name="command" value="sync">
+      <input type="hidden" name="content_types_present" value="1">
       <div class="command-card-heading"><span>01</span><div><p>Historical backfill</p><h3>Sync selected history</h3></div></div>
       <p>Resume from durable checkpoints, repair missing files, and archive messages oldest-to-newest.</p>
       <div class="sync-options">
@@ -108,14 +162,17 @@
         <label><span>Since date</span><input type="date" name="since"></label>
         <label><span>Until date</span><input type="date" name="until"></label>
       </div>
+      {{ content_picker('sync') }}
       <button class="button primary" type="submit" {% if active_operation or not selected_chats %}disabled aria-disabled="true"{% endif %}>{% if not selected_chats %}Select a chat first{% else %}Start sync{% endif %}</button>
     </form>
 
     <form class="operation-command-card" method="post" action="/operations/start" data-operation-start-form>
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="hidden" name="command" value="listen">
+      <input type="hidden" name="content_types_present" value="1">
       <div class="command-card-heading"><span>02</span><div><p>Real-time worker</p><h3>Start listener</h3></div></div>
       <p>Monitor selected chats for new messages and edits. This remains active until safely stopped.</p>
+      <details class="content-type-disclosure" data-content-disclosure data-content-label="Content types"><summary>Content types · all selected</summary>{{ content_picker('listen') }}</details>
       <div class="command-card-signal"><span aria-hidden="true"></span>Reconnects automatically</div>
       <button class="button primary" type="submit" {% if active_operation or not selected_chats %}disabled aria-disabled="true"{% endif %}>{% if not selected_chats %}Select a chat first{% else %}Start listener{% endif %}</button>
     </form>
@@ -123,8 +180,10 @@
     <form class="operation-command-card" method="post" action="/operations/start" data-operation-start-form>
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="hidden" name="command" value="retry-failed">
+      <input type="hidden" name="content_types_present" value="1">
       <div class="command-card-heading"><span>03</span><div><p>Media recovery</p><h3>Retry failed files</h3></div></div>
       <p>Retry only media currently marked failed while preserving completed files and message identities.</p>
+      <details class="content-type-disclosure" data-content-disclosure data-content-label="Media types"><summary>Media types · all selected</summary>{{ content_picker('retry', true) }}</details>
       <div class="command-card-signal warning-signal">Respects FloodWait and retry limits</div>
       <button class="button secondary" type="submit" {% if active_operation or not selected_chats %}disabled aria-disabled="true"{% endif %}>Retry failed media</button>
     </form>

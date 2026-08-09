@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.config import Settings
+from app.services.content_types import MEDIA_CONTENT_TYPES
 from app.telegram.entities import MessageData
 
 
@@ -15,19 +16,38 @@ class FilterDecision:
 
 
 class MediaFilter:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        selected_content_types: frozenset[str] | None = None,
+    ) -> None:
         self.settings = settings
+        self.selected_media_types = (
+            selected_content_types & MEDIA_CONTENT_TYPES
+            if selected_content_types is not None
+            else None
+        )
+
+    def media_type_selected(self, media_type: str | None) -> bool:
+        """Return whether an operation-specific selection permits this media type."""
+
+        return self.selected_media_types is None or media_type in self.selected_media_types
 
     def evaluate(self, message: MessageData) -> FilterDecision:
         media_type = message.media_type
         if media_type in {None, "unsupported"}:
             return FilterDecision(False, "Unsupported media type")
+        if not self.media_type_selected(media_type):
+            return FilterDecision(False, f"{media_type.replace('_', ' ').title()} not selected")
         enabled = {
             "photo": self.settings.download_photos,
             "video": self.settings.download_videos,
+            "video_note": self.settings.download_videos,
             "animation": self.settings.download_videos,
             "document": self.settings.download_documents,
+            "sticker": self.settings.download_documents,
             "audio": self.settings.download_audio,
+            "voice": self.settings.download_audio,
         }.get(media_type, False)
         if not enabled:
             return FilterDecision(False, f"{media_type.capitalize()} downloads are disabled")

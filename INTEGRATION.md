@@ -141,7 +141,7 @@ The HTML routes are:
 | `GET` | `/chats` | Render cached selection controls; `refresh=true` refreshes Telegram dialogs |
 | `POST` | `/chats/selection` | CSRF-protected selection mutation after current access validation |
 | `GET` | `/operations` | Command launcher, live progress, safe stop, logs, and durable operation history |
-| `POST` | `/operations/start` | CSRF-protected allowlisted start for sync, listen, retry-failed, or doctor |
+| `POST` | `/operations/start` | CSRF-protected allowlisted start for sync, listen, retry-failed, or doctor; worker forms may repeat `content_type` |
 | `POST` | `/operations/{job_id}/stop` | CSRF-protected cooperative stop request |
 | `GET` | `/system` | Redacted runtime and security posture |
 | `GET` | `/auth/telegram` | Existing-account status and official QR connection workflow |
@@ -167,6 +167,8 @@ The programmatic routes are:
 ### Chat-selection integration
 
 `POST /chats/selection` accepts a bounded URL-encoded form containing the in-page `csrf_token`, a `mode` of `specific`, `all`, or `environment`, and repeated `chat_id` values for specific mode. It is an operator UI contract, not a public API. The handler opens the local authorized Telethon session and refreshes `iter_dialogs()` before committing. Specific IDs and environment defaults must all be present in that current list. All mode stores no IDs; every worker re-enumerates accessible dialogs when it starts.
+
+`POST /operations/start` accepts repeated `content_type` fields when `content_types_present=1` for `sync`, `listen`, and `retry-failed`. Canonical values are `text`, `photo`, `video`, `video_note`, `voice`, `audio`, `animation`, `sticker`, `document`, and `other`. An empty or unknown selection is rejected. Omitting the sentinel preserves the all-types contract for older local integrations. Operation history stores only canonical category names, never arbitrary executable input.
 
 Selection changes do not hot-reconfigure an already running listener. Restart `sync`, `listen`, or `retry-failed` after a change. This gives each worker one stable target set while it is processing. Web/TUI and environment modes share the same database, so all processes must use the same `DATABASE_URL`.
 
@@ -228,20 +230,27 @@ settings = Settings()
 database = Database(settings.database_url)
 repository = ArchiveRepository(database)
 downloader = MediaDownloader(settings, repository)
-archive = ArchiveService(settings, repository, downloader)
+content_types = frozenset({"photo", "video", "voice"})
+archive = ArchiveService(settings, repository, downloader, content_types)
 client = create_client(settings)
 
 await database.initialize()
 try:
     await connect_authorized(client)
     chats = await ChatSelectionService(settings, repository).resolve_with_client(client)
-    await sync_history(client, chats, archive, repository)
+    await sync_history(
+        client,
+        chats,
+        archive,
+        repository,
+        content_types=content_types,
+    )
 finally:
     await client.disconnect()
     await database.close()
 ```
 
-Do not share a SQLAlchemy `AsyncSession`; repository operations intentionally create short-lived transactions. One `ArchiveService` may process concurrent listener events safely: a per-message lock prevents duplicate work and `MediaDownloader` applies the configured global semaphore.
+Do not share a SQLAlchemy `AsyncSession`; repository operations intentionally create short-lived transactions. One `ArchiveService` may process concurrent listener events safely: a per-message lock prevents duplicate work and `MediaDownloader` applies the configured global semaphore. Historical sync also uses `DOWNLOAD_CONCURRENCY` as its bounded in-flight window. It settles tasks and advances the per-chat checkpoint in source order, so a newer completed transfer can never make restart recovery skip older in-flight work.
 
 `ChatInfo` and `MessageData` in `app.telegram.entities` are the adapter boundary between Telethon objects and archive logic. Integrations should prefer these data types and repository methods over direct ORM mutation, because explicit repository transitions preserve retry and deduplication invariants.
 
@@ -257,6 +266,8 @@ pending -> downloading -> completed
 pending/filter decision -> skipped
 no media -> not_applicable
 ```
+
+An explicit content-type sync uses `content_sync_checkpoints` instead of the legacy all-content mark on `chats`. Each selected category has its own per-chat high-water mark. The worker starts from the oldest selected mark, ignores already-covered category/message combinations, and advances every selected mark only as source-ordered tasks settle. This preserves both later category expansion and crash-safe resume.
 
 Before a transfer begins, the final path is committed with `downloading`. Bytes are written to `<final>.part` and atomically renamed. Only then is the row marked `completed`. A crash can therefore leave either a `.part`, or a final file with a non-completed row; the next repair pass handles both. Never publish or index `.part` files as completed assets.
 

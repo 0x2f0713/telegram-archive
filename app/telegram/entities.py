@@ -123,13 +123,17 @@ def classify_media(message: Any) -> str | None:
     if getattr(message, "photo", None):
         return "photo"
     if getattr(message, "voice", None):
-        return "audio"
+        return "voice"
     if getattr(message, "audio", None):
         return "audio"
     if getattr(message, "gif", None):
         return "animation"
-    if getattr(message, "video", None) or getattr(message, "video_note", None):
+    if getattr(message, "video_note", None):
+        return "video_note"
+    if getattr(message, "video", None):
         return "video"
+    if getattr(message, "sticker", None):
+        return "sticker"
     if getattr(message, "document", None):
         return "document"
     if getattr(message, "media", None):

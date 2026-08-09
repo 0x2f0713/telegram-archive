@@ -33,6 +33,14 @@ class SuccessfulMessage:
         return file
 
 
+class ProgressMessage:
+    async def download_media(self, *, file: str, progress_callback) -> str:
+        await asyncio.to_thread(Path(file).write_bytes, b"complete")
+        progress_callback(2, 8)
+        progress_callback(8, 8)
+        return file
+
+
 async def test_interrupted_download_leaves_part_and_never_final(tmp_path: Path) -> None:
     repository = RecordingRepository()
     settings = Settings(_env_file=None, download_retries=1)
@@ -62,3 +70,22 @@ async def test_successful_download_is_atomically_renamed(tmp_path: Path) -> None
     assert target.read_bytes() == b"complete"
     assert not target.with_name(f"{target.name}.part").exists()
     assert repository.completed == 1
+
+
+async def test_download_forwards_per_file_progress(tmp_path: Path) -> None:
+    repository = RecordingRepository()
+    downloader = MediaDownloader(Settings(_env_file=None, download_retries=1), repository)  # type: ignore[arg-type]
+    updates: list[tuple[int, int]] = []
+    target = tmp_path / "42_report.pdf"
+    def collect(current: int, total: int) -> None:
+        updates.append((current, total))
+
+    result = await downloader.download(
+        type("Record", (), {"id": 1})(),
+        ProgressMessage(),
+        target,
+        collect,
+    )  # type: ignore[arg-type]
+
+    assert result.completed
+    assert updates == [(2, 8), (8, 8)]

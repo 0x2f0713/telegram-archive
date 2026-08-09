@@ -73,3 +73,19 @@ async def test_stats_reports_newest_message_per_chat(database: Database) -> None
 
     assert len(stats.newest_by_chat) == 1
     assert stats.newest_by_chat[0].message_id == 42
+
+
+async def test_content_checkpoints_are_independent_and_monotonic(database: Database) -> None:
+    repository = ArchiveRepository(database)
+    chat_id = make_chat().telegram_chat_id
+
+    await repository.advance_content_checkpoints(chat_id, ("photo", "video"), 20)
+    await repository.advance_content_checkpoints(chat_id, ("photo",), 10)
+    await repository.advance_content_checkpoints(chat_id, ("voice",), 7)
+
+    checkpoints = await repository.get_content_checkpoints(
+        chat_id,
+        ("photo", "video", "voice", "audio"),
+    )
+
+    assert checkpoints == {"photo": 20, "video": 20, "voice": 7, "audio": None}

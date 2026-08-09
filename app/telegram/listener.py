@@ -76,14 +76,14 @@ class RealtimeListener:
         if self.stop_event.is_set():
             return
         chat = self.chats.get(event.chat_id)
-        if chat:
+        if chat and self.archive.matches_message(event.message):
             self._schedule(self._process_event(event.message, chat, edited=False))
 
     async def _edited_message(self, event: Any) -> None:
         if self.stop_event.is_set():
             return
         chat = self.chats.get(event.chat_id)
-        if chat:
+        if chat and self.archive.matches_message(event.message):
             self._schedule(self._process_event(event.message, chat, edited=True))
 
     async def _process_event(self, message: Any, chat: ChatInfo, *, edited: bool) -> None:
