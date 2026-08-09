@@ -608,11 +608,10 @@ def create_router(settings: Settings) -> APIRouter:
             raise HTTPException(status_code=400, detail="This sync operation is already active")
         if previous["status"] not in {"cancelled", "interrupted", "failed"}:
             raise HTTPException(status_code=400, detail="Only unfinished sync operations can resume")
-        parameters = previous.get("parameters")
-        if not isinstance(parameters, dict):
-            raise HTTPException(status_code=400, detail="This sync operation has no resumable parameters")
         try:
-            operation = await manager.start_job("sync", dict(parameters))
+            operation = await manager.resume_job(job_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except OperationConflictError as exc:
             return RedirectResponse(
                 f"/operations?job={job_id}&{urlencode({'error': str(exc)})}",

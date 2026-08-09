@@ -434,6 +434,7 @@ async def test_web_operations_run_with_progress_csrf_and_safe_stop(tmp_path: Pat
     assert started.status_code == 303
     assert "Resume sync" in sync_page.text
     assert resumed.status_code == 303
+    assert resumed.headers["location"].startswith(f"/operations?job={sync_id}&")
     assert captured == {
         "chat": -1001234567890,
         "limit": 50,

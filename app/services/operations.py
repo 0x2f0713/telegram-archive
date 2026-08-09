@@ -166,6 +166,49 @@ class OperationManager:
             )
         return await self.get(record.id)
 
+    async def resume_job(self, job_id: int) -> dict[str, Any]:
+        """Reactivate one interrupted sync under its original operation ID.
+
+        Telegram progress is checkpointed separately from the operation row, so
+        a resumed task continues from durable checkpoints without creating a
+        second operation history or re-running completed downloads.
+        """
+
+        async with self._lock:
+            active = await self.active()
+            if active:
+                raise OperationConflictError(
+                    f"{active['command']} operation {active['id']} is already active"
+                )
+            record = await self.repository.get(job_id)
+            if record is None:
+                raise OperationNotFoundError(f"Operation {job_id} does not exist")
+            if record.command != "sync":
+                raise ValueError("Only historical sync operations can resume")
+            if record.status not in {"cancelled", "interrupted", "failed"}:
+                raise ValueError("Only unfinished sync operations can resume")
+
+            resumed = await self.repository.update(
+                job_id,
+                status="queued",
+                phase="queued",
+                detail="Resuming from durable checkpoints",
+                stop_requested=False,
+                error=None,
+                finished_at=None,
+            )
+            if resumed is None:
+                raise OperationNotFoundError(f"Operation {job_id} does not exist")
+            runtime = _Runtime(job_id=job_id, command=record.command)
+            runtime.overlay.update(resumed.public_dict())
+            self._runtime[job_id] = runtime
+            runtime.task = asyncio.create_task(
+                self._execute(job_id, record.command, record.parameters),
+                name=f"web-operation-{job_id}-{record.command}-resume",
+            )
+        await self.repository.add_log(job_id, "INFO", "Resuming from durable checkpoints")
+        return await self.get(job_id)
+
     async def request_stop(self, job_id: int) -> dict[str, Any]:
         record = await self.repository.get(job_id)
         if record is None:
@@ -188,7 +231,9 @@ class OperationManager:
     async def active(self) -> dict[str, Any] | None:
         for job_id, runtime in reversed(tuple(self._runtime.items())):
             if runtime.task and not runtime.task.done():
-                return await self.get(job_id)
+                candidate = await self.get(job_id)
+                if candidate["active"]:
+                    return candidate
         record = await self.repository.active()
         return self._public(record) if record else None
 

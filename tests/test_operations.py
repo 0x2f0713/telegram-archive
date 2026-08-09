@@ -146,6 +146,43 @@ async def test_download_reporter_tracks_each_task_with_speed(tmp_path: Path) -> 
     assert " B/s" not in str(updates[-1]["detail"])
 
 
+async def test_resume_reactivates_the_original_sync_operation(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize()
+    runs = 0
+
+    async def fake_sync(context: OperationContext) -> None:
+        nonlocal runs
+        runs += 1
+        await context.progress(force=True, phase="syncing", detail=f"Run {runs}")
+
+    manager = OperationManager(settings, database, executors={"sync": fake_sync})
+    await manager.startup()
+    started = await manager.start_job("sync", {"chat": -1001234567890, "limit": 50})
+    original_id = int(started["id"])
+    await _wait_for_status(manager, original_id, {"completed"})
+    await manager._progress(
+        original_id,
+        force=True,
+        status="interrupted",
+        phase="interrupted",
+        detail="Web process exited before this operation finished",
+    )
+
+    resumed = await manager.resume_job(original_id)
+    completed = await _wait_for_status(manager, original_id, {"completed"})
+    logs = await manager.logs(original_id)
+
+    assert resumed["id"] == original_id
+    assert completed["parameters"] == {"chat": -1001234567890, "limit": 50}
+    assert runs == 2
+    assert any("Resuming from durable checkpoints" in str(log["message"]) for log in logs)
+    assert len(await manager.recent()) == 1
+    await manager.shutdown()
+    await database.close()
+
+
 async def test_operation_safe_stop_and_restart_recovery(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     database = Database(settings.database_url)
