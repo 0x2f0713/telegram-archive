@@ -1,5 +1,5 @@
+from app.application.media_policy import MediaFilter
 from app.config import Settings
-from app.services.filters import MediaFilter
 from tests.helpers import make_message
 
 

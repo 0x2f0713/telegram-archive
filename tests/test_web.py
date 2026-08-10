@@ -3,21 +3,22 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
-from datetime import UTC, datetime
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import pytest
 
+from app.application.chat_selection import ChatDiscovery
+from app.application.operations import OperationContext, OperationManager
 from app.config import ConfigurationError, Settings
-from app.database.repository import ArchiveRepository
-from app.database.selection import ChatSelection, ChatSelectionRepository
-from app.database.session import Database
-from app.services.chat_selection import ChatDiscovery
-from app.services.operations import OperationContext, OperationManager
-from app.web.application import create_web_app
-from app.web.telegram_auth import TelegramAuthSnapshot, TelegramAuthStatus
-from tests.helpers import make_chat, make_message
+from app.infrastructure.persistence.database import Database
+from app.infrastructure.persistence.repository import ArchiveRepository
+from app.infrastructure.persistence.selection import ChatSelection, ChatSelectionRepository
+from app.interfaces.web.app import create_web_app
+from app.interfaces.web.auth import TelegramAuthSnapshot, TelegramAuthStatus
+from tests.helpers import make_chat, make_message, make_no_media_message
 
 
 def _settings(tmp_path: Path, **overrides: object) -> Settings:
@@ -81,6 +82,120 @@ async def test_web_pages_api_and_media_delivery(tmp_path: Path) -> None:
     assert media.headers["content-disposition"].startswith("attachment")
     assert stats.json()["stats"]["total_messages"] == 1
     assert api_messages.json()["total"] == 1
+
+
+def _seed_session_account(tmp_path: Path, account_id: int) -> Path:
+    session_path = tmp_path / "telegram_session.session"
+    connection = sqlite3.connect(session_path)
+    connection.execute(
+        "CREATE TABLE entities (id integer primary key, hash integer not null, "
+        "username text, phone integer, name text, date integer)"
+    )
+    connection.execute(
+        "INSERT INTO entities VALUES (0, ?, NULL, NULL, NULL, 1786334406)",
+        (account_id,),
+    )
+    connection.commit()
+    connection.close()
+    return session_path
+
+
+async def _seed_conversation(settings: Settings, account_id: int) -> int:
+    database = Database(settings.database_url)
+    await database.initialize()
+    archive = ArchiveRepository(database)
+    chat = make_chat(title="Conversation <Room>")
+    await archive.upsert_chat(chat)
+    base = datetime(2026, 8, 8, 10, 0, tzinfo=UTC)
+    for index, sender in enumerate((100, account_id, 100, account_id)):
+        telegram_message_id = 1000 + index
+        await archive.upsert_message(
+            make_no_media_message(
+                telegram_message_id=telegram_message_id,
+                sender_id=sender,
+                sender_name="Alice & Bob" if sender == 100 else "me",
+                text=f"message <b>{telegram_message_id}</b>",
+                message_date=base + timedelta(hours=index),
+                reply_to_message_id=1000 if index == 3 else None,
+            )
+        )
+    await database.close()
+    return chat.telegram_chat_id
+
+
+async def test_conversation_thread_renders_bubbles_with_outgoing_alignment(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    account_id = 909580109
+    _seed_session_account(tmp_path, account_id)
+    chat_id = await _seed_conversation(settings, account_id)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(f"/chats/{chat_id}")
+
+    assert response.status_code == 200
+    text = response.text
+    assert "Conversation &lt;Room&gt;" in text
+    assert "message &lt;b&gt;1000&lt;/b&gt;" in text
+    assert "<b>1000</b>" not in text
+    assert "message &lt;b&gt;1002&lt;/b&gt;" in text
+    assert "Alice &amp; Bob" in text
+    assert text.count("bubble-out") == 2
+    assert text.count("bubble-in") == 2
+    assert "Reply to message #1000" in text
+    assert 'class="thread-divider"' in text
+
+
+async def test_conversation_thread_404_for_unknown_chat(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/chats/-1009999999999")
+
+    assert response.status_code == 404
+
+
+async def test_conversation_thread_loads_older_history(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    chat_id = -1001234567890
+    database = Database(settings.database_url)
+    await database.initialize()
+    archive = ArchiveRepository(database)
+    await archive.upsert_chat(make_chat())
+    base = datetime(2026, 8, 1, 8, 0, tzinfo=UTC)
+    for index in range(55):
+        await archive.upsert_message(
+            make_no_media_message(
+                telegram_message_id=2000 + index,
+                sender_id=100,
+                sender_name="Test Sender",
+                text=f"older message {index}",
+                message_date=base + timedelta(minutes=index),
+            )
+        )
+    await database.close()
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            first = await client.get(f"/chats/{chat_id}")
+            older = await client.get(f"/chats/{chat_id}", params={"page": 2})
+
+    assert first.status_code == 200
+    assert "Load older messages" in first.text
+    assert "older message 0" not in first.text
+    assert "older message 54" in first.text
+    assert older.status_code == 200
+    assert "Load older messages" not in older.text
+    assert "older message 0" in older.text
 
 
 async def test_web_rejects_media_outside_download_directory(tmp_path: Path) -> None:
@@ -477,3 +592,95 @@ async def test_filtered_csv_export_neutralizes_spreadsheet_formulas(tmp_path: Pa
     assert rows[0]["sender_name"] == "'+Formula sender"
     assert rows[0]["text"] == "'=2+3"
     assert rows[0]["filename"] == "'@payload.pdf"
+
+
+def _system_settings_form(concurrency: str = "2", log_level: str = "INFO") -> dict[str, str]:
+    return {
+        "download_photos": "false",
+        "download_videos": "false",
+        "download_audios": "false",
+        "download_documents": "false",
+        "max_file_size_mb": "100",
+        "download_concurrency": concurrency,
+        "download_retries": "3",
+        "web_refresh_seconds": "30",
+        "allowed_extensions": "",
+        "ignored_extensions": "",
+        "keywords": "",
+        "log_level": log_level,
+    }
+
+
+async def test_web_system_settings_saves_applies_and_resets(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", follow_redirects=True
+        ) as client:
+            initial = await client.get("/system")
+            assert initial.status_code == 200
+            assert "Effective configuration" in initial.text
+            assert initial.text.count(">overridden<") == 0
+
+            form = _system_settings_form(concurrency="7", log_level="DEBUG")
+            saved = await client.post(
+                "/system/settings", data={"csrf_token": application.state.csrf_token, **form}
+            )
+            assert saved.status_code == 200
+            assert "Configuration saved." in saved.text
+            assert 'name="download_concurrency" min="1" max="20" value="7"' in saved.text
+            assert 'name="max_file_size_mb" min="0" value="100"' in saved.text
+            assert 'name="web_refresh_seconds" min="5" max="3600" value="30"' in saved.text
+            assert '<option value="DEBUG" selected' in saved.text
+            assert saved.text.count(">overridden<") == 6
+
+            applied = await client.get("/system")
+            assert 'name="download_concurrency" min="1" max="20" value="7"' in applied.text
+            assert '<option value="DEBUG" selected' in applied.text
+            assert applied.text.count(">overridden<") == 6
+
+            reset = await client.post(
+                "/system/settings/reset", data={"csrf_token": application.state.csrf_token}
+            )
+            assert reset.status_code == 200
+            assert "Configuration reset." in reset.text
+            assert 'name="download_concurrency" min="1" max="20" value="2"' in reset.text
+            assert reset.text.count(">overridden<") == 0
+
+            after_reset = await client.get("/system")
+            assert 'name="download_concurrency" min="1" max="20" value="2"' in after_reset.text
+            assert after_reset.text.count(">overridden<") == 0
+
+
+async def test_web_system_settings_rejects_invalid_values_and_csrf(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", follow_redirects=True
+        ) as client:
+            invalid = await client.post(
+                "/system/settings",
+                data={
+                    "csrf_token": application.state.csrf_token,
+                    **_system_settings_form(log_level="loud"),
+                },
+            )
+            assert invalid.status_code == 422
+            assert "Configuration was not saved." in invalid.text
+            assert "loud" in invalid.text
+
+            csrf_rejected = await client.post(
+                "/system/settings", data={"csrf_token": "wrong", **_system_settings_form()}
+            )
+            assert csrf_rejected.status_code == 403
+
+            reset_rejected = await client.post(
+                "/system/settings/reset", data={"csrf_token": "wrong"}
+            )
+            assert reset_rejected.status_code == 403

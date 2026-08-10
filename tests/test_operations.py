@@ -5,14 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from app.config import Settings
-from app.database.operations import OperationRepository
-from app.database.session import Database
-from app.services.operations import (
+from app.application.commands import Commands
+from app.application.operations import (
     OperationConflictError,
     OperationContext,
     OperationManager,
 )
+from app.config import Settings
+from app.infrastructure.persistence.database import Database
+from app.infrastructure.persistence.operations import OperationRepository
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -131,7 +132,7 @@ async def test_download_reporter_tracks_each_task_with_speed(tmp_path: Path) -> 
         async def progress(self, **values: object) -> None:
             updates.append(values)
 
-    reporter = OperationManager._download_reporter(Context())  # type: ignore[arg-type]
+    reporter = Commands._download_reporter(Context())  # type: ignore[arg-type]
     reporter("one.bin", 512, 1024)
     await asyncio.sleep(0)
     reporter("two.bin", 1024, 2048)
@@ -223,15 +224,13 @@ async def test_operation_safe_stop_and_restart_recovery(tmp_path: Path) -> None:
 def test_operation_content_type_parameters_are_canonical_and_all_is_unfiltered(
     tmp_path: Path,
 ) -> None:
-    settings = _settings(tmp_path)
-    database = Database(settings.database_url)
-    manager = OperationManager(settings, database)
+    del tmp_path  # content parsing is pure; no database needed
 
-    assert manager._content_types({"content_types": ["images", "voice-messages"]}) == (
+    assert Commands._content_types({"content_types": ["images", "voice-messages"]}) == (
         frozenset({"photo", "voice"})
     )
     assert (
-        manager._content_types(
+        Commands._content_types(
             {
                 "content_types": [
                     "text",

@@ -1,0 +1,224 @@
+{% extends "base.html" %}
+{% macro content_picker(scope, media_only=false) %}
+<fieldset class="content-type-picker" data-content-type-picker>
+  <legend>Content types</legend>
+  <div class="content-type-picker-head">
+    <p>{% if media_only %}Choose which failed media categories to retry.{% else %}A message is included when it matches any checked category.{% endif %}</p>
+    <div><button type="button" data-content-select="all">Select all</button>{% if not media_only %}<button type="button" data-content-select="media">Media only</button><button type="button" data-content-select="text">Text only</button>{% endif %}</div>
+  </div>
+  <div class="content-type-grid">
+    {% for option in content_type_options %}{% if not media_only or option.downloadable %}
+    <label class="content-type-choice" for="{{ scope }}-type-{{ option.key }}">
+      <input id="{{ scope }}-type-{{ option.key }}" type="checkbox" name="content_type" value="{{ option.key }}" data-downloadable="{{ 'true' if option.downloadable else 'false' }}" checked>
+      <span class="content-type-check" aria-hidden="true"></span>
+      <span><strong>{{ option.label }}</strong><small>{{ option.description }}</small></span>
+    </label>
+    {% endif %}{% endfor %}
+  </div>
+  <p class="content-type-error" data-content-type-error role="alert" hidden>Select at least one content type.</p>
+</fieldset>
+{% endmacro %}
+{% block title %}Operations | Telegram Archiver{% endblock %}
+{% block content %}
+<header class="page-heading operations-heading">
+  <div>
+    <p class="eyebrow">Worker control</p>
+    <h1>Run the archive.</h1>
+    <p>Backfill history, keep the listener online, repair failed media, and validate the installation without leaving the private dashboard.</p>
+  </div>
+  <div class="heading-actions">
+    {% if active_operation %}
+    <span class="operation-live-badge"><span aria-hidden="true"></span>{{ active_operation.command|replace('-', ' ') }} active</span>
+    {% else %}
+    <span class="selection-mode-badge">Worker idle</span>
+    {% endif %}
+    <a class="button secondary" href="/chats">Review selected chats</a>
+  </div>
+</header>
+
+{% if operation_started %}
+<div class="selection-feedback success" role="status" aria-live="polite">
+  <strong>Operation started.</strong><span>Progress updates automatically on this page.</span>
+</div>
+{% elif operation_error_message %}
+<div class="selection-feedback error" role="alert" aria-live="assertive">
+  <strong>Operation could not start.</strong><span>{{ operation_error_message }}</span>
+</div>
+{% elif operation_stopped %}
+<div class="selection-feedback" role="status" aria-live="polite">
+  <strong>Safe stop requested.</strong><span>The current transaction or file transfer will settle before the worker exits.</span>
+</div>
+{% endif %}
+{% if active_operation %}
+<div class="selection-feedback" role="status" aria-live="polite">
+  <strong>Commands are temporarily locked.</strong>
+  <span>Operation #{{ active_operation.id }} ({{ active_operation.command|replace('-', ' ') }}) is {{ active_operation.status }}. Wait for it to finish or use “Stop safely” before starting another command.</span>
+</div>
+{% elif not selected_chats %}
+<div class="selection-feedback" role="alert">
+  <strong>No chats selected.</strong><span>Choose at least one accessible chat on <a href="/chats">Coverage</a> and save the selection before starting sync or listener.</span>
+</div>
+{% endif %}
+
+<section class="operation-monitor" aria-labelledby="operation-monitor-title" {% if focus_operation %}data-operation-monitor data-operation-id="{{ focus_operation.id }}"{% endif %}>
+  {% if focus_operation %}
+  <div class="operation-monitor-head">
+    <div>
+      <p class="eyebrow">Operation #{{ focus_operation.id }}</p>
+      <h2 id="operation-monitor-title">{{ focus_operation.command|replace('-', ' ')|title }}</h2>
+    </div>
+    <span class="operation-status status-{{ focus_operation.status }}" data-operation-status>{{ focus_operation.status }}</span>
+  </div>
+  <p class="operation-detail" data-operation-detail>{{ focus_operation.detail or 'Preparing operation status' }}</p>
+  <details class="operation-download-disclosure" data-operation-download-details {% if focus_operation.get('download_tasks') %}open{% endif %}>
+    <summary><span>Download tasks</span><strong data-operation-download-summary>{{ focus_operation.get('download_tasks', [])|length }} active</strong></summary>
+    <div class="operation-download-list" data-operation-download-list>
+      {% for task in focus_operation.get('download_tasks', []) %}
+      <article class="operation-download-progress" data-download-task>
+        <div class="operation-download-progress-head"><strong data-download-filename>{{ task.filename }}</strong><span data-download-percent>{{ task.percent or 0 }}%</span></div>
+        <progress data-download-bar value="{{ task.current or 0 }}" max="{{ task.total or 1 }}" aria-label="Download progress for {{ task.filename }}">{{ task.percent or 0 }}%</progress>
+        <small data-download-stats>{{ task.current or 0 }} / {{ task.total or 0 }} bytes · {{ task.speed or 0 }} B/s · {{ task.status }}</small>
+      </article>
+      {% else %}
+      <p class="operation-download-empty" data-operation-download-empty>No media transfer is active.</p>
+      {% endfor %}
+    </div>
+  </details>
+  {% if focus_operation.command in ('sync', 'listen', 'retry-failed') %}<p class="operation-content-scope"><strong>Content</strong><span>{% if focus_operation.parameters.get('content_types') %}{{ focus_operation.parameters.get('content_types')|join(' · ')|replace('_', ' ') }}{% else %}All Telegram content types{% endif %}</span></p>{% endif %}
+  <div class="operation-progress-wrap">
+    {% if focus_operation.progress_total %}
+    <progress data-operation-progress value="{{ focus_operation.progress_current }}" max="{{ focus_operation.progress_total }}" aria-label="Operation progress">{{ focus_operation.progress_percent }}%</progress>
+    {% else %}
+    <progress data-operation-progress aria-label="Operation is active; total work is not known"></progress>
+    {% endif %}
+    <div class="operation-progress-meta">
+      <span data-operation-phase>{{ focus_operation.phase|replace('-', ' ') }}</span>
+      <span data-operation-progress-label>{% if focus_operation.progress_total %}{{ focus_operation.progress_current }} / {{ focus_operation.progress_total }}{% else %}Live progress{% endif %}</span>
+    </div>
+  </div>
+  <dl class="operation-metrics">
+    <div><dt>Chats</dt><dd data-operation-chats>{{ focus_operation.chats_completed }} / {{ focus_operation.chats_total or '—' }}</dd></div>
+    <div><dt>Messages</dt><dd data-operation-messages>{{ "{:,}".format(focus_operation.messages_processed) }}</dd></div>
+    <div><dt>Downloads</dt><dd data-operation-downloads>{{ "{:,}".format(focus_operation.downloads_completed) }}</dd></div>
+    <div><dt>Retries</dt><dd data-operation-retries>{{ focus_operation.retry_completed }} / {{ focus_operation.retry_attempted }}</dd></div>
+    <div><dt>Elapsed</dt><dd data-operation-elapsed>{{ focus_operation.elapsed_seconds }}s</dd></div>
+  </dl>
+  {% if focus_operation.error %}
+  <div class="operation-error" role="alert" data-operation-error><strong>Operation error</strong><span>{{ focus_operation.error }}</span></div>
+  {% else %}
+  <div class="operation-error" role="alert" data-operation-error hidden></div>
+  {% endif %}
+  <div class="operation-monitor-actions">
+    {% if focus_operation.active %}
+    <form method="post" action="/operations/{{ focus_operation.id }}/stop" data-operation-stop-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button danger-button" type="submit">Stop safely</button>
+    </form>
+    {% elif focus_operation.command == 'sync' and focus_operation.status in ('cancelled', 'interrupted', 'failed') and not active_operation %}
+    <form method="post" action="/operations/{{ focus_operation.id }}/resume" data-operation-resume-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button primary" type="submit">Resume sync</button>
+    </form>
+    {% endif %}
+    <a class="button text-button" href="/operations?job={{ focus_operation.id }}">Refresh details</a>
+  </div>
+  <div class="operation-log-panel">
+    <div><p class="eyebrow">Event log</p><span>Latest {{ operation_logs|length }} entries</span></div>
+    <ol class="operation-log" data-operation-logs aria-live="polite" aria-relevant="additions text">
+      {% for entry in operation_logs %}
+      <li class="log-{{ entry.level|lower }}"><time datetime="{{ entry.created_at }}">{{ entry.created_at|datetime }}</time><strong>{{ entry.level }}</strong><span>{{ entry.message }}</span></li>
+      {% else %}
+      <li class="operation-log-empty">Waiting for the first operation event.</li>
+      {% endfor %}
+    </ol>
+  </div>
+  {% else %}
+  <div class="empty-state operation-empty">
+    <p class="eyebrow">No operation history</p>
+    <h2 id="operation-monitor-title">Ready for the first archive pass.</h2>
+    <p>Choose a command below. Telegram network commands run one at a time to protect the session and respect rate limits.</p>
+  </div>
+  {% endif %}
+</section>
+
+<section class="operation-command-section" aria-labelledby="operation-command-title" data-operation-commands data-selected-chats="{{ selected_chats|length }}" data-active-operation="{{ active_operation.id if active_operation else '' }}">
+  <div class="chapter-heading">
+    <div><p class="eyebrow">Command launcher</p><h2 id="operation-command-title">Choose the next operation.</h2></div>
+    <p>Commands are allowlisted application workflows. The browser cannot execute arbitrary shell commands.</p>
+  </div>
+  <div class="operation-command-grid">
+    <form class="operation-command-card sync-command-card" method="post" action="/operations/start" data-operation-start-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="command" value="sync">
+      <input type="hidden" name="content_types_present" value="1">
+      <div class="command-card-heading"><span>01</span><div><p>Historical backfill</p><h3>Sync selected history</h3></div></div>
+      <p>Resume from durable checkpoints, repair missing files, and archive messages oldest-to-newest.</p>
+      <div class="sync-options">
+        <label><span>Chat scope</span><select name="chat">
+          <option value="">All selected chats</option>
+          {% for chat in selected_chats %}<option value="{{ chat.telegram_chat_id }}">{{ chat.title }} · {{ chat.telegram_chat_id }}</option>{% endfor %}
+        </select></label>
+        <label><span>Message limit per chat</span><input type="number" name="limit" min="1" max="1000000" inputmode="numeric" placeholder="No limit"></label>
+        <label><span>Since date</span><input type="date" name="since"></label>
+        <label><span>Until date</span><input type="date" name="until"></label>
+      </div>
+      {{ content_picker('sync') }}
+      <button class="button primary" type="submit" {% if active_operation or not selected_chats %}disabled aria-disabled="true"{% endif %}>{% if not selected_chats %}Select a chat first{% else %}Start sync{% endif %}</button>
+    </form>
+
+    <form class="operation-command-card" method="post" action="/operations/start" data-operation-start-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="command" value="listen">
+      <input type="hidden" name="content_types_present" value="1">
+      <div class="command-card-heading"><span>02</span><div><p>Real-time worker</p><h3>Start listener</h3></div></div>
+      <p>Monitor selected chats for new messages and edits. This remains active until safely stopped.</p>
+      <details class="content-type-disclosure" data-content-disclosure data-content-label="Content types"><summary>Content types · all selected</summary>{{ content_picker('listen') }}</details>
+      <div class="command-card-signal"><span aria-hidden="true"></span>Reconnects automatically</div>
+      <button class="button primary" type="submit" {% if active_operation or not selected_chats %}disabled aria-disabled="true"{% endif %}>{% if not selected_chats %}Select a chat first{% else %}Start listener{% endif %}</button>
+    </form>
+
+    <form class="operation-command-card" method="post" action="/operations/start" data-operation-start-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="command" value="retry-failed">
+      <input type="hidden" name="content_types_present" value="1">
+      <div class="command-card-heading"><span>03</span><div><p>Media recovery</p><h3>Retry failed files</h3></div></div>
+      <p>Retry only media currently marked failed while preserving completed files and message identities.</p>
+      <details class="content-type-disclosure" data-content-disclosure data-content-label="Media types"><summary>Media types · all selected</summary>{{ content_picker('retry', true) }}</details>
+      <div class="command-card-signal warning-signal">Respects FloodWait and retry limits</div>
+      <button class="button secondary" type="submit" {% if active_operation or not selected_chats %}disabled aria-disabled="true"{% endif %}>Retry failed media</button>
+    </form>
+
+    <form class="operation-command-card" method="post" action="/operations/start" data-operation-start-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="command" value="doctor">
+      <div class="command-card-heading"><span>04</span><div><p>Installation check</p><h3>Run doctor</h3></div></div>
+      <p>Validate configuration, SQLite, download storage, authorization, and selected-chat access.</p>
+      <div class="command-card-signal">Secrets remain redacted</div>
+      <button class="button secondary" type="submit" {% if active_operation %}disabled aria-disabled="true"{% endif %}>Run diagnostics</button>
+    </form>
+  </div>
+</section>
+
+<section class="command-map" aria-labelledby="command-map-title">
+  <div class="chapter-heading"><div><p class="eyebrow">Web command map</p><h2 id="command-map-title">Every operator workflow, one interface.</h2></div></div>
+  <div class="command-map-grid">
+    <a href="/auth/telegram"><code>login</code><strong>Telegram account</strong><span>Connect an existing account with the official QR flow.</span></a>
+    <a href="/chats?refresh=true"><code>chats</code><strong>Discover and select</strong><span>Refresh accessible dialogs and save archive coverage.</span></a>
+    <a href="/"><code>stats</code><strong>Archive overview</strong><span>Inspect message, media, failure, and activity totals.</span></a>
+    <a href="/system"><code>web · tui</code><strong>Web and system</strong><span>Use this responsive console as the browser equivalent of the terminal UI, and review the active server, storage, and security posture.</span></a>
+  </div>
+</section>
+
+{% if recent_operations %}
+<section class="operation-history" aria-labelledby="operation-history-title">
+  <div class="chapter-heading"><div><p class="eyebrow">Durable history</p><h2 id="operation-history-title">Recent operations</h2></div></div>
+  <div class="operation-history-list">
+    {% for operation in recent_operations %}
+    <a href="/operations?job={{ operation.id }}" {% if focus_operation and focus_operation.id == operation.id %}aria-current="true"{% endif %}>
+      <span>#{{ operation.id }}</span><strong>{{ operation.command|replace('-', ' ') }}</strong><em class="status-{{ operation.status }}">{{ operation.status }}</em><time datetime="{{ operation.created_at }}">{{ operation.created_at|datetime }}</time>
+    </a>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+{% endblock %}

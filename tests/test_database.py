@@ -3,9 +3,9 @@ from pathlib import Path
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from app.database.models import Message
-from app.database.repository import ArchiveRepository
-from app.database.session import Database
+from app.infrastructure.persistence.database import Database
+from app.infrastructure.persistence.models import Message
+from app.infrastructure.persistence.repository import ArchiveRepository
 from tests.helpers import make_chat, make_message
 
 

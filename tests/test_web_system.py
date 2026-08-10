@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from app.config import Settings
-from app.web.system import inspect_storage
+from app.interfaces.web.system import inspect_storage
 
 
 def test_storage_health_counts_partial_and_missing_files(tmp_path: Path) -> None:

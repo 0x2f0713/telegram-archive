@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from app.services.filenames import media_filename, output_path, sanitize_filename
+from app.application.filenames import media_filename, output_path, sanitize_filename
 from tests.helpers import make_chat, make_message
 
 

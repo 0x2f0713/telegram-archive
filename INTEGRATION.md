@@ -218,13 +218,13 @@ For an in-process integration, construct one settings/database/repository/servic
 
 ```python
 from app.config import Settings
-from app.database.repository import ArchiveRepository
-from app.database.session import Database
-from app.services.archive import ArchiveService
-from app.services.chat_selection import ChatSelectionService
-from app.services.downloader import MediaDownloader
-from app.telegram.client import connect_authorized, create_client
-from app.telegram.history import sync_history
+from app.infrastructure.persistence.repository import ArchiveRepository
+from app.infrastructure.persistence.database import Database
+from app.application.archive import ArchiveService
+from app.application.chat_selection import ChatSelectionService
+from app.infrastructure.download import MediaDownloader
+from app.infrastructure.telegram.client import connect_authorized, create_client
+from app.application.sync import sync_history
 
 settings = Settings()
 database = Database(settings.database_url)
@@ -252,7 +252,9 @@ finally:
 
 Do not share a SQLAlchemy `AsyncSession`; repository operations intentionally create short-lived transactions. One `ArchiveService` may process concurrent listener events safely: a per-message lock prevents duplicate work and `MediaDownloader` applies the configured global semaphore. Historical sync also uses `DOWNLOAD_CONCURRENCY` as its bounded in-flight window. It settles tasks and advances the per-chat checkpoint in source order, so a newer completed transfer can never make restart recovery skip older in-flight work.
 
-`ChatInfo` and `MessageData` in `app.telegram.entities` are the adapter boundary between Telethon objects and archive logic. Integrations should prefer these data types and repository methods over direct ORM mutation, because explicit repository transitions preserve retry and deduplication invariants.
+`ChatInfo` and `MessageData` in `app.domain` are the pure business value objects. `app.infrastructure.telegram.translation` adapts raw Telethon objects into them at the adapter boundary. Integrations should prefer these data types and repository methods over direct ORM mutation, because explicit repository transitions preserve retry and deduplication invariants.
+
+The package layout follows the business model: `app.domain` holds the artifact hierarchy (Chat -> Message -> MediaArtifact) with no framework imports, `app.application` holds the workflows (archive, sync, listener, operations, media policy), `app.infrastructure` holds the Telethon, persistence, and download adapters, and `app.interfaces` holds the CLI, TUI, and web surfaces.
 
 ## Database and file consistency contract
 

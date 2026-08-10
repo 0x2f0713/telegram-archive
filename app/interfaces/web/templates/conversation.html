@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}{{ chat.title }} | Telegram Archiver{% endblock %}
+{% block content %}
+<nav class="breadcrumb" aria-label="Breadcrumb"><a href="/chats">Coverage</a><span aria-hidden="true">/</span><span>{{ chat.title }}</span></nav>
+<header class="page-heading conversation-heading">
+  <div>
+    <p class="eyebrow">{{ chat.type|capitalize }} archive · {{ chat.telegram_chat_id }}</p>
+    <h1>{{ chat.title }}</h1>
+    <p>{{ chat.message_count }} messages archived · {{ chat.completed_count }} files · {{ chat.failed_count }} failed{{ ' · @' ~ chat.username if chat.username }}.</p>
+  </div>
+  <div class="heading-actions">
+    <a class="button secondary" href="/messages?chat={{ chat.telegram_chat_id }}">Open explorer view</a>
+  </div>
+</header>
+
+<section class="conversation-thread" aria-label="Conversation with {{ chat.title }}">
+  {% if has_older %}
+  <div class="thread-history-control">
+    <a class="button secondary" href="{{ older_url }}">Load older messages</a>
+    <span>Showing the newest {{ messages|length }} of {{ chat.message_count }}</span>
+  </div>
+  {% endif %}
+
+  {% if messages %}
+  {% set last_day = namespace(value="") %}
+  {% for message in messages %}
+    {% set day = message.message_date|day_label %}
+    {% if day != last_day.value %}
+      {% set last_day.value = day %}
+      <div class="thread-divider" role="separator"><span>{{ day }}</span></div>
+    {% endif %}
+    {% set is_out = account_user_id is not none and message.sender_id == account_user_id %}
+    <article class="thread-bubble {{ 'bubble-out' if is_out else 'bubble-in' }}" data-sender="{{ message.sender_id or 'anonymous' }}" style="--sender-hue: {{ (message.sender_id or 0) % 360 }}deg">
+      {% if not is_out and (loop.previtem is not defined or (loop.previtem.sender_id != message.sender_id or (loop.previtem.message_date|day_label) != day)) %}
+      {% set sender_parts = (message.sender_name or '?').split() %}
+      <div class="sender-line">
+        <span class="sender-avatar" aria-hidden="true">{{ sender_parts[:2]|map('first')|join('')|upper }}</span>
+        {% if chat.type != 'user' %}<strong>{{ message.sender_name or ('Sender ' ~ message.sender_id if message.sender_id else 'Unknown sender') }}</strong>{% endif %}
+      </div>
+      {% endif %}
+      <div class="bubble-body">
+        {% if message.reply_to_message_id is not none %}
+          {% set reply_local = reply_targets.get(message.reply_to_message_id) %}
+          {% if reply_local %}<a class="bubble-reply" href="/messages/{{ reply_local }}">Reply to message #{{ message.reply_to_message_id }}</a>
+          {% else %}<span class="bubble-reply" title="Reply target is not archived in this chat">Reply to message #{{ message.reply_to_message_id }}</span>{% endif %}
+        {% endif %}
+        {% if message.text %}<p class="bubble-text">{{ message.text }}</p>{% endif %}
+        {% if message.download_status == 'completed' and message.media_path %}
+          {% set kind = preview_kind(message.mime_type) %}
+          {% if kind == 'image' %}<img class="bubble-media" src="/media/{{ message.id }}" alt="Media attached to message {{ message.telegram_message_id }}" loading="lazy">
+          {% elif kind == 'video' %}<video class="bubble-media" controls preload="metadata"><source src="/media/{{ message.id }}" type="{{ message.mime_type }}">Your browser cannot play this video. Use the download link.</video>
+          {% elif kind == 'audio' %}<audio class="bubble-media" controls preload="metadata"><source src="/media/{{ message.id }}" type="{{ message.mime_type }}">Your browser cannot play this audio. Use the download link.</audio>
+          {% else %}<a class="bubble-file" href="/media/{{ message.id }}" download><span class="file-glyph" aria-hidden="true"></span><span><strong>{{ message.filename or 'Archived file' }}</strong><small>{{ message.mime_type or 'Unknown file type' }}{% if message.media_size is not none %} · {{ message.media_size|bytes }}{% endif %}</small></span><span class="file-cta">Download</span></a>{% endif %}
+        {% elif message.has_media %}
+          <div class="bubble-media-missing"><span class="status status-{{ message.download_status }}"><i aria-hidden="true"></i>{{ message.download_status|replace('_', ' ') }}</span>{% if message.download_error %}<small>{{ message.download_error }}</small>{% endif %}{% if message.download_status == 'failed' %}<a class="text-action" href="/operations">Retry in operations</a>{% endif %}</div>
+        {% elif message.download_status not in ('completed', 'pending') %}
+          <span class="status status-{{ message.download_status }}"><i aria-hidden="true"></i>{{ message.download_status|replace('_', ' ') }}</span>
+        {% endif %}
+      </div>
+      <footer class="bubble-meta">
+        <time datetime="{{ message.message_date.isoformat() }}">{{ message.message_date|datetime }}</time>
+        {% if message.edit_date %}<span class="edited-mark" title="Edited {{ message.edit_date|datetime }}">edited</span>{% endif %}
+      </footer>
+    </article>
+  {% endfor %}
+  {% else %}
+  <div class="empty-state"><span class="empty-mark" aria-hidden="true"></span><strong>No messages archived for this chat.</strong><p>Run a sync or the listener to pull this chat's history into the archive.</p><a class="button secondary" href="/operations">Open operations</a></div>
+  {% endif %}
+</section>
+{% endblock %}

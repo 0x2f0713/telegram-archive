@@ -10,6 +10,45 @@ import yaml
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+#: Settings keys an operator may edit from the web "Effective configuration"
+#: panel. Secrets and environment-sensitive paths intentionally stay outside.
+RUNTIME_OVERRIDE_FIELDS: frozenset[str] = frozenset(
+    {
+        "download_photos",
+        "download_videos",
+        "download_documents",
+        "download_audio",
+        "max_file_size_mb",
+        "download_concurrency",
+        "download_retries",
+        "allowed_extensions",
+        "ignored_extensions",
+        "keywords",
+        "log_level",
+        "web_refresh_seconds",
+    }
+)
+
+_BOOL_OVERRIDES: frozenset[str] = frozenset(
+    {
+        "download_photos",
+        "download_videos",
+        "download_documents",
+        "download_audio",
+    }
+)
+
+_INT_OVERRIDES: frozenset[str] = frozenset(
+    {
+        "max_file_size_mb",
+        "download_concurrency",
+        "download_retries",
+        "web_refresh_seconds",
+    }
+)
+
+_TRUE_VALUES: frozenset[str] = frozenset({"1", "true", "on", "yes"})
+
 
 class ConfigurationError(ValueError):
     """Raised when required application configuration is invalid."""
@@ -151,3 +190,78 @@ class Settings(BaseSettings):
         if value and not value.startswith("."):
             value = f".{value}"
         return value
+
+
+def decode_overrides(overrides: dict[str, str]) -> dict[str, object]:
+    """Convert stored override strings into typed values for validation.
+
+    Only keys declared in ``RUNTIME_OVERRIDE_FIELDS`` are returned; anything
+    else is dropped, which keeps secret and environment-only settings safe
+    even if a crafted or corrupt row reaches the resolver.
+    """
+    decoded: dict[str, object] = {}
+    for key, raw in overrides.items():
+        if key not in RUNTIME_OVERRIDE_FIELDS:
+            continue
+        value = raw.strip()
+        if key in _BOOL_OVERRIDES:
+            decoded[key] = value.casefold() in _TRUE_VALUES
+        elif key in _INT_OVERRIDES:
+            try:
+                decoded[key] = int(value)
+            except ValueError:
+                raise ValueError(f"Runtime override {key!r} must be an integer") from None
+        else:
+            decoded[key] = value
+    return decoded
+
+
+def encode_overrides(settings: Settings) -> dict[str, str]:
+    """Canonical string form of every editable field on a settings object."""
+    return {
+        key: ("true" if getattr(settings, key) else "false")
+        if key in _BOOL_OVERRIDES
+        else str(getattr(settings, key))
+        for key in sorted(RUNTIME_OVERRIDE_FIELDS)
+    }
+
+
+def settings_form_values(settings: Settings) -> dict[str, bool | int | str]:
+    """Typed, form-usable values for every editable setting."""
+    return {
+        key: getattr(settings, key)
+        if key in _BOOL_OVERRIDES or key in _INT_OVERRIDES
+        else str(getattr(settings, key))
+        for key in sorted(RUNTIME_OVERRIDE_FIELDS)
+    }
+
+
+def runtime_form_values(values: dict[str, list[str]]) -> dict[str, str]:
+    """Convert parsed form values into canonical override strings.
+
+    Boolean fields are checkbox keys: present means true, absent false.
+    Integer and string fields are stripped and must be non-empty. Keys
+    outside ``RUNTIME_OVERRIDE_FIELDS`` are dropped.
+    """
+    overrides: dict[str, str] = {}
+    for key in sorted(RUNTIME_OVERRIDE_FIELDS):
+        if key in _BOOL_OVERRIDES:
+            overrides[key] = "true" if key in values else "false"
+            continue
+        raw = (values.get(key, [""])[0] if values.get(key) else "").strip()
+        overrides[key] = raw
+    return overrides
+
+
+def apply_runtime_overrides(settings: Settings, overrides: dict[str, str]) -> Settings:
+    """Return a re-validated settings copy with DB overrides applied on top.
+
+    Pydantic validation runs again on the merged values, so an invalid row
+    (bad log level, out-of-range integer) raises ``ValidationError`` instead
+    of silently producing an inconsistent runtime configuration.
+    """
+    if not overrides:
+        return settings
+    merged: dict[str, Any] = settings.model_dump()
+    merged.update(decode_overrides(overrides))
+    return Settings.model_validate(merged)

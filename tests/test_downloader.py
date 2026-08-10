@@ -2,7 +2,7 @@ import asyncio
 from pathlib import Path
 
 from app.config import Settings
-from app.services.downloader import MediaDownloader
+from app.infrastructure.download import MediaDownloader
 
 
 class RecordingRepository:
@@ -77,6 +77,7 @@ async def test_download_forwards_per_file_progress(tmp_path: Path) -> None:
     downloader = MediaDownloader(Settings(_env_file=None, download_retries=1), repository)  # type: ignore[arg-type]
     updates: list[tuple[int, int]] = []
     target = tmp_path / "42_report.pdf"
+
     def collect(current: int, total: int) -> None:
         updates.append((current, total))
 

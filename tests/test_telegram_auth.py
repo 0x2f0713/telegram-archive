@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from telethon.errors import SessionPasswordNeededError
 
 from app.config import Settings
-from app.web.telegram_auth import TelegramAuthStatus, TelegramQrAuthManager
+from app.interfaces.web.auth import TelegramAuthStatus, TelegramQrAuthManager
 
 
 class _FakeQrLogin:

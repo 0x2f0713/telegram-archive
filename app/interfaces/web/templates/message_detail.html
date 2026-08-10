@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Message {{ message.telegram_message_id }} | Telegram Archiver{% endblock %}
+{% block content %}
+<nav class="breadcrumb" aria-label="Breadcrumb"><a href="/messages">Explorer</a><span aria-hidden="true">/</span><span>{{ message.chat_title }}</span><span aria-hidden="true">/</span><span>{{ message.telegram_message_id }}</span></nav>
+<header class="page-heading detail-heading"><div><p class="eyebrow">{{ message.chat_title }}</p><h1>Message {{ message.telegram_message_id }}</h1><p>Sent by {{ message.sender_name or ('sender ' ~ message.sender_id if message.sender_id else 'an unknown sender') }} on {{ message.message_date|datetime }}.</p></div><span class="status status-{{ message.download_status }}"><i aria-hidden="true"></i>{{ message.download_status|replace('_', ' ') }}</span></header>
+
+<div class="detail-layout">
+  <article class="message-document">
+    <div class="document-head"><h2>Stored content</h2><button class="text-action" type="button" data-copy-value="{{ message.telegram_chat_id }}:{{ message.telegram_message_id }}">Copy identity</button></div>
+    {% if message.text %}<div class="message-text">{{ message.text }}</div>{% else %}<div class="empty-inline">This message has no text or caption.</div>{% endif %}
+    {% if message.download_status == 'completed' and message.media_path %}
+    <section class="media-preview" aria-labelledby="media-preview-heading"><div class="panel-heading"><div><h2 id="media-preview-heading">Archived media</h2><p>{{ message.filename or 'Generated archive filename' }}</p></div><a class="button secondary" href="/media/{{ message.id }}" download>Download file</a></div>
+      {% if preview_kind == 'image' %}<img src="/media/{{ message.id }}" alt="Media attached to Telegram message {{ message.telegram_message_id }}" loading="lazy">
+      {% elif preview_kind == 'video' %}<video controls preload="metadata"><source src="/media/{{ message.id }}" type="{{ message.mime_type }}">Your browser cannot play this video. Use the download link.</video>
+      {% elif preview_kind == 'audio' %}<audio controls preload="metadata"><source src="/media/{{ message.id }}" type="{{ message.mime_type }}">Your browser cannot play this audio. Use the download link.</audio>
+      {% else %}<div class="file-preview"><span class="file-glyph" aria-hidden="true"></span><div><strong>{{ message.filename or 'Archived file' }}</strong><span>{{ message.mime_type or 'Unknown file type' }}, {{ message.media_size|bytes }}</span></div></div>{% endif %}
+    </section>
+    {% elif message.has_media %}<div class="notice"><strong>Media is not available for preview.</strong><p>{{ message.download_error or 'The file has not completed downloading.' }}</p>{% if message.download_status == 'failed' %}<a class="text-action" href="/operations">Open retry controls</a>{% endif %}</div>{% endif %}
+  </article>
+
+  <aside class="metadata-panel" aria-labelledby="metadata-heading"><h2 id="metadata-heading">Metadata</h2><dl><div><dt>Chat ID</dt><dd>{{ message.telegram_chat_id }}</dd></div><div><dt>Message ID</dt><dd>{{ message.telegram_message_id }}</dd></div><div><dt>Sender ID</dt><dd>{{ message.sender_id or 'Unavailable' }}</dd></div><div><dt>Media type</dt><dd>{{ message.media_type or 'None' }}</dd></div><div><dt>MIME type</dt><dd>{{ message.mime_type or 'Unavailable' }}</dd></div><div><dt>File size</dt><dd>{{ message.media_size|bytes if message.media_size is not none else 'Unavailable' }}</dd></div><div><dt>Album ID</dt><dd>{{ message.grouped_id or 'None' }}</dd></div><div><dt>Reply to</dt><dd>{{ message.reply_to_message_id or 'None' }}</dd></div><div><dt>Edited</dt><dd>{{ message.edit_date|datetime if message.edit_date else 'No' }}</dd></div><div><dt>Attempts</dt><dd>{{ message.download_attempts }}</dd></div></dl></aside>
+</div>
+
+{% if album|length > 1 %}<section class="album-context" aria-labelledby="album-title"><header class="chapter-heading"><div><p class="eyebrow">Grouped media</p><h2 id="album-title">{{ album|length }} records in this album.</h2></div></header><div class="album-rail">{% for item in album %}<a href="/messages/{{ item.id }}" {% if item.id == message.id %}aria-current="page"{% endif %}><span>{{ item.telegram_message_id }}</span><strong>{{ item.filename or item.media_type or 'Media item' }}</strong><small>{{ item.download_status|replace('_', ' ') }}</small></a>{% endfor %}</div></section>{% endif %}
+{% endblock %}

@@ -1,0 +1,492 @@
+"""Allowlisted long-running workflows the web operator can start.
+
+Each command is a use case executed inside an ``OperationContext``: sync
+historical history, run the real-time listener, retry failed media, and run
+the doctor. They are the only commands a browser can start, and none of them
+accepts a shell command.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import tempfile
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from time import monotonic
+from typing import Any
+
+from app.application.archive import ArchiveService, RetryProgress
+from app.application.chat_selection import ChatSelectionService
+from app.application.listener import ListenerProgress, RealtimeListener
+from app.application.operations import (
+    OperationContext,
+    OperationExecutionError,
+    OperationExecutor,
+    OperationManager,
+)
+from app.application.sync import SyncProgress, sync_history
+from app.config import ConfigurationError, Settings
+from app.domain import ALL_CONTENT_TYPES, ContentType, normalize_content_types
+from app.domain.content import canonical_content_type_list
+from app.infrastructure.download import MediaDownloader
+from app.infrastructure.persistence.database import Database
+from app.infrastructure.persistence.repository import ArchiveRepository
+from app.infrastructure.telegram.client import connect_authorized
+from app.utils.logging import format_bytes
+
+logger = logging.getLogger(__name__)
+
+
+class Commands:
+    """Executors bound to one operation manager."""
+
+    def __init__(self, manager: OperationManager) -> None:
+        self.manager = manager
+
+    @property
+    def settings(self) -> Settings:
+        return self.manager.settings
+
+    def executors(self) -> dict[str, OperationExecutor]:
+        return {
+            "sync": self.sync,
+            "listen": self.listen,
+            "retry-failed": self.retry_failed,
+            "doctor": self.doctor,
+        }
+
+    @staticmethod
+    def _content_types(parameters: Mapping[str, Any]) -> frozenset[ContentType] | None:
+        raw_values = parameters.get("content_types")
+        if raw_values is None:
+            return None
+        if isinstance(raw_values, str):
+            values = (raw_values,)
+        elif isinstance(raw_values, (list, tuple)):
+            values = tuple(str(value) for value in raw_values)
+        else:
+            raise ConfigurationError("content_types must be a list of Telegram content types")
+        selected = normalize_content_types(values)
+        return None if selected == ALL_CONTENT_TYPES else selected
+
+    def _archive_stack(
+        self,
+        content_types: frozenset[ContentType] | None = None,
+        download_progress: Callable[[str, int, int], None] | None = None,
+    ) -> tuple[Database, ArchiveRepository, ArchiveService]:
+        database = Database(self.settings.database_url)
+        repository = ArchiveRepository(database)
+        downloader = MediaDownloader(self.settings, repository)
+        return (
+            database,
+            repository,
+            ArchiveService(
+                self.settings,
+                repository,
+                downloader,
+                content_types,
+                download_progress,
+            ),
+        )
+
+    @staticmethod
+    def _download_reporter(
+        context: OperationContext,
+    ) -> Callable[[str, int, int], None]:
+        """Bridge Telethon's synchronous callback into throttled operation updates."""
+        last_report: dict[str, float] = {}
+        states: dict[str, tuple[int, float, float]] = {}
+        tasks: dict[str, dict[str, Any]] = {}
+
+        def report(filename: str, current: int, total: int) -> None:
+            now = monotonic()
+            previous_report = last_report.get(filename, 0.0)
+            if current < total and now - previous_report < 0.2:
+                return
+            last_report[filename] = now
+            last_current, last_time, previous_speed = states.get(filename, (0, now, 0.0))
+            elapsed = max(0.001, now - last_time)
+            instantaneous_speed = max(0, current - last_current) / elapsed
+            speed = (
+                instantaneous_speed
+                if not previous_speed
+                else (previous_speed * 0.7 + instantaneous_speed * 0.3)
+            )
+            states[filename] = (current, now, speed)
+            percent = round(current / total * 100, 1) if total else None
+            status = "completed" if total and current >= total else "downloading"
+            tasks[filename] = {
+                "filename": filename,
+                "current": current,
+                "total": total,
+                "percent": percent,
+                "speed": round(speed),
+                "status": status,
+            }
+            # Keep the active list useful without allowing a long sync to grow
+            # the in-memory operation payload without bound.
+            while len(tasks) > 8:
+                oldest = next(iter(tasks))
+                if tasks[oldest]["status"] == "downloading":
+                    break
+                tasks.pop(oldest)
+            snapshot = list(tasks.values())
+            task = asyncio.create_task(
+                context.progress(
+                    force=current >= total,
+                    phase="downloading",
+                    detail=(
+                        f"Downloading {filename} ({percent or 0:.1f}%, "
+                        f"{format_bytes(round(speed))}/s)"
+                    ),
+                    download_filename=filename,
+                    download_current=current,
+                    download_total=total,
+                    download_percent=percent,
+                    download_speed=round(speed),
+                    download_tasks=snapshot,
+                )
+            )
+            task.add_done_callback(lambda completed: completed.exception())
+
+        return report
+
+    async def _selected_chats(self, client: Any, repository: ArchiveRepository) -> dict[int, Any]:
+        chats = await ChatSelectionService(self.settings, repository).resolve_with_client(client)
+        if not chats:
+            raise ConfigurationError(
+                "No chats are selected. Choose chats on the Chats page before starting a worker."
+            )
+        return chats
+
+    @staticmethod
+    def _parse_sync_dates(parameters: dict[str, Any]) -> tuple[datetime | None, datetime | None]:
+        def parsed(name: str) -> datetime | None:
+            raw = parameters.get(name)
+            if not raw:
+                return None
+            try:
+                return datetime.strptime(str(raw), "%Y-%m-%d").replace(tzinfo=UTC)
+            except ValueError as exc:
+                raise ConfigurationError(f"{name} must use YYYY-MM-DD format") from exc
+
+        since = parsed("since")
+        until_day = parsed("until")
+        until = until_day + timedelta(days=1) if until_day else None
+        if since and until and since >= until:
+            raise ConfigurationError("Since date must be on or before until date")
+        return since, until
+
+    async def sync(self, context: OperationContext) -> None:
+        content_types = self._content_types(context.parameters)
+        database, repository, archive = self._archive_stack(
+            content_types, self._download_reporter(context)
+        )
+        client = self.manager.client_factory(self.settings)
+        try:
+            await database.initialize()
+            await context.progress(
+                force=True,
+                phase="connecting",
+                detail="Connecting to the authorized Telegram session",
+            )
+            await connect_authorized(client)
+            chats = await self._selected_chats(client, repository)
+            raw_chat = context.parameters.get("chat")
+            if raw_chat is not None:
+                chat_id = int(raw_chat)
+                if chat_id not in chats:
+                    raise ConfigurationError(f"Chat {chat_id} is not selected for archiving")
+                chats = {chat_id: chats[chat_id]}
+            limit_value = context.parameters.get("limit")
+            limit = int(limit_value) if limit_value is not None else None
+            if limit is not None and limit < 1:
+                raise ConfigurationError("Message limit must be at least 1")
+            since, until = self._parse_sync_dates(context.parameters)
+            if content_types is not None:
+                await context.log(
+                    "Selected content types: "
+                    + ", ".join(canonical_content_type_list(content_types))
+                )
+            await context.progress(
+                force=True,
+                phase="repairing",
+                detail="Checking incomplete media before history sync",
+                progress_current=0,
+                progress_total=None,
+                chats_total=len(chats),
+            )
+
+            async def repair_progress(progress: RetryProgress) -> None:
+                await context.progress(
+                    phase=progress.phase,
+                    detail=progress.detail,
+                    progress_current=progress.current,
+                    progress_total=progress.total,
+                    retry_attempted=progress.attempted,
+                    retry_completed=progress.completed,
+                )
+
+            attempted, repaired = await archive.retry_candidates(
+                client,
+                chats,
+                stop_event=context.stop_event,
+                progress=repair_progress,
+            )
+            if context.stop_event.is_set():
+                return
+            if attempted:
+                await context.log(
+                    f"Startup repair attempted {attempted} media files and downloaded {repaired}"
+                )
+
+            async def sync_progress(progress: SyncProgress) -> None:
+                await context.progress(
+                    phase=progress.phase,
+                    detail=progress.detail,
+                    progress_current=progress.chats_completed,
+                    progress_total=progress.chats_total,
+                    chats_completed=progress.chats_completed,
+                    chats_total=progress.chats_total,
+                    messages_processed=progress.messages_processed,
+                    downloads_completed=progress.downloads_completed + repaired,
+                )
+                if progress.phase == "chat-complete":
+                    await context.log(progress.detail)
+                elif progress.phase in {"rate-limited", "reconnecting"}:
+                    await context.log(progress.detail, "WARNING")
+
+            result = await sync_history(
+                client,
+                chats,
+                archive,
+                repository,
+                limit=limit,
+                since=since,
+                until=until,
+                concurrency=self.settings.download_concurrency,
+                content_types=content_types,
+                stop_event=context.stop_event,
+                progress=sync_progress,
+            )
+            await context.progress(
+                force=True,
+                progress_current=result.chats,
+                progress_total=len(chats),
+                chats_completed=result.chats,
+                chats_total=len(chats),
+                messages_processed=result.messages,
+                downloads_completed=result.downloads + repaired,
+                detail=(
+                    f"Processed {result.messages} messages and downloaded "
+                    f"{result.downloads + repaired} files"
+                ),
+            )
+        finally:
+            await client.disconnect()
+            await database.close()
+
+    async def retry_failed(self, context: OperationContext) -> None:
+        content_types = self._content_types(context.parameters)
+        database, repository, archive = self._archive_stack(
+            content_types, self._download_reporter(context)
+        )
+        client = self.manager.client_factory(self.settings)
+        try:
+            await database.initialize()
+            await context.progress(
+                force=True,
+                phase="connecting",
+                detail="Connecting to Telegram and loading failed media",
+            )
+            await connect_authorized(client)
+            chats = await self._selected_chats(client, repository)
+
+            async def retry_progress(progress: RetryProgress) -> None:
+                await context.progress(
+                    phase=progress.phase,
+                    detail=progress.detail,
+                    progress_current=progress.current,
+                    progress_total=progress.total,
+                    retry_attempted=progress.attempted,
+                    retry_completed=progress.completed,
+                    downloads_completed=progress.completed,
+                    chats_total=len(chats),
+                )
+
+            attempted, completed = await archive.retry_candidates(
+                client,
+                chats,
+                failed_only=True,
+                stop_event=context.stop_event,
+                progress=retry_progress,
+            )
+            await context.progress(
+                force=True,
+                retry_attempted=attempted,
+                retry_completed=completed,
+                downloads_completed=completed,
+                detail=f"Retried {attempted} failed media files; {completed} downloaded",
+            )
+        finally:
+            await client.disconnect()
+            await database.close()
+
+    async def listen(self, context: OperationContext) -> None:
+        content_types = self._content_types(context.parameters)
+        database, repository, archive = self._archive_stack(
+            content_types, self._download_reporter(context)
+        )
+        client = self.manager.client_factory(self.settings)
+        try:
+            await database.initialize()
+            await context.progress(
+                force=True,
+                phase="connecting",
+                detail="Connecting the real-time Telegram listener",
+            )
+            await connect_authorized(client)
+            chats = await self._selected_chats(client, repository)
+            await context.progress(
+                force=True,
+                chats_total=len(chats),
+                phase="repairing",
+                detail="Repairing incomplete media before listening",
+            )
+
+            async def listener_progress(progress: ListenerProgress) -> None:
+                await context.increment(
+                    messages_processed=1,
+                    downloads_completed=int(progress.downloaded),
+                )
+                action = "edit" if progress.edited else "message"
+                await context.progress(
+                    phase="listening",
+                    detail=f"Archived {action} {progress.message_id} from {progress.chat_title}",
+                )
+
+            listener = RealtimeListener(
+                client,
+                chats,
+                archive,
+                self.settings,
+                progress=listener_progress,
+                manage_signals=False,
+                stop_event=context.stop_event,
+            )
+            listener.install_handlers()
+
+            async def repair_progress(progress: RetryProgress) -> None:
+                await context.progress(
+                    phase=progress.phase,
+                    detail=progress.detail,
+                    progress_current=progress.current,
+                    progress_total=progress.total,
+                    retry_attempted=progress.attempted,
+                    retry_completed=progress.completed,
+                )
+
+            attempted, repaired = await archive.retry_candidates(
+                client,
+                chats,
+                stop_event=context.stop_event,
+                progress=repair_progress,
+            )
+            if context.stop_event.is_set():
+                return
+            await context.log(
+                f"Listener startup repair attempted {attempted} media files and downloaded {repaired}"
+            )
+            await context.progress(
+                force=True,
+                phase="listening",
+                detail=f"Monitoring {len(chats)} selected chats for new messages and edits",
+                progress_current=0,
+                progress_total=None,
+                chats_total=len(chats),
+                downloads_completed=repaired,
+            )
+            await listener.run()
+        finally:
+            await client.disconnect()
+            await database.close()
+
+    async def doctor(self, context: OperationContext) -> None:
+        checks_total = 4
+        failed = False
+        await context.progress(
+            force=True,
+            phase="checking",
+            detail="Validating configuration",
+            progress_current=0,
+            progress_total=checks_total,
+        )
+        try:
+            self.settings.require_telegram_credentials()
+            await context.log("PASS · Telegram API credentials are configured")
+        except ConfigurationError as exc:
+            failed = True
+            await context.log(f"FAIL · Environment: {exc}", "ERROR")
+        await context.progress(
+            progress_current=1,
+            detail="Validated environment configuration",
+        )
+        if context.stop_event.is_set():
+            return
+
+        try:
+            await self.manager.database.healthcheck()
+            await context.log("PASS · SQLite database is readable and writable")
+        except Exception as exc:
+            failed = True
+            await context.log(f"FAIL · Database: {type(exc).__name__}: {exc}", "ERROR")
+        await context.progress(progress_current=2, detail="Validated SQLite database")
+        if context.stop_event.is_set():
+            return
+
+        def check_download_directory(path: Path) -> None:
+            path.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=path, prefix=".doctor-", delete=True):
+                pass
+
+        try:
+            await asyncio.to_thread(check_download_directory, self.settings.download_dir)
+            await context.log("PASS · Download directory is writable")
+        except OSError as exc:
+            failed = True
+            await context.log(f"FAIL · Downloads: {type(exc).__name__}: {exc}", "ERROR")
+        await context.progress(progress_current=3, detail="Validated download storage")
+        if context.stop_event.is_set():
+            return
+
+        client = self.manager.client_factory(self.settings)
+        database, repository, _archive = self._archive_stack()
+        try:
+            await database.initialize()
+            await connect_authorized(client)
+            chats = await ChatSelectionService(self.settings, repository).resolve_with_client(
+                client
+            )
+            if chats:
+                await context.log(
+                    f"PASS · Telegram session authorized; {len(chats)} selected chats accessible"
+                )
+            else:
+                await context.log(
+                    "WARN · Telegram session authorized; no chats selected", "WARNING"
+                )
+        except Exception as exc:
+            failed = True
+            await context.log(f"FAIL · Telegram: {type(exc).__name__}: {exc}", "ERROR")
+        finally:
+            await client.disconnect()
+            await database.close()
+        await context.progress(
+            force=True,
+            progress_current=4,
+            detail="Doctor checks finished",
+        )
+        if failed:
+            raise OperationExecutionError("One or more doctor checks failed")

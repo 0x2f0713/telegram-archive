@@ -1,10 +1,10 @@
 import asyncio
 from types import SimpleNamespace
 
+from app.application.archive import ArchiveService, ProcessResult
+from app.application.listener import RealtimeListener
 from app.config import Settings
-from app.database.repository import RetryCandidate
-from app.services.archive import ArchiveService, ProcessResult
-from app.telegram.listener import RealtimeListener
+from app.infrastructure.persistence.repository import RetryCandidate
 from tests.helpers import make_chat
 
 

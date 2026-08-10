@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.services.archive import ProcessResult
-from app.telegram.history import SyncProgress, sync_history
+from app.application.archive import ProcessResult
+from app.application.sync import SyncProgress, sync_history
 from tests.helpers import make_chat
 
 
