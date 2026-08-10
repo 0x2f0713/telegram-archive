@@ -1,3 +1,4 @@
+@import "plyr/dist/plyr.css";
 :root {
   color-scheme: dark;
   --bg: #081210;
@@ -372,3 +373,15 @@ main { width: min(100%, 92rem); margin: 0 auto; padding: clamp(4rem, 8vw, 8rem) 
 @media (max-width: 47.9375rem) {
   .settings-group, .settings-grid { grid-template-columns: 1fr 1fr; }
 }
+/* Chat filter keyboard navigation */
+.chat-choice.is-highlighted { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, var(--surface)); box-shadow: 0 0 0 1px var(--accent); }
+.chat-choice.is-highlighted .chat-identity strong { color: var(--accent); }
+.chat-picker-search small { grid-column: 1 / -1; margin-top: -0.25rem; color: var(--ink-faint); font-size: 0.68rem; }
+.chat-picker-search kbd { padding: 0 0.3rem; border: 1px solid var(--line-strong); border-radius: 0.25rem; background: var(--surface-raised); font-family: inherit; font-size: 0.62rem; }
+/* Plyr player theming and video speed badge */
+.bubble-player { position: relative; }
+.bubble-player .plyr { --plyr-color-main: var(--accent); --plyr-video-controls-background: linear-gradient(rgba(5, 11, 9, 0), rgba(5, 11, 9, 0.85)); --plyr-menu-background: var(--surface-raised); --plyr-menu-color: var(--ink); --plyr-menu-border-color: var(--line-strong); --plyr-tooltip-background: var(--surface-raised); --plyr-tooltip-color: var(--ink); --plyr-menu-arrow-size: 0; border-radius: var(--radius); overflow: hidden; }
+.bubble-player .plyr video { border-radius: var(--radius); }
+.bubble-player .plyr__controls { border-radius: 0 0 var(--radius) var(--radius); }
+.bubble-player .plyr__menu__container { border-radius: var(--radius-sm); }
+.video-speed-badge { position: absolute; right: 0.6rem; bottom: 3.4rem; z-index: 10; display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.3rem 0.6rem; border-radius: 999px; background: rgba(5, 11, 9, 0.82); border: 1px solid var(--line-strong); color: var(--ink); font-size: 0.68rem; font-variant-numeric: tabular-nums; pointer-events: none; }

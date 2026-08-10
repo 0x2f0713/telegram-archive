@@ -62,8 +62,9 @@
         <h2 id="chat-picker-title">Select archive targets</h2>
       </div>
       <label class="chat-picker-search">
-        <span>Filter accessible chats</span>
-        <input type="search" placeholder="Filter by title, type, username, or ID" autocomplete="off" data-chat-filter>
+        <span>Filter accessible chats <kbd>/</kbd></span>
+        <input type="search" placeholder="Filter by title, type, username, or ID — Enter opens the top match" autocomplete="off" data-chat-filter>
+        <small data-chat-filter-count hidden></small>
       </label>
       <div class="chat-picker-actions">
         <button type="button" class="button secondary" data-select-visible>Select visible</button>

@@ -1,6 +1,7 @@
 import "@fontsource-variable/geist";
 import { gsap } from "gsap";
 import { ScrollTrigger } from "gsap/ScrollTrigger";
+import Plyr from "plyr";
 import "../static/dashboard.css";
 
 gsap.registerPlugin(ScrollTrigger);
@@ -305,10 +306,12 @@ function setupChatSelection() {
   const modeLabel = form.querySelector("[data-selection-mode-label]");
   const warning = form.querySelector("[data-all-mode-warning]");
   const search = form.querySelector("[data-chat-filter]");
+  const count = form.querySelector("[data-chat-filter-count]");
   const empty = form.querySelector("[data-chat-filter-empty]");
   const selectVisible = form.querySelector("[data-select-visible]");
   const clearVisible = form.querySelector("[data-clear-visible]");
   const save = form.querySelector("[data-save-selection]");
+  let selectedChoice = null;
   const specificIds = new Set(
     choices
       .filter((choice) => choice.dataset.specificSelected === "true")
@@ -363,6 +366,39 @@ function setupChatSelection() {
       choice.hidden = !choice.dataset.search.toLocaleLowerCase().includes(query);
     });
     if (empty) empty.hidden = visibleChoices().length > 0;
+    if (count) {
+      count.hidden = !query || visibleChoices().length === 0;
+      if (!count.hidden) count.textContent = `${visibleChoices().length} of ${choices.length} dialogs match`;
+    }
+    setHighlight(query ? 0 : -1);
+  };
+  const setHighlight = (index) => {
+    const visible = visibleChoices();
+    if (!visible.length) {
+      selectedChoice = null;
+      return;
+    }
+    if (index < 0) {
+      selectedChoice = null;
+      choices.forEach((choice) => choice.classList.remove("is-highlighted"));
+      return;
+    }
+    selectedChoice = visible[index % visible.length];
+    choices.forEach((choice) => choice.classList.remove("is-highlighted"));
+    selectedChoice.classList.add("is-highlighted");
+    selectedChoice.scrollIntoView({ block: "nearest" });
+  };
+  const openChat = (choice) => {
+    const conversation = choice?.querySelector('a[href^="/chats/"]');
+    if (conversation) window.location.href = conversation.href;
+  };
+  const moveHighlight = (offset) => {
+    const visible = visibleChoices();
+    if (!visible.length) return;
+    const currentIndex = visible.indexOf(selectedChoice);
+    setHighlight(
+      currentIndex === -1 ? (offset > 0 ? 0 : visible.length - 1) : currentIndex + offset,
+    );
   };
   const setVisible = (selected) => {
     if (activeMode() !== "specific") return;
@@ -383,6 +419,37 @@ function setupChatSelection() {
     });
   });
   search?.addEventListener("input", filter);
+  search?.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      moveHighlight(event.key === "ArrowDown" ? 1 : -1);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      if (selectedChoice) openChat(selectedChoice);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      if (search.value) {
+        search.value = "";
+        filter();
+      } else {
+        search.blur();
+      }
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (
+      event.key === "/"
+      && !event.metaKey
+      && !event.ctrlKey
+      && !["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName)
+    ) {
+      const chatFilter = form.querySelector("[data-chat-filter]");
+      if (chatFilter) {
+        event.preventDefault();
+        chatFilter.focus();
+      }
+    }
+  });
   selectVisible?.addEventListener("click", () => setVisible(true));
   clearVisible?.addEventListener("click", () => setVisible(false));
   form.addEventListener("submit", () => {
@@ -651,6 +718,107 @@ function setupOperationForms() {
   });
 }
 
+function formatBytes(value) {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
+  const amount = value / 1024 ** index;
+  return `${amount >= 100 || index === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[index]}`;
+}
+
+function formatSpeed(bytesPerSecond) {
+  return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+function setupVideoPlayers() {
+  document.querySelectorAll("[data-video-player] video").forEach((video) => {
+    const host = video.closest("[data-video-player]");
+    const badge = host?.querySelector("[data-video-speed]");
+    const size = Number.parseInt(host?.dataset.mediaSize || "0", 10);
+    const PROBE_BYTES = 4 * 1024 * 1024;
+    const BUFFER_AHEAD_SECONDS = 20;
+    let probe = null;
+    let probeSpeed = 0;
+
+    new Plyr(video, {
+      controls: [
+        "play",
+        "progress",
+        "current-time",
+        "duration",
+        "mute",
+        "volume",
+        "settings",
+        "pip",
+        "fullscreen",
+      ],
+      settings: ["speed"],
+      speed: { selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2] },
+      tooltips: { controls: true, seek: true },
+      storage: { enabled: false },
+      seekTime: 10,
+    });
+
+    const bufferedAhead = () => {
+      const current = video.currentTime || 0;
+      for (let i = 0; i < video.buffered.length; i += 1) {
+        if (video.buffered.start(i) <= current && current < video.buffered.end(i)) {
+          return video.buffered.end(i) - current;
+        }
+      }
+      return 0;
+    };
+    const stopProbe = () => {
+      if (!probe) return;
+      probe.abort();
+      probe = null;
+      if (badge) badge.hidden = true;
+    };
+    const startProbe = () => {
+      if (probe || !size) return;
+      if (bufferedAhead() >= BUFFER_AHEAD_SECONDS) return;
+      const offset = Math.min(
+        size - 1,
+        Math.floor((video.currentTime / Math.max(video.duration, 1)) * size),
+      );
+      const end = Math.min(size - 1, offset + PROBE_BYTES - 1);
+      let loadedBytes = 0;
+      let startedAt = 0;
+      probe = new XMLHttpRequest();
+      probe.open("GET", video.currentSrc, true);
+      probe.setRequestHeader("Range", `bytes=${offset}-${end}`);
+      probe.addEventListener("progress", (event) => {
+        if (!event.lengthComputable) return;
+        loadedBytes = event.loaded;
+        const elapsed = (performance.now() - startedAt) / 1000;
+        if (elapsed < 0.15) return;
+        const instantaneous = loadedBytes / elapsed;
+        probeSpeed = probeSpeed ? probeSpeed * 0.7 + instantaneous * 0.3 : instantaneous;
+        if (badge) {
+          badge.hidden = false;
+          badge.textContent = `⚡ ${formatSpeed(probeSpeed)} · ${formatBytes(loadedBytes)} loaded`;
+        }
+      });
+      probe.addEventListener("loadstart", () => {
+        startedAt = performance.now();
+      });
+      probe.addEventListener("loadend", () => {
+        probe = null;
+        if (badge) badge.hidden = true;
+      });
+      probe.send();
+    };
+
+    video.addEventListener("play", startProbe);
+    video.addEventListener("waiting", startProbe);
+    video.addEventListener("seeked", startProbe);
+    video.addEventListener("canplaythrough", stopProbe);
+    video.addEventListener("playing", () => {
+      if (bufferedAhead() >= BUFFER_AHEAD_SECONDS) stopProbe();
+    });
+  });
+}
+
 function initialize() {
   setupThemes();
   setupCopyActions();
@@ -665,6 +833,7 @@ function initialize() {
   setupChatSelection();
   setupOperationMonitor();
   setupOperationForms();
+  setupVideoPlayers();
 }
 
 if (document.readyState === "loading") {
