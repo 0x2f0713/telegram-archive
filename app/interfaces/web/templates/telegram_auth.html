@@ -4,13 +4,25 @@
 <section class="account-hero" data-telegram-auth data-auth-status="{{ auth_status }}" data-status-url="/api/v1/auth/telegram">
   <div class="account-copy">
     <p class="eyebrow">Account connection</p>
-    {% if auth_status == "connected" %}
+    {% if auth_status == "connected" and browser_authenticated %}
       <h1>Your archive is connected.</h1>
-      <p class="hero-lede">The local Telethon session belongs to <strong>{{ auth.identity }}</strong>. Telegram decides which chats this account can access; the archive never bypasses those permissions.</p>
+      <p class="hero-lede">This browser is signed in through <strong>{{ auth.identity }}</strong>. Telegram decides which chats this account can access; the archive never bypasses those permissions.</p>
       <div class="hero-actions">
         <a class="button primary" href="/chats">Review chat coverage</a>
         <a class="button secondary" href="/operations">Open operations</a>
+        <form method="post" action="/auth/telegram/logout">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="button secondary" type="submit">Sign out</button>
+        </form>
       </div>
+    {% elif auth_status == "connected" %}
+      <h1>Continue with Telegram.</h1>
+      <p class="hero-lede">This archive is connected to <strong>{{ auth.identity }}</strong>. Continue to create a signed browser session. No dashboard username or password is required.</p>
+      <form class="hero-actions" method="post" action="/auth/telegram/continue">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="next" value="{{ next_path }}">
+        <button class="button primary" type="submit">Continue to archive</button>
+      </form>
     {% elif auth_status == "pending" %}
       <h1>Scan once. Keep control.</h1>
       <p class="hero-lede">Open Telegram on your phone, go to <strong>Settings → Devices → Link Desktop Device</strong>, then scan the short-lived code.</p>
@@ -33,9 +45,13 @@
       <p class="hero-lede">First connection creates the local archive profile. Use an existing Telegram account you control; account creation remains in Telegram’s official apps.</p>
       <form class="hero-actions" method="post" action="/auth/telegram/start">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="next" value="{{ next_path }}">
         <button class="button primary" type="submit">Create secure QR code</button>
         <button class="button secondary" type="button" data-copy-value="python -m app login">Use terminal login</button>
       </form>
+    {% endif %}
+    {% if auth_error %}
+      <p class="notice account-error" role="alert">{{ auth_error }}</p>
     {% endif %}
   </div>
 
@@ -63,6 +79,7 @@
         {% if auth_status in ("expired", "failed") %}
           <form method="post" action="/auth/telegram/start">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="next" value="{{ next_path }}">
             <button class="button secondary" type="submit">Create a new code</button>
           </form>
         {% endif %}
@@ -77,9 +94,9 @@
     <p>The archive stores one sensitive Telethon session locally. It never accepts exported or uploaded session files.</p>
   </div>
   <div class="principle-grid">
-    <article><span>01</span><h3>Official approval</h3><p>The QR request is generated through Telegram’s MTProto API and approved inside an already authorized Telegram app.</p></article>
-    <article><span>02</span><h3>Local persistence</h3><p>The resulting <code>.session</code> file remains in <code>data/</code>, outside the browser and excluded from Git.</p></article>
-    <article><span>03</span><h3>Existing access only</h3><p>Discovery and archiving are limited to dialogs Telegram already exposes to the connected account.</p></article>
+    <article><h3>Official approval</h3><p>The QR request is generated through Telegram’s MTProto API and approved inside an already authorized Telegram app.</p></article>
+    <article><h3>Local persistence</h3><p>The resulting <code>.session</code> file remains in <code>data/</code>, outside the browser and excluded from Git.</p></article>
+    <article><h3>Existing access only</h3><p>Discovery and archiving are limited to dialogs Telegram already exposes to the connected account.</p></article>
   </div>
 </section>
 {% endblock %}

@@ -224,28 +224,28 @@ The Operations page exposes the application workflows that previously required a
 - **Retry failed** can narrow recovery to selected media categories and reports candidate and completed counts.
 - **Doctor** reports configuration, SQLite, download storage, authorization, and selected-chat checks without exposing credentials.
 
-Only one web operation runs at a time. Start and stop actions are allowlisted application calls protected by the same Basic Auth and CSRF boundary as chat selection; the browser cannot supply a shell command. Job state and bounded logs are stored in SQLite, so completed history survives page reloads. If the web process exits during a job, that job is marked `interrupted` at restart; the next sync resumes from message checkpoints and completed files. Do not run a separate CLI `sync`, `listen`, `retry-failed`, or `doctor` against the same Telethon session while a web operation is active.
+Only one web operation runs at a time. Start and stop actions are allowlisted application calls protected by a signed Telegram-bound browser session and CSRF, just like chat selection; the browser cannot supply a shell command. Job state and bounded logs are stored in SQLite, so completed history survives page reloads. If the web process exits during a job, that job is marked `interrupted` at restart; the next sync resumes from message checkpoints and completed files. Do not run a separate CLI `sync`, `listen`, `retry-failed`, or `doctor` against the same Telethon session while a web operation is active.
 
 The **Account** page adds a safe first-run alternative to `python -m app login`:
 
 1. Open `/auth/telegram` and select **Create secure QR code**.
 2. In the official Telegram mobile app, open **Settings → Devices → Link Desktop Device**.
 3. Scan the short-lived QR code and approve the connection.
-4. The resulting Telethon session is stored at `TG_SESSION_NAME`, exactly as with CLI login.
+4. Choose **Continue to archive** to sign this browser in to the connected Telegram account.
+5. The resulting Telethon session is stored at `TG_SESSION_NAME`, exactly as with CLI login.
 
 This flow connects an existing Telegram account. It does not create a Telegram account; use an official Telegram app to register a new account first. The web application never asks for a phone number, OTP, Telegram password, API hash, or uploaded session. If the account has Telegram 2FA enabled, complete the process with `python -m app login` so the password stays in Telethon's interactive terminal flow.
 
-The default bind is loopback-only and does not require a web password. Any non-loopback `WEB_HOST`, including `0.0.0.0`, is rejected unless `WEB_PASSWORD` is set:
+The default bind is loopback-only. The browser sign-in is tied to the local Telegram account and stored as a signed HttpOnly cookie. Any non-loopback `WEB_HOST`, including `0.0.0.0`, is rejected unless a persistent `WEB_SESSION_SECRET` is set:
 
 ```dotenv
 WEB_HOST=127.0.0.1
 WEB_PORT=8686
-WEB_USERNAME=archiver
-WEB_PASSWORD=
+WEB_SESSION_SECRET=
 WEB_REFRESH_SECONDS=15
 ```
 
-Use a long, unique password if the dashboard is exposed through a private network. Basic Auth does not provide transport encryption, so terminate TLS in a trusted reverse proxy before allowing remote access. Do not expose it directly to the public internet. Media delivery is limited to completed database records whose resolved files remain inside `DOWNLOAD_DIR`.
+Use a long, random session secret if the dashboard is exposed through a private network. The Telegram cookie is an application login session, not transport encryption, so terminate TLS in a trusted reverse proxy before allowing remote access. Do not expose it directly to the public internet. Media delivery is limited to completed database records whose resolved files remain inside `DOWNLOAD_DIR`.
 
 Read-only integration endpoints are:
 
@@ -259,7 +259,7 @@ Read-only integration endpoints are:
 
 The operator-only `POST /chats/selection` form saves the durable selection policy after refreshing Telegram's accessible dialogs. `POST /operations/start` and `POST /operations/{id}/stop` control allowlisted jobs. Every mutation rejects invalid CSRF tokens; chat selection also rejects IDs absent from the authenticated account's current dialog list.
 
-When `WEB_PASSWORD` is configured, the same Basic Auth credentials protect HTML, JSON, static assets, health checks, and archived media.
+When `WEB_SESSION_SECRET` is configured, the signed Telegram browser session protects every route, including health checks, JSON, operations, and media. The QR bootstrap page and its short-lived QR image remain public so the operator can establish the first session.
 
 ## Terminal dashboard
 
@@ -294,13 +294,13 @@ Run the TUI against the same mounted directories with:
 docker compose run --rm telegram-archiver tui
 ```
 
-The optional web service binds only to host loopback. Set a strong `WEB_PASSWORD` in `.env` because the container listens on `0.0.0.0` internally, then start its profile:
+The optional web service binds only to host loopback. Set a long random `WEB_SESSION_SECRET` in `.env` because the container listens on `0.0.0.0` internally, then start its profile:
 
 ```bash
 docker compose --profile web up -d telegram-web
 ```
 
-Visit [http://127.0.0.1:8686](http://127.0.0.1:8686) and enter `WEB_USERNAME` plus `WEB_PASSWORD`. Starting only `telegram-web` lets the Operations page own sync/listener lifecycle. Do not also start `telegram-archiver` while a web worker is active; both services share the same sensitive session and mounted persistent directories.
+Visit [http://127.0.0.1:8686](http://127.0.0.1:8686), connect or confirm the Telegram account, and choose **Continue to archive**. Starting only `telegram-web` lets the Operations page own sync/listener lifecycle. Do not also start `telegram-archiver` while a web worker is active; both services share the same sensitive session and mounted persistent directories.
 
 To use a custom host port without changing the container port, add this to `.env`:
 

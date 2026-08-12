@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
+import asyncio
 import ipaddress
 import secrets
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -27,6 +27,7 @@ from app.infrastructure.persistence.selection import ChatSelectionRepository
 from app.infrastructure.telegram.session_account import read_session_account_id
 from app.interfaces.web.auth import TelegramQrAuthManager
 from app.interfaces.web.routes import create_router, templates
+from app.interfaces.web.session import TelegramWebSession
 from app.utils.logging import configure_logging
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -42,46 +43,60 @@ def _is_loopback_host(host: str) -> bool:
 
 
 def validate_web_security(settings: Settings) -> None:
-    """Refuse an unauthenticated dashboard on a remotely reachable bind."""
+    """Refuse a remotely reachable dashboard without signed browser sessions."""
 
-    password = settings.web_password.get_secret_value() if settings.web_password else ""
-    if not _is_loopback_host(settings.web_host) and not password:
+    session_secret = _configured_session_secret(settings)
+    if not _is_loopback_host(settings.web_host) and not session_secret:
         raise ConfigurationError(
-            "WEB_PASSWORD is required when WEB_HOST is not localhost or a loopback address"
+            "WEB_SESSION_SECRET is required when WEB_HOST is not localhost or a loopback address"
         )
 
 
-class BasicAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: Any, *, username: str, password: str) -> None:
+class TelegramSessionMiddleware(BaseHTTPMiddleware):
+    """Protect the dashboard with a cookie bound to the local Telegram account."""
+
+    public_paths = frozenset(
+        {
+            "/auth/telegram",
+            "/auth/telegram/start",
+            "/auth/telegram/continue",
+            "/auth/telegram/logout",
+            "/auth/telegram/qr.svg",
+            "/api/v1/auth/telegram",
+            "/login",
+            "/register",
+        }
+    )
+
+    def __init__(self, app: Any, *, session: TelegramWebSession) -> None:
         super().__init__(app)
-        self.username = username
-        self.password = password
+        self.session = session
+
+    @classmethod
+    def _is_public(cls, path: str) -> bool:
+        return path in cls.public_paths or path.startswith("/static/")
 
     async def dispatch(
         self,
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
-        authorization = request.headers.get("Authorization", "")
-        authenticated = False
-        if authorization.startswith("Basic "):
-            try:
-                decoded = base64.b64decode(
-                    authorization.removeprefix("Basic "), validate=True
-                ).decode("utf-8")
-                username, password = decoded.split(":", 1)
-                authenticated = secrets.compare_digest(
-                    username, self.username
-                ) and secrets.compare_digest(password, self.password)
-            except (ValueError, UnicodeDecodeError, binascii.Error):
-                authenticated = False
-        if not authenticated:
-            return PlainTextResponse(
-                "Authentication required",
-                status_code=401,
-                headers={"WWW-Authenticate": 'Basic realm="Telegram Archive"'},
-            )
-        return await call_next(request)
+        if self._is_public(request.url.path):
+            return await call_next(request)
+
+        account_id = await asyncio.to_thread(
+            read_session_account_id,
+            request.app.state.settings.tg_session_name,
+        )
+        request.app.state.account_user_id = account_id
+        if self.session.valid(request.cookies.get(self.session.cookie_name), account_id):
+            return await call_next(request)
+
+        target = request.url.path
+        if request.url.query:
+            target = f"{target}?{request.url.query}"
+        login_url = f"/auth/telegram?next={quote(target, safe='/')}"
+        return RedirectResponse(login_url, status_code=303)
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -107,9 +122,20 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         return response
 
 
+def _session_secret(settings: Settings) -> str:
+    return _configured_session_secret(settings) or secrets.token_urlsafe(32)
+
+
+def _configured_session_secret(settings: Settings) -> str:
+    return (
+        settings.web_session_secret.get_secret_value() if settings.web_session_secret else ""
+    )
+
+
 def create_web_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
     validate_web_security(settings)
+    web_session = TelegramWebSession(_session_secret(settings))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -128,6 +154,7 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
         app.state.dashboard_service = DashboardService(database, overridden.configured_chat_ids)
         app.state.csrf_token = secrets.token_urlsafe(32)
         app.state.telegram_auth = TelegramQrAuthManager(overridden)
+        app.state.web_session = web_session
         app.state.operations = OperationManager(overridden, database)
         app.state.account_user_id = read_session_account_id(overridden.tg_session_name)
         templates.env.globals["refresh_seconds"] = overridden.web_refresh_seconds
@@ -147,14 +174,12 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
         redoc_url=None,
         lifespan=lifespan,
     )
-    password = settings.web_password.get_secret_value() if settings.web_password else ""
-    if password:
+    if _configured_session_secret(settings) or not _is_loopback_host(settings.web_host):
         application.add_middleware(
-            BasicAuthMiddleware,
-            username=settings.web_username,
-            password=password,
+            TelegramSessionMiddleware,
+            session=web_session,
         )
-    # Registered last so the headers also cover Basic Auth rejections.
+    # Registered last so the headers also cover authentication redirects.
     application.add_middleware(SecurityHeadersMiddleware)
     application.mount("/static", StaticFiles(directory=PACKAGE_ROOT / "static"), name="static")
     application.include_router(create_router(settings))

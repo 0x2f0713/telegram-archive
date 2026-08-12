@@ -60,7 +60,9 @@ from app.infrastructure.persistence.read_models import (
 from app.infrastructure.persistence.selection import ChatSelectionRepository
 from app.infrastructure.persistence.settings import RuntimeSettingsRepository
 from app.infrastructure.telegram.client import TelegramAccessError
+from app.infrastructure.telegram.session_account import read_session_account_id
 from app.interfaces.web.auth import TelegramQrAuthManager
+from app.interfaces.web.session import TelegramWebSession
 from app.interfaces.web.system import inspect_storage
 from app.utils.logging import format_bytes
 
@@ -109,6 +111,38 @@ def _navigation_context(request: Request, section: str) -> dict[str, object]:
         "generated_at": datetime.now(UTC),
         "csrf_token": request.app.state.csrf_token,
     }
+
+
+def _safe_next_path(value: str | None) -> str:
+    """Keep post-login redirects on this origin."""
+
+    if not value or not value.startswith("/") or value.startswith("//") or "\\" in value:
+        return "/"
+    return value
+
+
+def _browser_authenticated(request: Request) -> bool:
+    session: TelegramWebSession | None = getattr(request.app.state, "web_session", None)
+    account_id = getattr(request.app.state, "account_user_id", None)
+    return bool(
+        session
+        and session.valid(request.cookies.get(session.cookie_name), account_id)
+    )
+
+
+def _set_browser_cookie(request: Request, response: RedirectResponse, account_id: int) -> None:
+    session: TelegramWebSession | None = getattr(request.app.state, "web_session", None)
+    if session is None:
+        return
+    response.set_cookie(
+        session.cookie_name,
+        session.issue(account_id),
+        max_age=session.max_age,
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https",
+        path="/",
+    )
 
 
 def _query_values(query: MessageQuery, *, include_page: bool = True) -> dict[str, str | int]:
@@ -250,7 +284,7 @@ async def _system_context(
             },
             "session_exists": await asyncio.to_thread(session_path.is_file),
             "web_auth_enabled": bool(
-                effective.web_password and effective.web_password.get_secret_value()
+                effective.web_session_secret and effective.web_session_secret.get_secret_value()
             ),
             "loopback_only": _loopback_host(effective.web_host),
             "storage": storage,
@@ -796,11 +830,15 @@ def create_router(settings: Settings) -> APIRouter:
     async def telegram_auth_page(request: Request) -> HTMLResponse:
         manager: TelegramQrAuthManager = request.app.state.telegram_auth
         snapshot = await manager.inspect_session()
+        next_path = _safe_next_path(request.query_params.get("next"))
         context = _navigation_context(request, "account")
         context.update(
             {
                 "auth": snapshot,
                 "auth_status": snapshot.status.value,
+                "browser_authenticated": _browser_authenticated(request),
+                "next_path": next_path,
+                "auth_error": request.query_params.get("error"),
             }
         )
         return templates.TemplateResponse(request, "telegram_auth.html", context)
@@ -811,7 +849,42 @@ def create_router(settings: Settings) -> APIRouter:
         _require_csrf(request, values)
         manager: TelegramQrAuthManager = request.app.state.telegram_auth
         await manager.start()
-        return RedirectResponse("/auth/telegram", status_code=303)
+        next_path = _safe_next_path(values.get("next", [""])[0])
+        return RedirectResponse(
+            f"/auth/telegram?{urlencode({'next': next_path})}",
+            status_code=303,
+        )
+
+    @router.post("/auth/telegram/continue", response_class=HTMLResponse)
+    async def continue_telegram_auth(request: Request) -> RedirectResponse:
+        values = await _form_values(request)
+        _require_csrf(request, values)
+        manager: TelegramQrAuthManager = request.app.state.telegram_auth
+        snapshot = await manager.inspect_session()
+        account_id = await asyncio.to_thread(
+            read_session_account_id,
+            request.app.state.settings.tg_session_name,
+        )
+        if snapshot.status.value != "connected" or account_id is None:
+            return RedirectResponse(
+                f"/auth/telegram?{urlencode({'error': 'Telegram account is not connected yet'})}",
+                status_code=303,
+            )
+        request.app.state.account_user_id = account_id
+        next_path = _safe_next_path(values.get("next", [""])[0])
+        response = RedirectResponse(next_path, status_code=303)
+        _set_browser_cookie(request, response, account_id)
+        return response
+
+    @router.post("/auth/telegram/logout", response_class=HTMLResponse)
+    async def logout_telegram_auth(request: Request) -> RedirectResponse:
+        values = await _form_values(request)
+        _require_csrf(request, values)
+        response = RedirectResponse("/auth/telegram", status_code=303)
+        session: TelegramWebSession | None = getattr(request.app.state, "web_session", None)
+        if session is not None:
+            response.delete_cookie(session.cookie_name, path="/")
+        return response
 
     @router.get("/auth/telegram/qr.svg", include_in_schema=False)
     async def telegram_qr_image(request: Request) -> Response:

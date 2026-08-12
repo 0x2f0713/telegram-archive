@@ -95,8 +95,7 @@ class Settings(BaseSettings):
 
     web_host: str = "127.0.0.1"
     web_port: int = Field(default=8686, ge=1, le=65535)
-    web_username: str = "archiver"
-    web_password: SecretStr | None = None
+    web_session_secret: SecretStr | None = None
     web_refresh_seconds: int = Field(default=15, ge=5, le=3600)
     tui_refresh_seconds: int = Field(default=5, ge=1, le=3600)
 

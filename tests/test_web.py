@@ -19,6 +19,7 @@ from app.infrastructure.persistence.selection import ChatSelection, ChatSelectio
 from app.infrastructure.persistence.settings import RuntimeSettingsRepository
 from app.interfaces.web.app import create_web_app
 from app.interfaces.web.auth import TelegramAuthSnapshot, TelegramAuthStatus
+from app.interfaces.web.session import TelegramWebSession
 from tests.helpers import make_chat, make_message, make_no_media_message
 
 
@@ -214,28 +215,44 @@ async def test_web_rejects_media_outside_download_directory(tmp_path: Path) -> N
     assert response.status_code == 403
 
 
-def test_remote_bind_requires_password(tmp_path: Path) -> None:
+def test_remote_bind_requires_session_secret(tmp_path: Path) -> None:
     settings = _settings(tmp_path, web_host="0.0.0.0")
 
-    with pytest.raises(ConfigurationError, match="WEB_PASSWORD is required"):
+    with pytest.raises(ConfigurationError, match="WEB_SESSION_SECRET is required"):
         create_web_app(settings)
 
 
-async def test_basic_auth_protects_every_route(tmp_path: Path) -> None:
-    settings = _settings(tmp_path, web_host="0.0.0.0", web_password="correct horse")
+async def test_telegram_browser_session_protects_every_route(tmp_path: Path) -> None:
+    account_id = 909580109
+    _seed_session_account(tmp_path, account_id)
+    settings = _settings(
+        tmp_path,
+        web_host="0.0.0.0",
+        web_session_secret="test-session-secret",
+    )
     application = create_web_app(settings)
 
     async with application.router.lifespan_context(application):
         transport = httpx.ASGITransport(app=application)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             denied = await client.get("/healthz")
-            accepted = await client.get("/healthz", auth=(settings.web_username, "correct horse"))
+            client.cookies.set(
+                TelegramWebSession.cookie_name,
+                application.state.web_session.issue(account_id),
+            )
+            accepted = await client.get("/healthz")
+            client.cookies.clear()
+            basic = await client.get(
+                "/healthz",
+                headers={"Authorization": "Basic YXJjaGl2ZXI6Y29ycmVjdCBob3JzZQ=="},
+            )
 
-    assert denied.status_code == 401
-    assert denied.headers["www-authenticate"].startswith("Basic")
+    assert denied.status_code == 303
+    assert denied.headers["location"] == "/auth/telegram?next=/healthz"
     assert denied.headers["content-security-policy"].startswith("default-src 'self'")
     assert accepted.status_code == 200
     assert accepted.json() == {"status": "ok"}
+    assert basic.status_code == 303
 
 
 class _FakeTelegramAuth:
@@ -299,6 +316,37 @@ async def test_telegram_account_page_and_csrf_protection(tmp_path: Path) -> None
     assert qr_image.headers["content-type"].startswith("image/svg+xml")
     assert alias.status_code == 307
     assert alias.headers["location"] == "/auth/telegram"
+
+
+async def test_telegram_continue_issues_browser_session(tmp_path: Path) -> None:
+    account_id = 909580109
+    _seed_session_account(tmp_path, account_id)
+    settings = _settings(tmp_path, web_session_secret="test-session-secret")
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        await application.state.telegram_auth.close()
+        fake_auth = _FakeTelegramAuth()
+        fake_auth.snapshot = TelegramAuthSnapshot(
+            TelegramAuthStatus.CONNECTED,
+            "Telegram is connected.",
+            identity="@archive_owner",
+        )
+        application.state.telegram_auth = fake_auth
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", follow_redirects=False
+        ) as client:
+            response = await client.post(
+                "/auth/telegram/continue",
+                data={"csrf_token": application.state.csrf_token, "next": "/operations"},
+            )
+            health = await client.get("/healthz")
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/operations"
+    assert TelegramWebSession.cookie_name in response.headers["set-cookie"]
+    assert health.status_code == 200
 
 
 async def test_web_chat_selection_saves_specific_and_all_modes(tmp_path: Path) -> None:

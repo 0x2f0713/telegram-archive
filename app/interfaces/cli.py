@@ -338,7 +338,11 @@ def web_command(
     except (ConfigurationError, ValueError) as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
-    auth_note = " with Basic Auth" if settings.web_password else " on loopback only"
+    auth_note = (
+        " with Telegram browser auth"
+        if settings.web_session_secret and settings.web_session_secret.get_secret_value()
+        else " on loopback only"
+    )
     logger.info(
         "Starting web dashboard at http://%s:%s%s",
         settings.web_host,
