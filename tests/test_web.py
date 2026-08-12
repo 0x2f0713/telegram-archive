@@ -507,6 +507,7 @@ async def test_web_operations_run_with_progress_csrf_and_safe_stop(tmp_path: Pat
                 phase="cancelled",
                 detail="Stopped safely by the operator",
             )
+            cancelled_sync_status = await client.get(f"/api/v1/operations/{sync_id}")
             sync_page = await client.get(f"/operations?job={sync_id}")
 
             listener_started = await client.post(
@@ -531,6 +532,26 @@ async def test_web_operations_run_with_progress_csrf_and_safe_stop(tmp_path: Pat
                 if final_listener.json()["operation"]["terminal"]:
                     break
                 await asyncio.sleep(0.01)
+            listener_page = await client.get(f"/operations?job={listener_id}")
+            retried = await client.post(
+                f"/operations/{listener_id}/retry",
+                data={"csrf_token": application.state.csrf_token},
+            )
+            retried_id = int(retried.headers["location"].split("job=")[1].split("&")[0])
+            for _ in range(100):
+                retry_status = await client.get(f"/api/v1/operations/{retried_id}")
+                if retry_status.json()["operation"]["phase"] == "starting":
+                    break
+                await asyncio.sleep(0.01)
+            retry_stopped = await client.post(
+                f"/operations/{retried_id}/stop",
+                data={"csrf_token": application.state.csrf_token},
+            )
+            for _ in range(100):
+                retry_final = await client.get(f"/api/v1/operations/{retried_id}")
+                if retry_final.json()["operation"]["terminal"]:
+                    break
+                await asyncio.sleep(0.01)
             resumed = await client.post(
                 f"/operations/{sync_id}/resume",
                 data={"csrf_token": application.state.csrf_token},
@@ -551,6 +572,14 @@ async def test_web_operations_run_with_progress_csrf_and_safe_stop(tmp_path: Pat
     assert "Unknown content type" in unknown_type.text
     assert started.status_code == 303
     assert "Resume sync" in sync_page.text
+    assert cancelled_sync_status.json()["operation"]["action"] == {
+        "kind": "resume",
+        "label": "Resume sync",
+        "enabled": True,
+    }
+    assert "Restart listener" in listener_page.text
+    assert retried.status_code == 303
+    assert retry_stopped.status_code == 303
     assert resumed.status_code == 303
     assert resumed.headers["location"].startswith(f"/operations?job={sync_id}&")
     assert captured == {

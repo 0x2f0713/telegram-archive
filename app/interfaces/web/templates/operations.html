@@ -109,17 +109,25 @@
   <div class="operation-error" role="alert" data-operation-error hidden></div>
   {% endif %}
   <div class="operation-monitor-actions">
-    {% if focus_operation.active %}
-    <form method="post" action="/operations/{{ focus_operation.id }}/stop" data-operation-stop-form>
+    {% set operation_action = focus_operation.action %}
+    <div data-operation-actions data-operation-action-kind="{{ operation_action.kind }}">
+    {% if operation_action.kind == 'stop' %}
+    <form method="post" action="/operations/{{ focus_operation.id }}/stop" data-operation-action-form data-operation-action-kind="stop">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <button class="button danger-button" type="submit">Stop safely</button>
+      <button class="button danger-button" type="submit" {% if not operation_action.enabled %}disabled aria-disabled="true"{% endif %}>{{ operation_action.label }}</button>
     </form>
-    {% elif focus_operation.command == 'sync' and focus_operation.status in ('cancelled', 'interrupted', 'failed') and not active_operation %}
-    <form method="post" action="/operations/{{ focus_operation.id }}/resume" data-operation-resume-form>
+    {% elif operation_action.kind == 'resume' %}
+    <form method="post" action="/operations/{{ focus_operation.id }}/resume" data-operation-action-form data-operation-action-kind="resume">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <button class="button primary" type="submit">Resume sync</button>
+      <button class="button primary" type="submit" {% if not operation_action.enabled %}disabled aria-disabled="true"{% endif %}>{{ operation_action.label }}</button>
+    </form>
+    {% elif operation_action.kind == 'retry' %}
+    <form method="post" action="/operations/{{ focus_operation.id }}/retry" data-operation-action-form data-operation-action-kind="retry">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button primary" type="submit" {% if not operation_action.enabled %}disabled aria-disabled="true"{% endif %}>{{ operation_action.label }}</button>
     </form>
     {% endif %}
+    </div>
     <a class="button text-button" href="/operations?job={{ focus_operation.id }}">Refresh details</a>
   </div>
   <div class="operation-log-panel">

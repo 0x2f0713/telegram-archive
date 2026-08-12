@@ -10,6 +10,7 @@ from app.application.operations import (
     OperationConflictError,
     OperationContext,
     OperationManager,
+    operation_action,
 )
 from app.config import Settings
 from app.infrastructure.persistence.database import Database
@@ -145,6 +146,70 @@ async def test_download_reporter_tracks_each_task_with_speed(tmp_path: Path) -> 
     assert all("speed" in task and "percent" in task for task in tasks)
     assert "/s)" in str(updates[-1]["detail"])
     assert " B/s" not in str(updates[-1]["detail"])
+
+
+def test_operation_action_matrix() -> None:
+    assert operation_action("sync", "queued") == {
+        "kind": "stop",
+        "label": "Stop safely",
+        "enabled": True,
+    }
+    assert operation_action("sync", "stopping") == {
+        "kind": "stop",
+        "label": "Stopping safely…",
+        "enabled": False,
+    }
+    assert operation_action("sync", "failed")["kind"] == "resume"
+    assert operation_action("listen", "cancelled") == {
+        "kind": "retry",
+        "label": "Restart listener",
+        "enabled": True,
+    }
+    assert operation_action("retry-failed", "interrupted")["label"] == "Retry failed media"
+    assert operation_action("doctor", "failed")["label"] == "Run diagnostics"
+    assert operation_action("sync", "completed") == {
+        "kind": "none",
+        "label": "",
+        "enabled": False,
+    }
+    assert operation_action("unknown", "failed")["kind"] == "none"
+
+
+async def test_retry_starts_new_operation_with_original_parameters(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize()
+
+    async def fake_listener(context: OperationContext) -> None:
+        await context.stop_event.wait()
+
+    manager = OperationManager(settings, database, executors={"listen": fake_listener})
+    await manager.startup()
+    started = await manager.start_job("listen", {"content_types": ["photo"]})
+    original_id = int(started["id"])
+    await _wait_for_status(manager, original_id, {"running"})
+    await manager.request_stop(original_id)
+    await _wait_for_status(manager, original_id, {"cancelled"})
+
+    retried = await manager.retry_job(original_id)
+    retried_id = int(retried["id"])
+    assert retried_id != original_id
+    assert retried["command"] == "listen"
+    assert retried["parameters"] == {"content_types": ["photo"]}
+    assert retried["action"]["kind"] == "stop"
+
+    await manager.request_stop(retried_id)
+    await _wait_for_status(manager, retried_id, {"cancelled"})
+    original_logs = await manager.logs(original_id)
+    retry_logs = await manager.logs(retried_id)
+    assert any(
+        f"Retry started as operation #{retried_id}" in log["message"] for log in original_logs
+    )
+    assert any(
+        f"Retrying operation #{original_id}" in log["message"] for log in retry_logs
+    )
+    await manager.shutdown()
+    await database.close()
 
 
 async def test_resume_reactivates_the_original_sync_operation(tmp_path: Path) -> None:

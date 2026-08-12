@@ -75,6 +75,30 @@ ClientFactory = Callable[[Settings], Any]
 OperationExecutor = Callable[["OperationContext"], Awaitable[None]]
 
 
+def operation_action(command: str, status: str, *, enabled: bool = True) -> dict[str, Any]:
+    """Return the canonical operator action for one command/status pair."""
+    try:
+        operation_command = OperationCommand(command)
+        operation_status = OperationStatus(status)
+    except ValueError:
+        return {"kind": "none", "label": "", "enabled": False}
+
+    if operation_status is OperationStatus.STOPPING:
+        return {"kind": "stop", "label": "Stopping safely…", "enabled": False}
+    if operation_status.is_active:
+        return {"kind": "stop", "label": "Stop safely", "enabled": enabled}
+    if not operation_status.is_recoverable:
+        return {"kind": "none", "label": "", "enabled": False}
+    if operation_command is OperationCommand.SYNC:
+        return {"kind": "resume", "label": "Resume sync", "enabled": enabled}
+    labels = {
+        OperationCommand.LISTEN: "Restart listener",
+        OperationCommand.RETRY_FAILED: "Retry failed media",
+        OperationCommand.DOCTOR: "Run diagnostics",
+    }
+    return {"kind": "retry", "label": labels[operation_command], "enabled": enabled}
+
+
 def default_executors(manager: OperationManager) -> Mapping[str, OperationExecutor]:
     """Build the production executors; imported lazily to avoid an import cycle."""
     from app.application.commands import Commands
@@ -151,15 +175,22 @@ class OperationManager:
                 raise OperationConflictError(
                     f"{active['command']} operation {active['id']} is already active"
                 )
-            record = await self.repository.create(normalized, safe_parameters)
-            runtime = _Runtime(job_id=record.id, command=normalized)
-            runtime.overlay.update(record.public_dict())
-            self._runtime[record.id] = runtime
-            runtime.task = asyncio.create_task(
-                self._execute(record.id, normalized, safe_parameters),
-                name=f"web-operation-{record.id}-{normalized}",
-            )
+            record = await self._start_job_locked(normalized, safe_parameters)
         return await self.get(record.id)
+
+    async def _start_job_locked(
+        self, command: str, parameters: dict[str, Any]
+    ) -> OperationRecord:
+        """Create and schedule a job while ``self._lock`` is held."""
+        record = await self.repository.create(command, parameters)
+        runtime = _Runtime(job_id=record.id, command=command)
+        runtime.overlay.update(record.public_dict())
+        self._runtime[record.id] = runtime
+        runtime.task = asyncio.create_task(
+            self._execute(record.id, command, parameters),
+            name=f"web-operation-{record.id}-{command}",
+        )
+        return record
 
     async def resume_job(self, job_id: int) -> dict[str, Any]:
         """Reactivate one interrupted sync under its original operation ID.
@@ -180,7 +211,7 @@ class OperationManager:
                 raise OperationNotFoundError(f"Operation {job_id} does not exist")
             if record.command != OperationCommand.SYNC.value:
                 raise ValueError("Only historical sync operations can resume")
-            if record.status not in {"cancelled", "interrupted", "failed"}:
+            if operation_action(record.command, record.status)["kind"] != "resume":
                 raise ValueError("Only unfinished sync operations can resume")
 
             resumed = await self.repository.update(
@@ -203,6 +234,35 @@ class OperationManager:
             )
         await self.repository.add_log(job_id, "INFO", "Resuming from durable checkpoints")
         return await self.get(job_id)
+
+    async def retry_job(self, job_id: int) -> dict[str, Any]:
+        """Start a new operation using a retryable job's original parameters."""
+        async with self._lock:
+            active = await self.active()
+            if active:
+                raise OperationConflictError(
+                    f"{active['command']} operation {active['id']} is already active"
+                )
+            record = await self.repository.get(job_id)
+            if record is None:
+                raise OperationNotFoundError(f"Operation {job_id} does not exist")
+            action = operation_action(record.command, record.status)
+            if action["kind"] != "retry":
+                raise ValueError("Only unfinished non-sync operations can retry")
+            if record.command not in self._executors:
+                raise ValueError(f"Unsupported web operation: {record.command}")
+            retried = await self._start_job_locked(record.command, dict(record.parameters))
+        await self.repository.add_log(
+            retried.id,
+            "INFO",
+            f"Retrying operation #{job_id} ({record.command})",
+        )
+        await self.repository.add_log(
+            job_id,
+            "INFO",
+            f"Retry started as operation #{retried.id}",
+        )
+        return await self.get(retried.id)
 
     async def request_stop(self, job_id: int) -> dict[str, Any]:
         record = await self.repository.get(job_id)
@@ -285,6 +345,7 @@ class OperationManager:
                     payload[key] = value
         payload["terminal"] = payload["status"] not in ACTIVE_OPERATION_STATUSES
         payload["active"] = payload["status"] in ACTIVE_OPERATION_STATUSES
+        payload["action"] = operation_action(record.command, payload["status"])
         total = payload.get("progress_total")
         current = payload.get("progress_current", 0)
         payload["progress_percent"] = (

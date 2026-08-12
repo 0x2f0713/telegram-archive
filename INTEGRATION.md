@@ -75,28 +75,28 @@ The included image has this interface:
 ENTRYPOINT: python -m app
 default command: listen
 persistent paths: /app/data, /app/downloads
-runtime user: UID/GID 10001
+runtime user: UID/GID 10001 by default (configurable with `ARCHIVER_UID`/`ARCHIVER_GID`)
 ```
 
-The included Compose file uses named volumes. To expose archives directly on the host, replace them with bind mounts and grant the container user access:
+The included Compose file uses configurable bind mounts. `ARCHIVER_DATA_DIR` stores the SQLite database, WAL sidecars, web state, and Telethon session; `ARCHIVER_DOWNLOADS_DIR` stores downloaded media:
 
 ```yaml
 services:
   telegram-archiver:
     volumes:
-      - ./data:/app/data
-      - ./downloads:/app/downloads
+      - ${ARCHIVER_DATA_DIR:-./data}:/app/data
+      - ${ARCHIVER_DOWNLOADS_DIR:-./downloads}:/app/downloads
 ```
 
-On Linux, either make these directories owned by UID/GID 10001 or set Compose `user` to a host UID/GID that can write the mounts. Never mount a session file read-only: Telethon may update it. Do not put secret values in the Dockerfile or image build arguments.
+On Linux, set `ARCHIVER_UID` and `ARCHIVER_GID` to the host owner of these directories. Never mount a session file read-only: Telethon may update it. Do not put secret values in the Dockerfile or image build arguments.
 
 When using `CONFIG_FILE` in Docker, mount that YAML file read-only and set its container path, for example `./config.yml:/app/config.yml:ro` with `CONFIG_FILE=/app/config.yml`. The default Compose stack relies on `TARGET_CHATS` and does not mount an optional YAML file automatically.
 
-Use the same named volume during interactive login and the listener. A login container using a different volume creates a session the worker cannot see.
+Use the same bind-mounted data directory during interactive login and the listener. A login container using a different mount creates a session the worker cannot see.
 
 ### Add the web dashboard to Compose
 
-The included `telegram-web` service is behind the `web` profile. It shares `archive-data` and `archive-downloads` with the worker and publishes the configured host port on loopback only. Set a strong password in `.env` before starting it because its container bind is `0.0.0.0`:
+The included `telegram-web` service is behind the `web` profile. It shares the configured data and download bind mounts with the worker and publishes the configured host port on loopback only. Set a strong password in `.env` before starting it because its container bind is `0.0.0.0`:
 
 ```dotenv
 WEB_USERNAME=archiver

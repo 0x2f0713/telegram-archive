@@ -484,7 +484,9 @@ function setupOperationMonitor() {
   const downloadList = monitor.querySelector("[data-operation-download-list]");
   const downloadSummary = monitor.querySelector("[data-operation-download-summary]");
   const logs = monitor.querySelector("[data-operation-logs]");
-  const stopForm = monitor.querySelector("[data-operation-stop-form]");
+  const actionContainer = monitor.querySelector("[data-operation-actions]");
+  const commands = document.querySelector("[data-operation-commands]");
+  const csrfToken = document.querySelector('input[name="csrf_token"]')?.value || "";
   let timer = 0;
 
   const statusClasses = [
@@ -565,6 +567,56 @@ function setupOperationMonitor() {
       logs.append(item);
     });
   };
+  const renderAction = (operation) => {
+    if (!actionContainer) return;
+    const action = operation.action || { kind: "none", label: "", enabled: false };
+    const blockedByOther = Boolean(
+      commands?.dataset.activeOperation
+      && commands.dataset.activeOperation !== String(operation.id)
+      && ["resume", "retry"].includes(action.kind),
+    );
+    const enabled = action.enabled !== false && !blockedByOther;
+    actionContainer.dataset.operationActionKind = action.kind;
+    actionContainer.replaceChildren();
+    if (action.kind === "none") return;
+    const form = document.createElement("form");
+    form.method = "post";
+    form.action = `/operations/${operation.id}/${action.kind === "resume" ? "resume" : action.kind === "retry" ? "retry" : "stop"}`;
+    form.dataset.operationActionForm = "";
+    form.dataset.operationActionKind = action.kind;
+    const token = document.createElement("input");
+    token.type = "hidden";
+    token.name = "csrf_token";
+    token.value = csrfToken;
+    const button = document.createElement("button");
+    button.className = `button ${action.kind === "stop" ? "danger-button" : "primary"}`;
+    button.type = "submit";
+    button.textContent = action.label;
+    button.disabled = !enabled;
+    if (!enabled) button.setAttribute("aria-disabled", "true");
+    form.append(token, button);
+    actionContainer.append(form);
+  };
+  const updateCommandButtons = (operation) => {
+    if (!commands) return;
+    if (operation.active) {
+      commands.dataset.activeOperation = String(operation.id);
+    } else if (commands.dataset.activeOperation === String(operation.id)) {
+      commands.dataset.activeOperation = "";
+    }
+    const anotherOperationIsActive = Boolean(
+      commands.dataset.activeOperation
+      && commands.dataset.activeOperation !== String(operation.id),
+    );
+    document.querySelectorAll("[data-operation-start-form] button[type='submit']").forEach((button) => {
+      const needsSelection = button.closest("form")?.querySelector('[name="command"]')?.value !== "doctor";
+      const selectedCount = Number.parseInt(commands.dataset.selectedChats || "0", 10);
+      const disabled = operation.active || anotherOperationIsActive || (needsSelection && selectedCount <= 0);
+      button.disabled = disabled;
+      if (disabled) button.setAttribute("aria-disabled", "true");
+      else button.removeAttribute("aria-disabled");
+    });
+  };
   const render = (payload) => {
     const operation = payload.operation;
     if (status) {
@@ -604,32 +656,9 @@ function setupOperationMonitor() {
     }
     renderDownloadTasks(operation.download_tasks);
     renderLogs(payload.logs || []);
-    if (operation.terminal) {
-      window.clearInterval(timer);
-      stopForm?.remove();
-      const commands = document.querySelector("[data-operation-commands]");
-      const anotherOperationIsActive = Boolean(
-        commands?.dataset.activeOperation
-        && commands.dataset.activeOperation !== String(operation.id),
-      );
-      document.querySelectorAll("[data-operation-start-form] button[type='submit']").forEach((button) => {
-        const needsSelection = button.closest("form")?.querySelector('[name="command"]')?.value !== "doctor";
-        const selectedCount = Number.parseInt(
-          commands?.dataset.selectedChats || "0",
-          10,
-        );
-        if (!anotherOperationIsActive && (!needsSelection || selectedCount > 0)) {
-          button.disabled = false;
-          button.removeAttribute("aria-disabled");
-        }
-      });
-    } else if (operation.status === "stopping") {
-      const stopButton = stopForm?.querySelector("button");
-      if (stopButton) {
-        stopButton.disabled = true;
-        stopButton.textContent = "Stopping safely…";
-      }
-    }
+    updateCommandButtons(operation);
+    renderAction(operation);
+    if (operation.terminal) window.clearInterval(timer);
   };
   const poll = async () => {
     try {
@@ -704,17 +733,12 @@ function setupOperationForms() {
       button.textContent = "Starting…";
     });
   });
-  document.querySelector("[data-operation-stop-form]")?.addEventListener("submit", (event) => {
+  document.querySelector("[data-operation-actions]")?.addEventListener("submit", (event) => {
     const button = event.currentTarget.querySelector("button[type='submit']");
     if (!button) return;
+    const kind = event.target.closest("[data-operation-action-form]")?.dataset.operationActionKind;
     button.disabled = true;
-    button.textContent = "Requesting safe stop…";
-  });
-  document.querySelector("[data-operation-resume-form]")?.addEventListener("submit", (event) => {
-    const button = event.currentTarget.querySelector("button[type='submit']");
-    if (!button) return;
-    button.disabled = true;
-    button.textContent = "Resuming…";
+    button.textContent = kind === "stop" ? "Requesting safe stop…" : kind === "resume" ? "Resuming…" : "Retrying…";
   });
 }
 

@@ -269,6 +269,21 @@ def _loopback_host(host: str) -> bool:
         return False
 
 
+def _focus_operation_action(
+    operation: dict[str, object], active_operation: dict[str, object] | None
+) -> dict[str, object]:
+    """Disable recovery actions while a different operation owns the worker."""
+    action = dict(operation.get("action") or {})
+    if (
+        active_operation
+        and active_operation.get("id") != operation.get("id")
+        and action.get("kind") in {"resume", "retry"}
+    ):
+        action["enabled"] = False
+    operation["action"] = action
+    return operation
+
+
 async def _form_values(
     request: Request, *, max_bytes: int = 2048, max_fields: int = 100
 ) -> dict[str, list[str]]:
@@ -621,6 +636,8 @@ def create_router(settings: Settings) -> APIRouter:
             focus = active
         elif recent:
             focus = recent[0]
+        if focus:
+            focus = _focus_operation_action(focus, active)
         logs = await manager.logs(int(focus["id"])) if focus else ()
         context = _navigation_context(request, "operations")
         context.update(
@@ -727,18 +744,42 @@ def create_router(settings: Settings) -> APIRouter:
             previous = await manager.get(job_id)
         except OperationNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        if previous["command"] != "sync":
+        if previous["action"]["kind"] != "resume":
             raise HTTPException(
                 status_code=400, detail="Only historical sync operations can resume"
             )
         if previous["active"]:
             raise HTTPException(status_code=400, detail="This sync operation is already active")
-        if previous["status"] not in {"cancelled", "interrupted", "failed"}:
-            raise HTTPException(
-                status_code=400, detail="Only unfinished sync operations can resume"
-            )
         try:
             operation = await manager.resume_job(job_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OperationConflictError as exc:
+            return RedirectResponse(
+                f"/operations?job={job_id}&{urlencode({'error': str(exc)})}",
+                status_code=303,
+            )
+        return RedirectResponse(
+            f"/operations?job={operation['id']}&started=true",
+            status_code=303,
+        )
+
+    @router.post("/operations/{job_id}/retry")
+    async def retry_operation(request: Request, job_id: int) -> RedirectResponse:
+        """Retry a failed, cancelled, or interrupted non-sync operation."""
+        values = await _form_values(request)
+        _require_csrf(request, values)
+        manager: OperationManager = request.app.state.operations
+        try:
+            previous = await manager.get(job_id)
+        except OperationNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if previous["action"]["kind"] != "retry":
+            raise HTTPException(
+                status_code=400, detail="Only unfinished non-sync operations can retry"
+            )
+        try:
+            operation = await manager.retry_job(job_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except OperationConflictError as exc:
@@ -842,8 +883,10 @@ def create_router(settings: Settings) -> APIRouter:
     async def api_operation(request: Request, job_id: int) -> dict[str, object]:
         manager: OperationManager = request.app.state.operations
         try:
+            operation = await manager.get(job_id)
+            active = await manager.active()
             return {
-                "operation": await manager.get(job_id),
+                "operation": _focus_operation_action(operation, active),
                 "logs": await manager.logs(job_id),
             }
         except OperationNotFoundError as exc:

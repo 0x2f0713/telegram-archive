@@ -41,3 +41,12 @@ class OperationStatus(StrEnum):
             OperationStatus.CANCELLED,
             OperationStatus.INTERRUPTED,
         }
+
+    @property
+    def is_recoverable(self) -> bool:
+        """Whether an unfinished operation can be resumed or retried."""
+        return self in {
+            OperationStatus.FAILED,
+            OperationStatus.CANCELLED,
+            OperationStatus.INTERRUPTED,
+        }

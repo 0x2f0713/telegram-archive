@@ -1,16 +1,22 @@
+x-runtime-volumes: &runtime-volumes
+  - ${ARCHIVER_DATA_DIR:-./data}:/app/data
+  - ${ARCHIVER_DOWNLOADS_DIR:-./downloads}:/app/downloads
+
+x-runtime-user: &runtime-user
+  user: "${ARCHIVER_UID:-10001}:${ARCHIVER_GID:-10001}"
+
 services:
   telegram-archiver:
     build: .
     image: telegram-archiver:local
+    <<: *runtime-user
     env_file:
       - .env
     environment:
       TG_SESSION_NAME: /app/data/telegram_session
       DATABASE_URL: sqlite:////app/data/archive.db
       DOWNLOAD_DIR: /app/downloads
-    volumes:
-      - archive-data:/app/data
-      - archive-downloads:/app/downloads
+    volumes: *runtime-volumes
     command: listen
     init: true
     restart: unless-stopped
@@ -21,6 +27,7 @@ services:
     image: telegram-archiver:local
     profiles:
       - web
+    <<: *runtime-user
     env_file:
       - .env
     environment:
@@ -29,16 +36,10 @@ services:
       DOWNLOAD_DIR: /app/downloads
       WEB_HOST: 0.0.0.0
       WEB_PORT: 8686
-    volumes:
-      - archive-data:/app/data
-      - archive-downloads:/app/downloads
+    volumes: *runtime-volumes
     ports:
       - "127.0.0.1:${WEB_HOST_PORT:-8686}:8686"
     command: web
     init: true
     restart: unless-stopped
     stop_grace_period: 45s
-
-volumes:
-  archive-data:
-  archive-downloads:

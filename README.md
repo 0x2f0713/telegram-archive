@@ -286,9 +286,9 @@ docker compose up -d
 docker compose logs -f telegram-archiver
 ```
 
-The service defaults to `listen`. Compose overrides internal paths to `/app/data` and `/app/downloads` and persists them in named volumes `archive-data` and `archive-downloads`; secrets remain runtime environment values and are never baked into the image. `docker compose down` preserves volumes. `docker compose down -v` permanently deletes the database, session, and downloads and should be used only intentionally.
+The service defaults to `listen`. Compose mounts host directories from `ARCHIVER_DATA_DIR` and `ARCHIVER_DOWNLOADS_DIR` into `/app/data` and `/app/downloads`; set `ARCHIVER_UID` and `ARCHIVER_GID` to the directories' owner when using bind mounts. Secrets remain runtime environment values and are never baked into the image. `docker compose down` preserves the mounted files.
 
-Run the TUI against the same volumes with:
+Run the TUI against the same mounted directories with:
 
 ```bash
 docker compose run --rm telegram-archiver tui
@@ -300,7 +300,7 @@ The optional web service binds only to host loopback. Set a strong `WEB_PASSWORD
 docker compose --profile web up -d telegram-web
 ```
 
-Visit [http://127.0.0.1:8686](http://127.0.0.1:8686) and enter `WEB_USERNAME` plus `WEB_PASSWORD`. Starting only `telegram-web` lets the Operations page own sync/listener lifecycle. Do not also start `telegram-archiver` while a web worker is active; both services share the same sensitive session and persistent volumes.
+Visit [http://127.0.0.1:8686](http://127.0.0.1:8686) and enter `WEB_USERNAME` plus `WEB_PASSWORD`. Starting only `telegram-web` lets the Operations page own sync/listener lifecycle. Do not also start `telegram-archiver` while a web worker is active; both services share the same sensitive session and mounted persistent directories.
 
 To use a custom host port without changing the container port, add this to `.env`:
 
