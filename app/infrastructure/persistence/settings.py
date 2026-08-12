@@ -34,6 +34,14 @@ class RuntimeSettingsRepository:
                     setting.value = value
                     setting.updated_at = now
 
+    async def replace_values(self, values: dict[str, str]) -> None:
+        """Atomically replace the complete set of operator overrides."""
+        now = utc_now()
+        async with self.database.sessions() as session, session.begin():
+            await session.execute(delete(RuntimeSetting))
+            for key, value in values.items():
+                session.add(RuntimeSetting(key=key, value=value, updated_at=now))
+
     async def clear(self) -> None:
         async with self.database.sessions() as session, session.begin():
             await session.execute(delete(RuntimeSetting))

@@ -18,19 +18,16 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.application.chat_selection import ChatSelectionService
 from app.application.operations import OperationManager
-from app.config import (
-    ConfigurationError,
-    Settings,
-    apply_runtime_overrides,
-)
+from app.application.runtime_settings import load_runtime_settings
+from app.config import ConfigurationError, Settings
 from app.infrastructure.persistence.database import Database
 from app.infrastructure.persistence.read_models import DashboardRepository, DashboardService
 from app.infrastructure.persistence.repository import ArchiveRepository
 from app.infrastructure.persistence.selection import ChatSelectionRepository
-from app.infrastructure.persistence.settings import RuntimeSettingsRepository
 from app.infrastructure.telegram.session_account import read_session_account_id
 from app.interfaces.web.auth import TelegramQrAuthManager
 from app.interfaces.web.routes import create_router, templates
+from app.utils.logging import configure_logging
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 
@@ -118,8 +115,9 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         database = Database(settings.database_url)
         await database.initialize()
-        runtime_settings = RuntimeSettingsRepository(database)
-        overridden = apply_runtime_overrides(settings, await runtime_settings.overrides())
+        resolution = await load_runtime_settings(settings, database)
+        overridden = resolution.settings
+        configure_logging(overridden.log_level)
         app.state.base_settings = settings
         app.state.settings = overridden
         app.state.database = database

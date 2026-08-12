@@ -385,3 +385,39 @@ main { width: min(100%, 92rem); margin: 0 auto; padding: clamp(4rem, 8vw, 8rem) 
 .bubble-player .plyr__controls { border-radius: 0 0 var(--radius) var(--radius); }
 .bubble-player .plyr__menu__container { border-radius: var(--radius-sm); }
 .video-speed-badge { position: absolute; right: 0.6rem; bottom: 3.4rem; z-index: 10; display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.3rem 0.6rem; border-radius: 999px; background: rgba(5, 11, 9, 0.82); border: 1px solid var(--line-strong); color: var(--ink); font-size: 0.68rem; font-variant-numeric: tabular-nums; pointer-events: none; }
+.sender-hue-0 { --sender-hue: 0deg; }
+.sender-hue-1 { --sender-hue: 10deg; }
+.sender-hue-2 { --sender-hue: 20deg; }
+.sender-hue-3 { --sender-hue: 30deg; }
+.sender-hue-4 { --sender-hue: 40deg; }
+.sender-hue-5 { --sender-hue: 50deg; }
+.sender-hue-6 { --sender-hue: 60deg; }
+.sender-hue-7 { --sender-hue: 70deg; }
+.sender-hue-8 { --sender-hue: 80deg; }
+.sender-hue-9 { --sender-hue: 90deg; }
+.sender-hue-10 { --sender-hue: 100deg; }
+.sender-hue-11 { --sender-hue: 110deg; }
+.sender-hue-12 { --sender-hue: 120deg; }
+.sender-hue-13 { --sender-hue: 130deg; }
+.sender-hue-14 { --sender-hue: 140deg; }
+.sender-hue-15 { --sender-hue: 150deg; }
+.sender-hue-16 { --sender-hue: 160deg; }
+.sender-hue-17 { --sender-hue: 170deg; }
+.sender-hue-18 { --sender-hue: 180deg; }
+.sender-hue-19 { --sender-hue: 190deg; }
+.sender-hue-20 { --sender-hue: 200deg; }
+.sender-hue-21 { --sender-hue: 210deg; }
+.sender-hue-22 { --sender-hue: 220deg; }
+.sender-hue-23 { --sender-hue: 230deg; }
+.sender-hue-24 { --sender-hue: 240deg; }
+.sender-hue-25 { --sender-hue: 250deg; }
+.sender-hue-26 { --sender-hue: 260deg; }
+.sender-hue-27 { --sender-hue: 270deg; }
+.sender-hue-28 { --sender-hue: 280deg; }
+.sender-hue-29 { --sender-hue: 290deg; }
+.sender-hue-30 { --sender-hue: 300deg; }
+.sender-hue-31 { --sender-hue: 310deg; }
+.sender-hue-32 { --sender-hue: 320deg; }
+.sender-hue-33 { --sender-hue: 330deg; }
+.sender-hue-34 { --sender-hue: 340deg; }
+.sender-hue-35 { --sender-hue: 350deg; }

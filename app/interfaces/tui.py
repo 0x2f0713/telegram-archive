@@ -6,7 +6,6 @@ import logging
 from datetime import datetime
 from typing import ClassVar
 
-from pydantic import ValidationError
 from rich.text import Text
 from telethon.errors import RPCError
 from textual import events, on
@@ -26,7 +25,8 @@ from textual.widgets import (
 )
 
 from app.application.chat_selection import ChatSelectionService
-from app.config import ConfigurationError, Settings, apply_runtime_overrides
+from app.application.runtime_settings import load_runtime_settings
+from app.config import ConfigurationError, Settings
 from app.infrastructure.persistence.database import Database
 from app.infrastructure.persistence.read_models import (
     DashboardRepository,
@@ -36,7 +36,6 @@ from app.infrastructure.persistence.read_models import (
 )
 from app.infrastructure.persistence.repository import ArchiveRepository
 from app.infrastructure.persistence.selection import ChatSelection, ChatSelectionRepository
-from app.infrastructure.persistence.settings import RuntimeSettingsRepository
 from app.infrastructure.telegram.client import TelegramAccessError
 from app.utils.logging import format_bytes
 
@@ -45,11 +44,7 @@ logger = logging.getLogger(__name__)
 
 async def _effective_settings(settings: Settings, database: Database) -> Settings:
     """Return settings with durable web overrides applied, or the originals."""
-    try:
-        overrides = await RuntimeSettingsRepository(database).overrides()
-        return apply_runtime_overrides(settings, overrides)
-    except (ValidationError, ValueError):
-        return settings
+    return (await load_runtime_settings(settings, database)).settings
 
 
 def _date(value: datetime | None) -> str:

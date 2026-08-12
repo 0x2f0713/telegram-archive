@@ -34,6 +34,7 @@ from app.application.operations import (
     OperationManager,
     OperationNotFoundError,
 )
+from app.application.runtime_settings import load_runtime_settings
 from app.config import (
     RUNTIME_OVERRIDE_FIELDS,
     ConfigurationError,
@@ -41,8 +42,8 @@ from app.config import (
     apply_runtime_overrides,
     decode_overrides,
     encode_overrides,
+    merge_runtime_form_values,
     runtime_form_values,
-    settings_form_values,
 )
 from app.domain.content import (
     ALL_CONTENT_TYPES,
@@ -224,13 +225,10 @@ async def _system_context(
     request: Request, *, error: str | None = None, submitted: dict[str, str] | None = None
 ) -> dict[str, object]:
     """Shared context for the System page, based on effective settings."""
-    runtime_settings = RuntimeSettingsRepository(request.app.state.database)
-    overrides = await runtime_settings.overrides()
-    effective: Settings = (
-        apply_runtime_overrides(request.app.state.base_settings, overrides)
-        if overrides
-        else request.app.state.base_settings
+    resolution = await load_runtime_settings(
+        request.app.state.base_settings, request.app.state.database
     )
+    effective: Settings = resolution.settings
     repository: DashboardRepository = request.app.state.dashboard
     selection_repository: ChatSelectionRepository = request.app.state.chat_selections
     session_path = effective.tg_session_name.expanduser()
@@ -239,14 +237,12 @@ async def _system_context(
     completed_paths = await repository.completed_media_paths()
     selected_ids = await selection_repository.effective_known_ids(effective.configured_chat_ids)
     storage = await asyncio.to_thread(inspect_storage, effective, completed_paths)
-    form_settings = settings_form_values(effective)
-    if submitted:
-        form_settings.update(submitted)
+    form_settings = merge_runtime_form_values(effective, submitted or {})
     context = _navigation_context(request, "system")
     context.update(
         {
-            "form_settings": settings_form_values(effective),
-            "overridden_keys": set(overrides) & set(RUNTIME_OVERRIDE_FIELDS),
+            "form_settings": form_settings,
+            "overridden_keys": set(resolution.valid_overrides),
             "safe_settings": {
                 "Database": effective.database_url,
                 "Download directory": str(effective.download_dir),
@@ -580,7 +576,7 @@ def create_router(settings: Settings) -> APIRouter:
                 request, error=_validation_message(exc), submitted=submitted
             )
             return templates.TemplateResponse(request, "system.html", context, status_code=422)
-        await RuntimeSettingsRepository(request.app.state.database).set_values(overrides)
+        await RuntimeSettingsRepository(request.app.state.database).replace_values(overrides)
         request.app.state.settings = apply_runtime_overrides(
             request.app.state.base_settings, overrides
         )

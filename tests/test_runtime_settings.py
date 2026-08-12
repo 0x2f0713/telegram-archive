@@ -5,12 +5,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from app.application.runtime_settings import load_runtime_settings
 from app.config import (
     RUNTIME_OVERRIDE_FIELDS,
     Settings,
     apply_runtime_overrides,
     decode_overrides,
     encode_overrides,
+    merge_runtime_form_values,
     runtime_form_values,
     settings_form_values,
 )
@@ -34,6 +36,8 @@ async def test_runtime_settings_repository_round_trip(tmp_path: Path) -> None:
         "download_photos": "true",
         "log_level": "DEBUG",
     }
+    await repository.replace_values({"download_retries": "5"})
+    assert await repository.overrides() == {"download_retries": "5"}
     await repository.clear()
     assert await repository.overrides() == {}
     await database.close()
@@ -106,3 +110,39 @@ def test_runtime_form_values_maps_checkboxes_and_required_fields() -> None:
     assert "csrf_token" not in overrides
     with pytest.raises(ValueError, match="must be an integer"):
         decode_overrides({key: value for key, value in overrides.items()})
+
+
+def test_merge_runtime_form_values_preserves_invalid_text_and_checkbox_state() -> None:
+    settings = Settings(_env_file=None)
+    merged = merge_runtime_form_values(
+        settings,
+        {
+            "download_photos": "false",
+            "download_concurrency": "many",
+            "keywords": "urgent",
+        },
+    )
+    assert merged["download_photos"] is False
+    assert merged["download_concurrency"] == "many"
+    assert merged["keywords"] == "urgent"
+
+
+async def test_load_runtime_settings_ignores_only_invalid_rows(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = Settings(_env_file=None, database_url=f"sqlite:///{tmp_path / 'runtime.db'}")
+    database = Database(settings.database_url)
+    await database.initialize()
+    await RuntimeSettingsRepository(database).set_values(
+        {"download_concurrency": "many", "download_retries": "5"}
+    )
+
+    with caplog.at_level("WARNING"):
+        resolution = await load_runtime_settings(settings, database)
+
+    assert resolution.settings.download_concurrency == settings.download_concurrency
+    assert resolution.settings.download_retries == 5
+    assert resolution.valid_overrides == {"download_retries": "5"}
+    assert resolution.invalid_keys == {"download_concurrency"}
+    assert "Ignoring invalid runtime setting download_concurrency" in caplog.text
+    await database.close()

@@ -30,7 +30,7 @@
       <div class="thread-divider" role="separator"><span>{{ day }}</span></div>
     {% endif %}
     {% set is_out = account_user_id is not none and message.sender_id == account_user_id %}
-    <article class="thread-bubble {{ 'bubble-out' if is_out else 'bubble-in' }}" data-sender="{{ message.sender_id or 'anonymous' }}" style="--sender-hue: {{ (message.sender_id or 0) % 360 }}deg">
+    <article class="thread-bubble {{ 'bubble-out' if is_out else 'bubble-in' }} sender-hue-{{ (message.sender_id or 0) % 36 }}" data-sender="{{ message.sender_id or 'anonymous' }}">
       {% if not is_out and (loop.previtem is not defined or (loop.previtem.sender_id != message.sender_id or (loop.previtem.message_date|day_label) != day)) %}
       {% set sender_parts = (message.sender_name or '?').split() %}
       <div class="sender-line">

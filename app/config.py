@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 #: Settings keys an operator may edit from the web "Effective configuration"
@@ -236,6 +236,24 @@ def settings_form_values(settings: Settings) -> dict[str, bool | int | str]:
     }
 
 
+def merge_runtime_form_values(
+    settings: Settings, submitted: dict[str, str]
+) -> dict[str, bool | int | str]:
+    """Overlay submitted form values while retaining their invalid text."""
+    form_values = settings_form_values(settings)
+    for key, raw in submitted.items():
+        if key in _BOOL_OVERRIDES:
+            form_values[key] = raw.casefold() == "true"
+        elif key in _INT_OVERRIDES:
+            try:
+                form_values[key] = int(raw)
+            except ValueError:
+                form_values[key] = raw
+        elif key in RUNTIME_OVERRIDE_FIELDS:
+            form_values[key] = raw
+    return form_values
+
+
 def runtime_form_values(values: dict[str, list[str]]) -> dict[str, str]:
     """Convert parsed form values into canonical override strings.
 
@@ -265,3 +283,28 @@ def apply_runtime_overrides(settings: Settings, overrides: dict[str, str]) -> Se
     merged: dict[str, Any] = settings.model_dump()
     merged.update(decode_overrides(overrides))
     return Settings.model_validate(merged)
+
+
+def resolve_runtime_overrides(
+    settings: Settings, overrides: dict[str, str]
+) -> tuple[Settings, dict[str, str], frozenset[str]]:
+    """Apply valid persisted overrides while isolating corrupt rows.
+
+    Runtime settings are operator-editable data, so one malformed row must not
+    prevent the rest of the application from starting. Unknown keys are
+    ignored; known keys that fail decoding or settings validation are returned
+    separately for logging and repair UI purposes.
+    """
+    valid: dict[str, str] = {}
+    invalid: set[str] = set()
+    for key, value in overrides.items():
+        if key not in RUNTIME_OVERRIDE_FIELDS:
+            continue
+        try:
+            apply_runtime_overrides(settings, {key: value})
+        except (ValidationError, ValueError):
+            invalid.add(key)
+        else:
+            valid[key] = value
+    effective = apply_runtime_overrides(settings, valid) if valid else settings
+    return effective, valid, frozenset(invalid)

@@ -17,11 +17,11 @@ from rich.table import Table
 from app.application.archive import ArchiveService
 from app.application.chat_selection import ChatSelectionService
 from app.application.listener import RealtimeListener
+from app.application.runtime_settings import load_runtime_settings
 from app.application.sync import sync_history
 from app.config import (
     ConfigurationError,
     Settings,
-    apply_runtime_overrides,
 )
 from app.domain import ContentType
 from app.domain.content import (
@@ -32,7 +32,6 @@ from app.infrastructure.download import MediaDownloader
 from app.infrastructure.persistence.database import Database
 from app.infrastructure.persistence.repository import ArchiveRepository
 from app.infrastructure.persistence.selection import ChatSelectionRepository
-from app.infrastructure.persistence.settings import RuntimeSettingsRepository
 from app.infrastructure.telegram.client import (
     TelegramAccessError,
     connect_authorized,
@@ -58,15 +57,20 @@ def _settings() -> Settings:
 
 async def _effective_settings(settings: Settings, database: Database) -> Settings:
     """Return settings with durable web overrides applied, or the originals."""
-    try:
-        overrides = await RuntimeSettingsRepository(database).overrides()
-        effective = apply_runtime_overrides(settings, overrides)
-    except (ValidationError, ValueError) as exc:
-        logger.warning("Ignoring invalid runtime settings overrides: %s", exc)
-        return settings
+    effective = (await load_runtime_settings(settings, database)).settings
     if effective is not settings:
         configure_logging(effective.log_level)
     return effective
+
+
+async def _effective_web_settings(settings: Settings) -> Settings:
+    """Resolve the web log level before handing control to Uvicorn."""
+    database = Database(settings.database_url)
+    await database.initialize()
+    try:
+        return await _effective_settings(settings, database)
+    finally:
+        await database.close()
 
 
 def _run(coroutine: Coroutine[Any, Any, Any]) -> None:
@@ -229,7 +233,7 @@ def sync_command(
                 limit=limit,
                 since=since_date,
                 until=until_date,
-                concurrency=settings.download_concurrency,
+                concurrency=effective.download_concurrency,
                 content_types=selected_types,
             )
             console.print(
@@ -329,6 +333,7 @@ def web_command(
     if updates:
         settings = settings.model_copy(update=updates)
     try:
+        effective = asyncio.run(_effective_web_settings(settings))
         web_app = create_web_app(settings)
     except (ConfigurationError, ValueError) as exc:
         console.print(f"[red]Error:[/red] {exc}")
@@ -344,8 +349,8 @@ def web_command(
         web_app,
         host=settings.web_host,
         port=settings.web_port,
-        log_level=settings.log_level.casefold(),
-        access_log=settings.log_level == "DEBUG",
+        log_level=effective.log_level.casefold(),
+        access_log=True,
     )
 
 

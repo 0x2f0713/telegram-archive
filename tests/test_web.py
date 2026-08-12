@@ -16,6 +16,7 @@ from app.config import ConfigurationError, Settings
 from app.infrastructure.persistence.database import Database
 from app.infrastructure.persistence.repository import ArchiveRepository
 from app.infrastructure.persistence.selection import ChatSelection, ChatSelectionRepository
+from app.infrastructure.persistence.settings import RuntimeSettingsRepository
 from app.interfaces.web.app import create_web_app
 from app.interfaces.web.auth import TelegramAuthSnapshot, TelegramAuthStatus
 from tests.helpers import make_chat, make_message, make_no_media_message
@@ -148,6 +149,8 @@ async def test_conversation_thread_renders_bubbles_with_outgoing_alignment(
     assert text.count("bubble-in") == 2
     assert "Reply to message #1000" in text
     assert 'class="thread-divider"' in text
+    assert 'style="' not in text
+    assert "sender-hue-" in text
 
 
 async def test_conversation_thread_404_for_unknown_chat(tmp_path: Path) -> None:
@@ -642,6 +645,19 @@ async def test_web_system_settings_saves_applies_and_resets(tmp_path: Path) -> N
             assert '<option value="DEBUG" selected' in applied.text
             assert applied.text.count(">overridden<") == 6
 
+            reset_one = await client.post(
+                "/system/settings",
+                data={
+                    "csrf_token": application.state.csrf_token,
+                    **_system_settings_form(concurrency="2", log_level="DEBUG"),
+                },
+            )
+            assert reset_one.status_code == 200
+            assert 'name="download_concurrency" min="1" max="20" value="2"' in reset_one.text
+            assert "download_concurrency" not in await RuntimeSettingsRepository(
+                application.state.database
+            ).overrides()
+
             reset = await client.post(
                 "/system/settings/reset", data={"csrf_token": application.state.csrf_token}
             )
@@ -664,16 +680,27 @@ async def test_web_system_settings_rejects_invalid_values_and_csrf(tmp_path: Pat
         async with httpx.AsyncClient(
             transport=transport, base_url="http://test", follow_redirects=True
         ) as client:
+            invalid_form = _system_settings_form(log_level="loud")
+            invalid_form["allowed_extensions"] = "pdf"
+            for checkbox in (
+                "download_photos",
+                "download_videos",
+                "download_documents",
+                "download_audio",
+            ):
+                invalid_form.pop(checkbox, None)
             invalid = await client.post(
                 "/system/settings",
                 data={
                     "csrf_token": application.state.csrf_token,
-                    **_system_settings_form(log_level="loud"),
+                    **invalid_form,
                 },
             )
             assert invalid.status_code == 422
             assert "Configuration was not saved." in invalid.text
             assert "loud" in invalid.text
+            assert 'name="allowed_extensions" value="pdf"' in invalid.text
+            assert 'name="download_photos" value="true" checked' not in invalid.text
 
             csrf_rejected = await client.post(
                 "/system/settings", data={"csrf_token": "wrong", **_system_settings_form()}
@@ -684,3 +711,23 @@ async def test_web_system_settings_rejects_invalid_values_and_csrf(tmp_path: Pat
                 "/system/settings/reset", data={"csrf_token": "wrong"}
             )
             assert reset_rejected.status_code == 403
+
+
+async def test_web_ignores_invalid_runtime_rows_on_startup(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _settings(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize()
+    await RuntimeSettingsRepository(database).set_values(
+        {"download_concurrency": "many", "download_retries": "5"}
+    )
+    await database.close()
+    application = create_web_app(settings)
+
+    with caplog.at_level("WARNING"):
+        async with application.router.lifespan_context(application):
+            assert application.state.settings.download_concurrency == 2
+            assert application.state.settings.download_retries == 5
+
+    assert "Ignoring invalid runtime setting download_concurrency" in caplog.text
