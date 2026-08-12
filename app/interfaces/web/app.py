@@ -84,11 +84,13 @@ class TelegramSessionMiddleware(BaseHTTPMiddleware):
         if self._is_public(request.url.path):
             return await call_next(request)
 
-        account_id = await asyncio.to_thread(
-            read_session_account_id,
-            request.app.state.settings.tg_session_name,
-        )
-        request.app.state.account_user_id = account_id
+        account_id = getattr(request.app.state, "account_user_id", None)
+        if account_id is None:
+            account_id = await asyncio.to_thread(
+                read_session_account_id,
+                request.app.state.settings.tg_session_name,
+            )
+            request.app.state.account_user_id = account_id
         if self.session.valid(request.cookies.get(self.session.cookie_name), account_id):
             return await call_next(request)
 

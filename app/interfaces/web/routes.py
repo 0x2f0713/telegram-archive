@@ -829,7 +829,13 @@ def create_router(settings: Settings) -> APIRouter:
     @router.get("/auth/telegram", response_class=HTMLResponse)
     async def telegram_auth_page(request: Request) -> HTMLResponse:
         manager: TelegramQrAuthManager = request.app.state.telegram_auth
-        snapshot = await manager.inspect_session()
+        account_id = getattr(request.app.state, "account_user_id", None)
+        use_existing_session = getattr(manager, "use_existing_session", None)
+        snapshot = (
+            use_existing_session(account_id)
+            if account_id is not None and callable(use_existing_session)
+            else await manager.inspect_session()
+        )
         next_path = _safe_next_path(request.query_params.get("next"))
         context = _navigation_context(request, "account")
         context.update(
@@ -860,11 +866,16 @@ def create_router(settings: Settings) -> APIRouter:
         values = await _form_values(request)
         _require_csrf(request, values)
         manager: TelegramQrAuthManager = request.app.state.telegram_auth
-        snapshot = await manager.inspect_session()
-        account_id = await asyncio.to_thread(
-            read_session_account_id,
-            request.app.state.settings.tg_session_name,
-        )
+        account_id = getattr(request.app.state, "account_user_id", None)
+        use_existing_session = getattr(manager, "use_existing_session", None)
+        if account_id is not None and callable(use_existing_session):
+            snapshot = use_existing_session(account_id)
+        else:
+            snapshot = await manager.inspect_session()
+            account_id = await asyncio.to_thread(
+                read_session_account_id,
+                request.app.state.settings.tg_session_name,
+            )
         if snapshot.status.value != "connected" or account_id is None:
             return RedirectResponse(
                 f"/auth/telegram?{urlencode({'error': 'Telegram account is not connected yet'})}",
@@ -901,6 +912,10 @@ def create_router(settings: Settings) -> APIRouter:
     @router.get("/api/v1/auth/telegram")
     async def telegram_auth_status(request: Request) -> dict[str, str | None]:
         manager: TelegramQrAuthManager = request.app.state.telegram_auth
+        account_id = getattr(request.app.state, "account_user_id", None)
+        use_existing_session = getattr(manager, "use_existing_session", None)
+        if account_id is not None and callable(use_existing_session):
+            use_existing_session(account_id)
         return manager.snapshot.public_dict()
 
     @router.get("/login", include_in_schema=False)

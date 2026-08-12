@@ -106,6 +106,25 @@ class TelegramQrAuthManager:
     def snapshot(self) -> TelegramAuthSnapshot:
         return self._snapshot
 
+    def use_existing_session(self, account_id: int) -> TelegramAuthSnapshot:
+        """Mark a known local session as connected without reopening its SQLite file.
+
+        The web listener may already hold Telethon's session database open. In that
+        case creating a second client just to inspect the account can fail with
+        ``database is locked`` even though the existing session is healthy.
+        """
+
+        if account_id <= 0:
+            return self._snapshot
+        if self._snapshot.status == TelegramAuthStatus.PENDING:
+            return self._snapshot
+        self._snapshot = TelegramAuthSnapshot(
+            TelegramAuthStatus.CONNECTED,
+            "Telegram is connected. This archive can access the same chats as this account.",
+            identity=self._snapshot.identity or "the connected Telegram account",
+        )
+        return self._snapshot
+
     async def inspect_session(self) -> TelegramAuthSnapshot:
         """Inspect the local Telethon session unless an authorization is active."""
 

@@ -11,6 +11,7 @@ root.classList.add("js");
 
 const storageKey = "telegram-archiver-theme";
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+const videoPlayers = new WeakMap();
 
 function applyTheme(theme) {
   const normalized = ["dark", "light", "system"].includes(theme) ? theme : "dark";
@@ -754,9 +755,32 @@ function formatSpeed(bytesPerSecond) {
   return `${formatBytes(bytesPerSecond)}/s`;
 }
 
+function requestNativeFullscreen(host, video) {
+  if (typeof video.webkitEnterFullscreen === "function") {
+    try {
+      video.webkitEnterFullscreen();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  const request = host.requestFullscreen || host.webkitRequestFullscreen;
+  if (typeof request !== "function") return false;
+  try {
+    const result = request.call(host);
+    result?.catch?.(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function setupVideoPlayers() {
   document.querySelectorAll("[data-video-player] video").forEach((video) => {
+    if (videoPlayers.has(video)) return;
     const host = video.closest("[data-video-player]");
+    if (!host) return;
     const badge = host?.querySelector("[data-video-speed]");
     const size = Number.parseInt(host?.dataset.mediaSize || "0", 10);
     const PROBE_BYTES = 4 * 1024 * 1024;
@@ -764,23 +788,44 @@ function setupVideoPlayers() {
     let probe = null;
     let probeSpeed = 0;
 
-    new Plyr(video, {
-      controls: [
-        "play",
-        "progress",
-        "current-time",
-        "duration",
-        "mute",
-        "volume",
-        "settings",
-        "pip",
-        "fullscreen",
-      ],
-      settings: ["speed"],
-      speed: { selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2] },
-      tooltips: { controls: true, seek: true },
-      storage: { enabled: false },
-      seekTime: 10,
+    let player;
+    try {
+      player = new Plyr(video, {
+        controls: [
+          "play-large",
+          "play",
+          "progress",
+          "current-time",
+          "duration",
+          "mute",
+          "volume",
+          "settings",
+          "pip",
+          "fullscreen",
+        ],
+        settings: ["speed"],
+        speed: { selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2] },
+        tooltips: { controls: true, seek: true },
+        storage: { enabled: false },
+        seekTime: 10,
+        ratio: "16:9",
+        iconUrl: "/static/plyr.svg",
+        fullscreen: { enabled: true, fallback: "force", iosNative: true, container: "[data-video-player]" },
+      });
+    } catch {
+      video.controls = true;
+      return;
+    }
+    videoPlayers.set(video, player);
+    video.dataset.playerReady = "true";
+
+    player.on("ready", () => {
+      const fullscreenControl = host.querySelector('[data-plyr="fullscreen"]');
+      if (!fullscreenControl || player.fullscreen?.supported) return;
+      fullscreenControl.addEventListener("click", (event) => {
+        event.preventDefault();
+        requestNativeFullscreen(host, video);
+      });
     });
 
     const bufferedAhead = () => {
@@ -820,7 +865,7 @@ function setupVideoPlayers() {
         probeSpeed = probeSpeed ? probeSpeed * 0.7 + instantaneous * 0.3 : instantaneous;
         if (badge) {
           badge.hidden = false;
-          badge.textContent = `⚡ ${formatSpeed(probeSpeed)} · ${formatBytes(loadedBytes)} loaded`;
+          badge.textContent = `Speed ${formatSpeed(probeSpeed)} · ${formatBytes(loadedBytes)} loaded`;
         }
       });
       probe.addEventListener("loadstart", () => {
