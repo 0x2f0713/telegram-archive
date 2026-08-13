@@ -62,12 +62,34 @@
 
 <section class="operation-monitor" aria-labelledby="operation-monitor-title" {% if focus_operation %}data-operation-monitor data-operation-id="{{ focus_operation.id }}"{% endif %}>
   {% if focus_operation %}
+  {% set operation_action = focus_operation.action %}
   <div class="operation-monitor-head">
     <div>
       <p class="eyebrow">Operation #{{ focus_operation.id }}</p>
       <h2 id="operation-monitor-title">{{ focus_operation.command|replace('-', ' ')|title }}</h2>
     </div>
-    <span class="operation-status status-{{ focus_operation.status }}" data-operation-status>{{ focus_operation.status }}</span>
+    <div class="operation-monitor-state">
+      <span class="operation-status status-{{ focus_operation.status }}" data-operation-status>{{ focus_operation.status }}</span>
+      <div data-operation-actions data-operation-action-kind="{{ operation_action.kind }}">
+      {% if operation_action.kind == 'stop' %}
+      <form method="post" action="/operations/{{ focus_operation.id }}/stop" data-operation-action-form data-operation-action-kind="stop">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="button danger-button" type="submit" {% if not operation_action.enabled %}disabled aria-disabled="true"{% endif %}>{{ operation_action.label }}</button>
+      </form>
+      {% elif operation_action.kind == 'resume' %}
+      <form method="post" action="/operations/{{ focus_operation.id }}/resume" data-operation-action-form data-operation-action-kind="resume">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="button primary" type="submit" {% if not operation_action.enabled %}disabled aria-disabled="true"{% endif %}>{{ operation_action.label }}</button>
+      </form>
+      {% elif operation_action.kind == 'retry' %}
+      <form method="post" action="/operations/{{ focus_operation.id }}/retry" data-operation-action-form data-operation-action-kind="retry">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="button primary" type="submit" {% if not operation_action.enabled %}disabled aria-disabled="true"{% endif %}>{{ operation_action.label }}</button>
+      </form>
+      {% endif %}
+      </div>
+      <a class="panel-link" href="/operations?job={{ focus_operation.id }}">Refresh details</a>
+    </div>
   </div>
   <p class="operation-detail" data-operation-detail>{{ focus_operation.detail or 'Preparing operation status' }}</p>
   <details class="operation-download-disclosure" data-operation-download-details {% if focus_operation.get('download_tasks') %}open{% endif %}>
@@ -108,28 +130,6 @@
   {% else %}
   <div class="operation-error" role="alert" data-operation-error hidden></div>
   {% endif %}
-  <div class="operation-monitor-actions">
-    {% set operation_action = focus_operation.action %}
-    <div data-operation-actions data-operation-action-kind="{{ operation_action.kind }}">
-    {% if operation_action.kind == 'stop' %}
-    <form method="post" action="/operations/{{ focus_operation.id }}/stop" data-operation-action-form data-operation-action-kind="stop">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <button class="button danger-button" type="submit" {% if not operation_action.enabled %}disabled aria-disabled="true"{% endif %}>{{ operation_action.label }}</button>
-    </form>
-    {% elif operation_action.kind == 'resume' %}
-    <form method="post" action="/operations/{{ focus_operation.id }}/resume" data-operation-action-form data-operation-action-kind="resume">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <button class="button primary" type="submit" {% if not operation_action.enabled %}disabled aria-disabled="true"{% endif %}>{{ operation_action.label }}</button>
-    </form>
-    {% elif operation_action.kind == 'retry' %}
-    <form method="post" action="/operations/{{ focus_operation.id }}/retry" data-operation-action-form data-operation-action-kind="retry">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <button class="button primary" type="submit" {% if not operation_action.enabled %}disabled aria-disabled="true"{% endif %}>{{ operation_action.label }}</button>
-    </form>
-    {% endif %}
-    </div>
-    <a class="button text-button" href="/operations?job={{ focus_operation.id }}">Refresh details</a>
-  </div>
   <div class="operation-log-panel">
     <div><p class="eyebrow">Event log</p><span>Latest {{ operation_logs|length }} entries</span></div>
     <ol class="operation-log" data-operation-logs aria-live="polite" aria-relevant="additions text">

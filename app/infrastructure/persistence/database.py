@@ -33,6 +33,13 @@ class Database:
         self.engine: AsyncEngine = create_async_engine(
             self.url,
             connect_args={"timeout": 30},
+            # This service has one SQLite file and several concurrent producers
+            # (web polling, operation progress, and archive writes). A single
+            # pooled connection gives those short transactions one queue instead
+            # of letting competing writers consume the pool and time out.
+            pool_size=1,
+            max_overflow=0,
+            pool_timeout=60,
         )
         event.listen(self.engine.sync_engine, "connect", self._configure_sqlite)
         self.sessions = async_sessionmaker(self.engine, class_=AsyncSession, expire_on_commit=False)

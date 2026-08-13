@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -89,3 +90,17 @@ async def test_content_checkpoints_are_independent_and_monotonic(database: Datab
     )
 
     assert checkpoints == {"photo": 20, "video": 20, "voice": 7, "audio": None}
+
+
+async def test_concurrent_archive_writes_share_the_sqlite_connection(database: Database) -> None:
+    """Concurrent producers queue cleanly instead of exhausting SQLite connections."""
+
+    repository = ArchiveRepository(database)
+    await asyncio.gather(
+        *(
+            repository.upsert_message(make_message(telegram_message_id=message_id))
+            for message_id in range(100, 140)
+        )
+    )
+
+    assert (await repository.stats()).total_messages == 40

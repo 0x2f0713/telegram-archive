@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-from app.application.commands import Commands
 from app.application.operations import (
     OperationConflictError,
     OperationContext,
@@ -15,6 +14,7 @@ from app.application.operations import (
 from app.config import Settings
 from app.infrastructure.persistence.database import Database
 from app.infrastructure.persistence.operations import OperationRepository
+from app.interfaces.web.commands import OperationCommands
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -91,7 +91,11 @@ async def test_operation_progress_history_and_single_job_exclusion(tmp_path: Pat
             downloads_completed=5,
         )
 
-    manager = OperationManager(settings, database, executors={"sync": fake_sync})
+    manager = OperationManager(
+        settings,
+        OperationRepository(database),
+        executors={"sync": fake_sync},
+    )
     await manager.startup()
     started = await manager.start_job("sync", {"limit": 100})
     running = await _wait_for_phase(manager, int(started["id"]), "syncing")
@@ -133,7 +137,7 @@ async def test_download_reporter_tracks_each_task_with_speed(tmp_path: Path) -> 
         async def progress(self, **values: object) -> None:
             updates.append(values)
 
-    reporter = Commands._download_reporter(Context())  # type: ignore[arg-type]
+    reporter = OperationCommands._download_reporter(Context())  # type: ignore[arg-type]
     reporter("one.bin", 512, 1024)
     await asyncio.sleep(0)
     reporter("two.bin", 1024, 2048)
@@ -183,7 +187,11 @@ async def test_retry_starts_new_operation_with_original_parameters(tmp_path: Pat
     async def fake_listener(context: OperationContext) -> None:
         await context.stop_event.wait()
 
-    manager = OperationManager(settings, database, executors={"listen": fake_listener})
+    manager = OperationManager(
+        settings,
+        OperationRepository(database),
+        executors={"listen": fake_listener},
+    )
     await manager.startup()
     started = await manager.start_job("listen", {"content_types": ["photo"]})
     original_id = int(started["id"])
@@ -223,7 +231,11 @@ async def test_resume_reactivates_the_original_sync_operation(tmp_path: Path) ->
         runs += 1
         await context.progress(force=True, phase="syncing", detail=f"Run {runs}")
 
-    manager = OperationManager(settings, database, executors={"sync": fake_sync})
+    manager = OperationManager(
+        settings,
+        OperationRepository(database),
+        executors={"sync": fake_sync},
+    )
     await manager.startup()
     started = await manager.start_job("sync", {"chat": -1001234567890, "limit": 50})
     original_id = int(started["id"])
@@ -263,7 +275,11 @@ async def test_operation_safe_stop_and_restart_recovery(tmp_path: Path) -> None:
         )
         await context.stop_event.wait()
 
-    manager = OperationManager(settings, database, executors={"listen": fake_listener})
+    manager = OperationManager(
+        settings,
+        OperationRepository(database),
+        executors={"listen": fake_listener},
+    )
     await manager.startup()
     started = await manager.start_job("listen")
     await _wait_for_status(manager, int(started["id"]), {"running"})
@@ -276,7 +292,11 @@ async def test_operation_safe_stop_and_restart_recovery(tmp_path: Path) -> None:
     repository = OperationRepository(database)
     orphan = await repository.create("sync", {})
     await repository.update(orphan.id, status="running", phase="syncing")
-    recovered_manager = OperationManager(settings, database, executors={})
+    recovered_manager = OperationManager(
+        settings,
+        OperationRepository(database),
+        executors={},
+    )
     await recovered_manager.startup()
     recovered = await recovered_manager.get(orphan.id)
 
@@ -291,11 +311,11 @@ def test_operation_content_type_parameters_are_canonical_and_all_is_unfiltered(
 ) -> None:
     del tmp_path  # content parsing is pure; no database needed
 
-    assert Commands._content_types({"content_types": ["images", "voice-messages"]}) == (
-        frozenset({"photo", "voice"})
-    )
+    assert OperationCommands._content_types(
+        {"content_types": ["images", "voice-messages"]}
+    ) == frozenset({"photo", "voice"})
     assert (
-        Commands._content_types(
+        OperationCommands._content_types(
             {
                 "content_types": [
                     "text",

@@ -4,19 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
-from telethon.errors import FloodWaitError, RPCError
-
+from app.application.archive_records import (
+    DownloadResult,
+    MessageSnapshot,
+    RetryCandidate,
+)
 from app.application.filenames import output_path
 from app.application.media_policy import MediaFilter
 from app.config import Settings
-from app.domain import ChatInfo, ContentType, DownloadState
-from app.infrastructure.download import MediaDownloader
-from app.infrastructure.persistence.repository import ArchiveRepository
-from app.infrastructure.telegram.translation import content_types_of, message_data
+from app.domain import ChatInfo, ContentType, DownloadState, MessageData
 from app.utils.logging import format_bytes
 from app.utils.waiting import wait_or_stop
 
@@ -42,20 +43,58 @@ class RetryProgress:
 
 
 RetryProgressCallback = Callable[[RetryProgress], Awaitable[None]]
+MessageParser = Callable[[object, ChatInfo], MessageData]
+ContentClassifier = Callable[[object], frozenset[ContentType]]
+RateLimitDelay = Callable[[Exception], int | None]
+TransientErrorPredicate = Callable[[Exception], bool]
+
+
+class ArchiveWriter(Protocol):
+    async def upsert_message(self, data: MessageData) -> tuple[MessageSnapshot, bool]: ...
+
+    async def mark_download_completed(
+        self, message_id: int, media_path: Path, media_size: int
+    ) -> None: ...
+
+    async def mark_download_skipped(self, message_id: int, reason: str) -> None: ...
+
+    async def mark_download_failed(self, message_id: int, error: str) -> None: ...
+
+    async def iter_retry_candidates(
+        self, chat_ids: Sequence[int], *, failed_only: bool = False
+    ) -> Sequence[RetryCandidate]: ...
+
+
+class ArchiveDownloader(Protocol):
+    async def download(
+        self,
+        record: MessageSnapshot,
+        raw_message: object,
+        target: Path,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> DownloadResult: ...
 
 
 class ArchiveService:
     def __init__(
         self,
         settings: Settings,
-        repository: ArchiveRepository,
-        downloader: MediaDownloader,
+        repository: ArchiveWriter,
+        downloader: ArchiveDownloader,
+        message_parser: MessageParser,
+        content_classifier: ContentClassifier,
+        rate_limit_delay: RateLimitDelay,
+        is_transient_error: TransientErrorPredicate,
         content_types: frozenset[ContentType] | None = None,
         download_progress: DownloadProgressCallback | None = None,
     ) -> None:
         self.settings = settings
         self.repository = repository
         self.downloader = downloader
+        self.message_parser = message_parser
+        self.content_classifier = content_classifier
+        self.rate_limit_delay = rate_limit_delay
+        self.is_transient_error = is_transient_error
         self.content_types = content_types
         self.download_progress = download_progress
         self.media_filter = MediaFilter(settings, content_types)
@@ -67,7 +106,7 @@ class ArchiveService:
         """Return whether this operation selected any facet of the message."""
 
         return self.content_types is None or bool(
-            content_types_of(raw_message) & self.content_types
+            self.content_classifier(raw_message) & self.content_types
         )
 
     async def process_message(
@@ -75,7 +114,7 @@ class ArchiveService:
     ) -> ProcessResult:
         if not self.matches_message(raw_message):
             return ProcessResult(False, False, True)
-        data = message_data(raw_message, chat)
+        data = self.message_parser(raw_message, chat)
         key = (data.telegram_chat_id, data.telegram_message_id)
         lock = self._message_locks[hash(key) % len(self._message_locks)]
         async with lock:
@@ -218,36 +257,41 @@ class ArchiveService:
                     )
                     retrieval_error = None
                     break
-                except FloodWaitError as exc:
-                    wait_seconds = max(1, int(exc.seconds))
-                    retrieval_error = f"Telegram FloodWait ({wait_seconds}s)"
-                    logger.warning("Telegram FloodWait: waiting %s seconds", wait_seconds)
-                    if retrieval_attempt < self.settings.download_retries:
-                        if progress:
-                            await progress(
-                                RetryProgress(
-                                    phase="rate-limited",
-                                    current=current,
-                                    total=total,
-                                    attempted=attempted,
-                                    completed=completed,
-                                    detail=f"Telegram requested a {wait_seconds}s FloodWait",
+                except Exception as exc:
+                    wait_seconds = self.rate_limit_delay(exc)
+                    if wait_seconds is not None:
+                        retrieval_error = f"Telegram FloodWait ({wait_seconds}s)"
+                        logger.warning("Telegram FloodWait: waiting %s seconds", wait_seconds)
+                        if retrieval_attempt < self.settings.download_retries:
+                            if progress:
+                                await progress(
+                                    RetryProgress(
+                                        phase="rate-limited",
+                                        current=current,
+                                        total=total,
+                                        attempted=attempted,
+                                        completed=completed,
+                                        detail=(
+                                            f"Telegram requested a {wait_seconds}s FloodWait"
+                                        ),
+                                    )
                                 )
+                            if await wait_or_stop(stop_event, wait_seconds):
+                                break
+                    elif self.is_transient_error(exc):
+                        retrieval_error = f"{type(exc).__name__}: {exc}"
+                        if retrieval_attempt < self.settings.download_retries:
+                            delay = min(30, 2 ** (retrieval_attempt - 1))
+                            logger.warning(
+                                "[%s] Message retrieval failed; retrying in %ss: %s",
+                                chat.title,
+                                delay,
+                                exc,
                             )
-                        if await wait_or_stop(stop_event, wait_seconds):
-                            break
-                except (RPCError, ConnectionError, TimeoutError) as exc:
-                    retrieval_error = f"{type(exc).__name__}: {exc}"
-                    if retrieval_attempt < self.settings.download_retries:
-                        delay = min(30, 2 ** (retrieval_attempt - 1))
-                        logger.warning(
-                            "[%s] Message retrieval failed; retrying in %ss: %s",
-                            chat.title,
-                            delay,
-                            exc,
-                        )
-                        if await wait_or_stop(stop_event, delay):
-                            break
+                            if await wait_or_stop(stop_event, delay):
+                                break
+                    else:
+                        raise
 
             if stop_event and stop_event.is_set():
                 break

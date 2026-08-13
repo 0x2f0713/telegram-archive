@@ -25,18 +25,21 @@ from textual.widgets import (
 )
 
 from app.application.chat_selection import ChatSelectionService
+from app.application.dashboard import DashboardService, MessageQuery, MessageView
 from app.application.runtime_settings import load_runtime_settings
 from app.config import ConfigurationError, Settings
 from app.infrastructure.persistence.database import Database
-from app.infrastructure.persistence.read_models import (
-    DashboardRepository,
-    DashboardService,
-    MessageQuery,
-    MessageView,
-)
+from app.infrastructure.persistence.read_models import DashboardRepository
 from app.infrastructure.persistence.repository import ArchiveRepository
 from app.infrastructure.persistence.selection import ChatSelection, ChatSelectionRepository
-from app.infrastructure.telegram.client import TelegramAccessError
+from app.infrastructure.persistence.settings import RuntimeSettingsRepository
+from app.infrastructure.telegram.client import (
+    TelegramAccessError,
+    accessible_dialogs,
+    connect_authorized,
+    create_client,
+    resolve_accessible_chats,
+)
 from app.utils.logging import format_bytes
 
 logger = logging.getLogger(__name__)
@@ -44,7 +47,9 @@ logger = logging.getLogger(__name__)
 
 async def _effective_settings(settings: Settings, database: Database) -> Settings:
     """Return settings with durable web overrides applied, or the originals."""
-    return (await load_runtime_settings(settings, database)).settings
+    return (
+        await load_runtime_settings(settings, RuntimeSettingsRepository(database))
+    ).settings
 
 
 def _date(value: datetime | None) -> str:
@@ -337,8 +342,21 @@ class ArchiveTui(App[None]):
         self.dashboard = DashboardRepository(self.database)
         self.archive = ArchiveRepository(self.database)
         self.selections = ChatSelectionRepository(self.database)
-        self.selection_service = ChatSelectionService(self.settings, self.archive)
-        self.service = DashboardService(self.database, self.settings.configured_chat_ids)
+        self.selection_service = ChatSelectionService(
+            self.settings.configured_chat_ids,
+            self.archive,
+            self.selections,
+            accessible_dialogs,
+            resolve_accessible_chats,
+            client_factory=lambda: create_client(self.settings),
+            client_connector=connect_authorized,
+        )
+        self.service = DashboardService(
+            self.archive,
+            self.dashboard,
+            self.selections,
+            self.settings.configured_chat_ids,
+        )
         self._setup_tables()
         if not await self.dashboard.chat_summaries():
             await self._discover_chats(notify=False)

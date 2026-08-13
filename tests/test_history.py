@@ -8,6 +8,7 @@ import pytest
 
 from app.application.archive import ProcessResult
 from app.application.sync import SyncProgress, sync_history
+from app.infrastructure.telegram.translation import content_types_of
 from tests.helpers import make_chat
 
 
@@ -323,6 +324,7 @@ async def test_filtered_sync_uses_independent_content_checkpoints() -> None:
         archive,
         repository,  # type: ignore[arg-type]
         content_types=frozenset({"photo"}),
+        content_classifier=content_types_of,
     )
     photos_again = await sync_history(
         client,
@@ -330,6 +332,7 @@ async def test_filtered_sync_uses_independent_content_checkpoints() -> None:
         archive,
         repository,  # type: ignore[arg-type]
         content_types=frozenset({"photo"}),
+        content_classifier=content_types_of,
     )
     videos = await sync_history(
         client,
@@ -337,6 +340,7 @@ async def test_filtered_sync_uses_independent_content_checkpoints() -> None:
         archive,
         repository,  # type: ignore[arg-type]
         content_types=frozenset({"video"}),
+        content_classifier=content_types_of,
     )
 
     assert photos.messages == 1
@@ -360,6 +364,7 @@ async def test_filtered_sync_matches_caption_as_text_content() -> None:
         archive,
         repository,  # type: ignore[arg-type]
         content_types=frozenset({"text"}),
+        content_classifier=content_types_of,
     )
 
     assert result.messages == 1

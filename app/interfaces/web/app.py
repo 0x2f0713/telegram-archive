@@ -17,16 +17,27 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.application.chat_selection import ChatSelectionService
+from app.application.dashboard import DashboardService
 from app.application.operations import OperationManager
 from app.application.runtime_settings import load_runtime_settings
 from app.config import ConfigurationError, Settings
 from app.infrastructure.persistence.database import Database
-from app.infrastructure.persistence.read_models import DashboardRepository, DashboardService
+from app.infrastructure.persistence.operations import OperationRepository
+from app.infrastructure.persistence.read_models import DashboardRepository
 from app.infrastructure.persistence.repository import ArchiveRepository
 from app.infrastructure.persistence.selection import ChatSelectionRepository
+from app.infrastructure.persistence.settings import RuntimeSettingsRepository
+from app.infrastructure.telegram.client import (
+    accessible_dialogs,
+    connect_authorized,
+    create_client,
+    resolve_accessible_chats,
+)
 from app.infrastructure.telegram.session_account import read_session_account_id
 from app.interfaces.web.auth import TelegramQrAuthManager
-from app.interfaces.web.routes import create_router, templates
+from app.interfaces.web.commands import OperationCommands
+from app.interfaces.web.presentation import templates
+from app.interfaces.web.routes import create_router
 from app.interfaces.web.session import TelegramWebSession
 from app.utils.logging import configure_logging
 
@@ -143,7 +154,8 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         database = Database(settings.database_url)
         await database.initialize()
-        resolution = await load_runtime_settings(settings, database)
+        runtime_settings = RuntimeSettingsRepository(database)
+        resolution = await load_runtime_settings(settings, runtime_settings)
         overridden = resolution.settings
         configure_logging(overridden.log_level)
         app.state.base_settings = settings
@@ -152,12 +164,32 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
         app.state.dashboard = DashboardRepository(database)
         app.state.archive = ArchiveRepository(database)
         app.state.chat_selections = ChatSelectionRepository(database)
-        app.state.chat_selection_service = ChatSelectionService(overridden, app.state.archive)
-        app.state.dashboard_service = DashboardService(database, overridden.configured_chat_ids)
+        app.state.runtime_settings = runtime_settings
+        app.state.chat_selection_service = ChatSelectionService(
+            overridden.configured_chat_ids,
+            app.state.archive,
+            app.state.chat_selections,
+            accessible_dialogs,
+            resolve_accessible_chats,
+            client_factory=lambda: create_client(overridden),
+            client_connector=connect_authorized,
+        )
+        app.state.dashboard_service = DashboardService(
+            app.state.archive,
+            app.state.dashboard,
+            app.state.chat_selections,
+            overridden.configured_chat_ids,
+        )
         app.state.csrf_token = secrets.token_urlsafe(32)
         app.state.telegram_auth = TelegramQrAuthManager(overridden)
         app.state.web_session = web_session
-        app.state.operations = OperationManager(overridden, database)
+        operations = OperationManager(
+            overridden,
+            OperationRepository(database),
+            executors={},
+        )
+        operations.configure_executors(OperationCommands(operations, database).executors())
+        app.state.operations = operations
         app.state.account_user_id = read_session_account_id(overridden.tg_session_name)
         templates.env.globals["refresh_seconds"] = overridden.web_refresh_seconds
         await app.state.operations.startup()

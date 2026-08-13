@@ -3,13 +3,11 @@ from pathlib import Path
 
 import pytest
 
+from app.application.dashboard import DashboardService, MessageQuery
 from app.infrastructure.persistence.database import Database
-from app.infrastructure.persistence.read_models import (
-    DashboardRepository,
-    DashboardService,
-    MessageQuery,
-)
+from app.infrastructure.persistence.read_models import DashboardRepository
 from app.infrastructure.persistence.repository import ArchiveRepository
+from app.infrastructure.persistence.selection import ChatSelectionRepository
 from tests.helpers import make_chat, make_message
 
 
@@ -65,7 +63,12 @@ async def _seed_archive(database: Database, media_path: Path) -> None:
 async def test_dashboard_aggregates_archive_health(database: Database, tmp_path: Path) -> None:
     await _seed_archive(database, tmp_path / "report.pdf")
 
-    overview = await DashboardService(database, (-1001234567890,)).overview()
+    overview = await DashboardService(
+        ArchiveRepository(database),
+        DashboardRepository(database),
+        ChatSelectionRepository(database),
+        (-1001234567890,),
+    ).overview()
 
     assert overview.stats.total_messages == 3
     assert overview.stats.downloaded_files == 1

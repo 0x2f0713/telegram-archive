@@ -14,6 +14,7 @@ from app.application.chat_selection import ChatDiscovery
 from app.application.operations import OperationContext, OperationManager
 from app.config import ConfigurationError, Settings
 from app.infrastructure.persistence.database import Database
+from app.infrastructure.persistence.operations import OperationRepository
 from app.infrastructure.persistence.repository import ArchiveRepository
 from app.infrastructure.persistence.selection import ChatSelection, ChatSelectionRepository
 from app.infrastructure.persistence.settings import RuntimeSettingsRepository
@@ -73,7 +74,8 @@ async def test_web_pages_api_and_media_delivery(tmp_path: Path) -> None:
             api_messages = await client.get("/api/v1/messages", params={"q": "Alice"})
 
     assert dashboard.status_code == 200
-    assert "Keep every message" in dashboard.text
+    assert "Archive overview" in dashboard.text
+    assert "Recommended next action" in dashboard.text
     assert dashboard.headers["content-security-policy"].startswith("default-src 'self'")
     assert messages.status_code == 200
     assert "Quarterly &lt;script&gt;" in messages.text
@@ -152,6 +154,39 @@ async def test_conversation_thread_renders_bubbles_with_outgoing_alignment(
     assert 'class="thread-divider"' in text
     assert 'style="' not in text
     assert "sender-hue-" in text
+
+
+async def test_conversation_video_bubble_reserves_preview_width(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize()
+    archive = ArchiveRepository(database)
+    chat = make_chat(title="Video Room")
+    await archive.upsert_chat(chat)
+    record, _ = await archive.upsert_message(
+        make_message(
+            text=None,
+            media_type="video",
+            mime_type="video/mp4",
+            original_filename="clip.mp4",
+            extension=".mp4",
+        )
+    )
+    media_path = settings.download_dir / "video" / "clip.mp4"
+    media_path.parent.mkdir(parents=True, exist_ok=True)
+    media_path.write_bytes(b"archived video")
+    await archive.mark_download_completed(record.id, media_path, media_path.stat().st_size)
+    await database.close()
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(f"/chats/{chat.telegram_chat_id}")
+
+    assert response.status_code == 200
+    assert "thread-bubble-video" in response.text
+    assert '<video class="bubble-media"' in response.text
 
 
 async def test_conversation_thread_404_for_unknown_chat(tmp_path: Path) -> None:
@@ -488,7 +523,7 @@ async def test_web_operations_run_with_progress_csrf_and_safe_stop(tmp_path: Pat
     async with application.router.lifespan_context(application):
         application.state.operations = OperationManager(
             settings,
-            application.state.database,
+            OperationRepository(application.state.database),
             executors={"sync": fake_sync, "listen": fake_listener},
         )
         await application.state.operations.startup()

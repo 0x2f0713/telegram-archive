@@ -1,4 +1,4 @@
-"""Allowlisted long-running workflows the web operator can start.
+"""Composition of allowlisted long-running workflows for the web operator.
 
 Each command is a use case executed inside an ``OperationContext``: sync
 historical history, run the real-time listener, retry failed media, and run
@@ -17,6 +17,8 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
+from telethon import events
+
 from app.application.archive import ArchiveService, RetryProgress
 from app.application.chat_selection import ChatSelectionService
 from app.application.listener import ListenerProgress, RealtimeListener
@@ -33,17 +35,33 @@ from app.domain.content import canonical_content_type_list
 from app.infrastructure.download import MediaDownloader
 from app.infrastructure.persistence.database import Database
 from app.infrastructure.persistence.repository import ArchiveRepository
-from app.infrastructure.telegram.client import connect_authorized
+from app.infrastructure.persistence.selection import ChatSelectionRepository
+from app.infrastructure.telegram.client import (
+    accessible_dialogs,
+    connect_authorized,
+    create_client,
+    flood_wait_seconds,
+    is_transient_telegram_error,
+    resolve_accessible_chats,
+)
+from app.infrastructure.telegram.translation import content_types_of, message_data
 from app.utils.logging import format_bytes
 
 logger = logging.getLogger(__name__)
 
 
-class Commands:
+class OperationCommands:
     """Executors bound to one operation manager."""
 
-    def __init__(self, manager: OperationManager) -> None:
+    def __init__(
+        self,
+        manager: OperationManager,
+        database: Database,
+        client_factory: Callable[[Settings], Any] = create_client,
+    ) -> None:
         self.manager = manager
+        self.database = database
+        self.client_factory = client_factory
 
     @property
     def settings(self) -> Settings:
@@ -56,6 +74,17 @@ class Commands:
             "retry-failed": self.retry_failed,
             "doctor": self.doctor,
         }
+
+    def _chat_selection_service(
+        self, repository: ArchiveRepository
+    ) -> ChatSelectionService:
+        return ChatSelectionService(
+            self.settings.configured_chat_ids,
+            repository,
+            ChatSelectionRepository(repository.database),
+            accessible_dialogs,
+            resolve_accessible_chats,
+        )
 
     @staticmethod
     def _content_types(parameters: Mapping[str, Any]) -> frozenset[ContentType] | None:
@@ -86,6 +115,10 @@ class Commands:
                 self.settings,
                 repository,
                 downloader,
+                message_data,
+                content_types_of,
+                flood_wait_seconds,
+                is_transient_telegram_error,
                 content_types,
                 download_progress,
             ),
@@ -154,7 +187,7 @@ class Commands:
         return report
 
     async def _selected_chats(self, client: Any, repository: ArchiveRepository) -> dict[int, Any]:
-        chats = await ChatSelectionService(self.settings, repository).resolve_with_client(client)
+        chats = await self._chat_selection_service(repository).resolve_with_client(client)
         if not chats:
             raise ConfigurationError(
                 "No chats are selected. Choose chats on the Chats page before starting a worker."
@@ -184,7 +217,7 @@ class Commands:
         database, repository, archive = self._archive_stack(
             content_types, self._download_reporter(context)
         )
-        client = self.manager.client_factory(self.settings)
+        client = self.client_factory(self.settings)
         try:
             await database.initialize()
             await context.progress(
@@ -268,6 +301,9 @@ class Commands:
                 until=until,
                 concurrency=self.settings.download_concurrency,
                 content_types=content_types,
+                content_classifier=content_types_of,
+                rate_limit_delay=flood_wait_seconds,
+                is_transient_error=is_transient_telegram_error,
                 stop_event=context.stop_event,
                 progress=sync_progress,
             )
@@ -293,7 +329,7 @@ class Commands:
         database, repository, archive = self._archive_stack(
             content_types, self._download_reporter(context)
         )
-        client = self.manager.client_factory(self.settings)
+        client = self.client_factory(self.settings)
         try:
             await database.initialize()
             await context.progress(
@@ -339,7 +375,7 @@ class Commands:
         database, repository, archive = self._archive_stack(
             content_types, self._download_reporter(context)
         )
-        client = self.manager.client_factory(self.settings)
+        client = self.client_factory(self.settings)
         try:
             await database.initialize()
             await context.progress(
@@ -372,6 +408,10 @@ class Commands:
                 chats,
                 archive,
                 self.settings,
+                event_builders=lambda entities: (
+                    events.NewMessage(chats=entities),
+                    events.MessageEdited(chats=entities),
+                ),
                 progress=listener_progress,
                 manage_signals=False,
                 stop_event=context.stop_event,
@@ -437,7 +477,7 @@ class Commands:
             return
 
         try:
-            await self.manager.database.healthcheck()
+            await self.database.healthcheck()
             await context.log("PASS · SQLite database is readable and writable")
         except Exception as exc:
             failed = True
@@ -461,12 +501,12 @@ class Commands:
         if context.stop_event.is_set():
             return
 
-        client = self.manager.client_factory(self.settings)
+        client = self.client_factory(self.settings)
         database, repository, _archive = self._archive_stack()
         try:
             await database.initialize()
             await connect_authorized(client)
-            chats = await ChatSelectionService(self.settings, repository).resolve_with_client(
+            chats = await self._chat_selection_service(repository).resolve_with_client(
                 client
             )
             if chats:

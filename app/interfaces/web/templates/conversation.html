@@ -30,7 +30,8 @@
       <div class="thread-divider" role="separator"><span>{{ day }}</span></div>
     {% endif %}
     {% set is_out = account_user_id is not none and message.sender_id == account_user_id %}
-    <article class="thread-bubble {{ 'bubble-out' if is_out else 'bubble-in' }} sender-hue-{{ (message.sender_id or 0) % 36 }}" data-sender="{{ message.sender_id or 'anonymous' }}">
+    {% set media_kind = preview_kind(message.mime_type) if message.download_status == 'completed' and message.media_path else '' %}
+    <article class="thread-bubble {{ 'bubble-out' if is_out else 'bubble-in' }}{{ ' thread-bubble-video' if media_kind == 'video' else '' }} sender-hue-{{ (message.sender_id or 0) % 36 }}" data-sender="{{ message.sender_id or 'anonymous' }}">
       {% if not is_out and (loop.previtem is not defined or (loop.previtem.sender_id != message.sender_id or (loop.previtem.message_date|day_label) != day)) %}
       {% set sender_parts = (message.sender_name or '?').split() %}
       <div class="sender-line">
@@ -46,10 +47,9 @@
         {% endif %}
         {% if message.text %}<p class="bubble-text">{{ message.text }}</p>{% endif %}
         {% if message.download_status == 'completed' and message.media_path %}
-          {% set kind = preview_kind(message.mime_type) %}
-          {% if kind == 'image' %}<img class="bubble-media" src="/media/{{ message.id }}" alt="Media attached to message {{ message.telegram_message_id }}" loading="lazy">
-          {% elif kind == 'video' %}<div class="bubble-player" data-video-player data-media-size="{{ message.media_size or 0 }}"><video class="bubble-media" controls preload="metadata" playsinline><source src="/media/{{ message.id }}" type="{{ message.mime_type }}">Your browser cannot play this video. Use the download link.</video><span class="video-speed-badge" data-video-speed aria-hidden="true" hidden></span></div>
-          {% elif kind == 'audio' %}<audio class="bubble-media" controls preload="metadata"><source src="/media/{{ message.id }}" type="{{ message.mime_type }}">Your browser cannot play this audio. Use the download link.</audio>
+          {% if media_kind == 'image' %}<img class="bubble-media" src="/media/{{ message.id }}" alt="Media attached to message {{ message.telegram_message_id }}" loading="lazy">
+          {% elif media_kind == 'video' %}<div class="bubble-player" data-video-player data-media-size="{{ message.media_size or 0 }}"><video class="bubble-media" controls preload="metadata" playsinline><source src="/media/{{ message.id }}" type="{{ message.mime_type }}">Your browser cannot play this video. Use the download link.</video><span class="video-speed-badge" data-video-speed aria-hidden="true" hidden></span></div>
+          {% elif media_kind == 'audio' %}<audio class="bubble-media" controls preload="metadata"><source src="/media/{{ message.id }}" type="{{ message.mime_type }}">Your browser cannot play this audio. Use the download link.</audio>
           {% else %}<a class="bubble-file" href="/media/{{ message.id }}" download><span class="file-glyph" aria-hidden="true"></span><span><strong>{{ message.filename or 'Archived file' }}</strong><small>{{ message.mime_type or 'Unknown file type' }}{% if message.media_size is not none %} · {{ message.media_size|bytes }}{% endif %}</small></span><span class="file-cta">Download</span></a>{% endif %}
         {% elif message.has_media %}
           <div class="bubble-media-missing"><span class="status status-{{ message.download_status }}"><i aria-hidden="true"></i>{{ message.download_status|replace('_', ' ') }}</span>{% if message.download_error %}<small>{{ message.download_error }}</small>{% endif %}{% if message.download_status == 'failed' %}<a class="text-action" href="/operations">Retry in operations</a>{% endif %}</div>

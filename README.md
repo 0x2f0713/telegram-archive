@@ -336,7 +336,9 @@ python -m ruff format --check .
 
 Tests use temporary SQLite databases and fake Telegram messages; they do not need a Telegram account or network access.
 
-Dashboard JavaScript, GSAP, CSS, and Geist fonts are bundled locally, so the browser makes no CDN requests. Node.js is needed only when editing frontend assets:
+See [docs/architecture.md](docs/architecture.md) for module boundaries, dependency rules, and composition guidance.
+
+Dashboard JavaScript, CSS, Plyr controls, and Geist fonts are bundled locally, so the browser makes no CDN requests. Node.js is needed only when editing frontend assets:
 
 ```bash
 npm install

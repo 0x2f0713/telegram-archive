@@ -2,8 +2,8 @@
 
 This is the application controller: it owns job state transitions, the
 in-memory progress overlay, stop coordination, and process-shutdown recovery.
-The actual command bodies (sync, listen, retry-failed, doctor) live in
-``app.application.commands`` and are injected as allowlisted executors.
+The actual command bodies (sync, listen, retry-failed, doctor) are composed at
+the web boundary and injected as allowlisted executors.
 """
 
 from __future__ import annotations
@@ -14,17 +14,15 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import monotonic
-from typing import Any
+from typing import Any, Protocol
 
+from app.application.operation_records import (
+    ACTIVE_OPERATION_STATUSES,
+    OperationLogRecord,
+    OperationRecord,
+)
 from app.config import Settings
 from app.domain import OperationCommand, OperationStatus
-from app.infrastructure.persistence.database import Database
-from app.infrastructure.persistence.operations import (
-    ACTIVE_OPERATION_STATUSES,
-    OperationRecord,
-    OperationRepository,
-)
-from app.infrastructure.telegram.client import create_client
 
 logger = logging.getLogger(__name__)
 OPERATION_COMMANDS = frozenset(command.value for command in OperationCommand)
@@ -71,8 +69,29 @@ class OperationExecutionError(RuntimeError):
     """Operator-safe workflow failure."""
 
 
-ClientFactory = Callable[[Settings], Any]
 OperationExecutor = Callable[["OperationContext"], Awaitable[None]]
+
+
+class OperationStore(Protocol):
+    """Persistence port required by the operation state machine."""
+
+    async def create(self, command: str, parameters: dict[str, Any]) -> OperationRecord: ...
+
+    async def update(self, job_id: int, **values: Any) -> OperationRecord | None: ...
+
+    async def get(self, job_id: int) -> OperationRecord | None: ...
+
+    async def recent(self, limit: int = 20) -> tuple[OperationRecord, ...]: ...
+
+    async def active(self) -> OperationRecord | None: ...
+
+    async def add_log(
+        self, job_id: int, level: str, message: str
+    ) -> OperationLogRecord: ...
+
+    async def logs(self, job_id: int, limit: int = 100) -> tuple[OperationLogRecord, ...]: ...
+
+    async def mark_active_interrupted(self) -> int: ...
 
 
 def operation_action(command: str, status: str, *, enabled: bool = True) -> dict[str, Any]:
@@ -97,13 +116,6 @@ def operation_action(command: str, status: str, *, enabled: bool = True) -> dict
         OperationCommand.DOCTOR: "Run diagnostics",
     }
     return {"kind": "retry", "label": labels[operation_command], "enabled": enabled}
-
-
-def default_executors(manager: OperationManager) -> Mapping[str, OperationExecutor]:
-    """Build the production executors; imported lazily to avoid an import cycle."""
-    from app.application.commands import Commands
-
-    return Commands(manager).executors()
 
 
 @dataclass(slots=True)
@@ -142,20 +154,22 @@ class OperationManager:
     def __init__(
         self,
         settings: Settings,
-        database: Database,
+        repository: OperationStore,
         *,
-        client_factory: ClientFactory = create_client,
-        executors: Mapping[str, OperationExecutor] | None = None,
+        executors: Mapping[str, OperationExecutor],
     ) -> None:
         self.settings = settings
-        self.database = database
-        self.repository = OperationRepository(database)
-        self.client_factory = client_factory
+        self.repository = repository
         self._lock = asyncio.Lock()
         self._runtime: dict[int, _Runtime] = {}
-        self._executors: Mapping[str, OperationExecutor] = (
-            executors if executors is not None else default_executors(self)
-        )
+        self._executors: Mapping[str, OperationExecutor] = dict(executors)
+
+    def configure_executors(self, executors: Mapping[str, OperationExecutor]) -> None:
+        """Attach composition-root executors before the manager starts serving requests."""
+
+        if any(runtime.task and not runtime.task.done() for runtime in self._runtime.values()):
+            raise RuntimeError("Cannot replace operation executors while a job is active")
+        self._executors = dict(executors)
 
     async def startup(self) -> None:
         interrupted = await self.repository.mark_active_interrupted()

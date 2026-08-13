@@ -5,16 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Protocol
 
-from telethon.errors import FloodWaitError, RPCError
-
-from app.application.archive import ArchiveService, ProcessResult
+from app.application.archive import ProcessResult
 from app.domain import ChatInfo, ContentType
-from app.infrastructure.persistence.repository import ArchiveRepository
-from app.infrastructure.telegram.translation import content_types_of
 from app.utils.waiting import wait_or_stop
 
 logger = logging.getLogger(__name__)
@@ -42,6 +39,39 @@ class SyncProgress:
 
 
 SyncProgressCallback = Callable[[SyncProgress], Awaitable[None]]
+ContentClassifier = Callable[[object], frozenset[ContentType]]
+RateLimitDelay = Callable[[Exception], int | None]
+TransientErrorPredicate = Callable[[Exception], bool]
+
+
+def _no_rate_limit(_error: Exception) -> int | None:
+    return None
+
+
+def _network_error(error: Exception) -> bool:
+    return isinstance(error, (ConnectionError, TimeoutError))
+
+
+class MessageProcessor(Protocol):
+    async def process_message(
+        self, raw_message: object, chat: ChatInfo, *, edited: bool = False
+    ) -> ProcessResult: ...
+
+
+class HistoryCheckpointStore(Protocol):
+    async def upsert_chat(self, chat: ChatInfo) -> None: ...
+
+    async def get_checkpoint(self, telegram_chat_id: int) -> int | None: ...
+
+    async def advance_checkpoint(self, telegram_chat_id: int, message_id: int) -> None: ...
+
+    async def get_content_checkpoints(
+        self, telegram_chat_id: int, content_types: Sequence[str]
+    ) -> dict[str, int | None]: ...
+
+    async def advance_content_checkpoints(
+        self, telegram_chat_id: int, content_types: Sequence[str], message_id: int
+    ) -> None: ...
 
 
 def _utc(value: datetime) -> datetime:
@@ -51,14 +81,17 @@ def _utc(value: datetime) -> datetime:
 async def sync_history(
     client: object,
     chats: Mapping[int, ChatInfo],
-    archive: ArchiveService,
-    repository: ArchiveRepository,
+    archive: MessageProcessor,
+    repository: HistoryCheckpointStore,
     *,
     limit: int | None = None,
     since: datetime | None = None,
     until: datetime | None = None,
     concurrency: int = 1,
     content_types: frozenset[ContentType] | None = None,
+    content_classifier: ContentClassifier | None = None,
+    rate_limit_delay: RateLimitDelay = _no_rate_limit,
+    is_transient_error: TransientErrorPredicate = _network_error,
     stop_event: asyncio.Event | None = None,
     progress: SyncProgressCallback | None = None,
 ) -> SyncResult:
@@ -73,6 +106,8 @@ async def sync_history(
     bounded_range = since is not None or until is not None
     worker_count = max(1, int(concurrency))
     explicit_content_types = tuple(sorted(content_types)) if content_types is not None else ()
+    if content_types is not None and content_classifier is None:
+        raise ValueError("A content classifier is required for filtered synchronization")
     total_messages = 0
     total_downloads = 0
     completed_chats = 0
@@ -180,7 +215,7 @@ async def sync_history(
                             finished = True
                             break
                         if content_types is not None:
-                            matching_types = content_types_of(raw_message) & content_types
+                            matching_types = content_classifier(raw_message) & content_types
                             if not matching_types:
                                 continue
                             if not any(
@@ -211,56 +246,61 @@ async def sync_history(
                     else:
                         finished = True
                     transient_failures = 0
-                except FloodWaitError as exc:
-                    wait_seconds = max(1, int(exc.seconds))
-                    logger.warning("Telegram FloodWait: waiting %s seconds", wait_seconds)
-                    if progress:
-                        await progress(
-                            SyncProgress(
-                                phase="rate-limited",
-                                chat_id=chat.telegram_chat_id,
-                                chat_title=chat.title,
-                                chat_index=chat_index,
-                                chats_total=chats_total,
-                                chats_completed=completed_chats,
-                                chat_messages=processed,
-                                messages_processed=total_messages,
-                                downloads_completed=total_downloads,
-                                detail=f"Telegram requested a {wait_seconds}s FloodWait",
+                except Exception as exc:
+                    wait_seconds = rate_limit_delay(exc)
+                    if wait_seconds is not None:
+                        logger.warning("Telegram FloodWait: waiting %s seconds", wait_seconds)
+                        if progress:
+                            await progress(
+                                SyncProgress(
+                                    phase="rate-limited",
+                                    chat_id=chat.telegram_chat_id,
+                                    chat_title=chat.title,
+                                    chat_index=chat_index,
+                                    chats_total=chats_total,
+                                    chats_completed=completed_chats,
+                                    chat_messages=processed,
+                                    messages_processed=total_messages,
+                                    downloads_completed=total_downloads,
+                                    detail=(
+                                        f"Telegram requested a {wait_seconds}s FloodWait"
+                                    ),
+                                )
                             )
+                        if await wait_or_stop(stop_event, wait_seconds):
+                            break
+                    elif is_transient_error(exc):
+                        transient_failures += 1
+                        if transient_failures > 5:
+                            raise RuntimeError(
+                                f"History sync for {chat.title} failed after retries: {exc}"
+                            ) from exc
+                        delay = min(30, 2 ** (transient_failures - 1))
+                        logger.warning(
+                            "[%s] Telegram history request failed; retrying in %ss: %s",
+                            chat.title,
+                            delay,
+                            exc,
                         )
-                    if await wait_or_stop(stop_event, wait_seconds):
-                        break
-                except (RPCError, ConnectionError, TimeoutError) as exc:
-                    transient_failures += 1
-                    if transient_failures > 5:
-                        raise RuntimeError(
-                            f"History sync for {chat.title} failed after retries: {exc}"
-                        ) from exc
-                    delay = min(30, 2 ** (transient_failures - 1))
-                    logger.warning(
-                        "[%s] Telegram history request failed; retrying in %ss: %s",
-                        chat.title,
-                        delay,
-                        exc,
-                    )
-                    if progress:
-                        await progress(
-                            SyncProgress(
-                                phase="reconnecting",
-                                chat_id=chat.telegram_chat_id,
-                                chat_title=chat.title,
-                                chat_index=chat_index,
-                                chats_total=chats_total,
-                                chats_completed=completed_chats,
-                                chat_messages=processed,
-                                messages_processed=total_messages,
-                                downloads_completed=total_downloads,
-                                detail=f"Telegram connection retry in {delay}s",
+                        if progress:
+                            await progress(
+                                SyncProgress(
+                                    phase="reconnecting",
+                                    chat_id=chat.telegram_chat_id,
+                                    chat_title=chat.title,
+                                    chat_index=chat_index,
+                                    chats_total=chats_total,
+                                    chats_completed=completed_chats,
+                                    chat_messages=processed,
+                                    messages_processed=total_messages,
+                                    downloads_completed=total_downloads,
+                                    detail=f"Telegram connection retry in {delay}s",
+                                )
                             )
-                        )
-                    if await wait_or_stop(stop_event, delay):
-                        break
+                        if await wait_or_stop(stop_event, delay):
+                            break
+                    else:
+                        raise
 
             # A safe stop stops accepting messages but lets the small bounded
             # in-flight set finish so completed files can be atomically renamed.

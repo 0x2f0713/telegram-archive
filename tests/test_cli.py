@@ -48,7 +48,11 @@ def test_sync_command_passes_effective_concurrency(monkeypatch, tmp_path: Path) 
     monkeypatch.setattr(cli, "_archive_stack", fake_stack)
     monkeypatch.setattr(cli, "create_client", lambda settings: FakeClient())
     monkeypatch.setattr(cli, "connect_authorized", lambda client: _completed())
-    monkeypatch.setattr(cli, "ChatSelectionService", FakeSelection)
+    monkeypatch.setattr(
+        cli,
+        "_chat_selection_service",
+        lambda settings, repository: FakeSelection(settings, repository),
+    )
     monkeypatch.setattr(cli, "sync_history", fake_sync)
 
     cli.sync_command(chat=None, limit=None, since=None, until=None, content_types=None)

@@ -138,7 +138,7 @@ async def test_load_runtime_settings_ignores_only_invalid_rows(
     )
 
     with caplog.at_level("WARNING"):
-        resolution = await load_runtime_settings(settings, database)
+        resolution = await load_runtime_settings(settings, RuntimeSettingsRepository(database))
 
     assert resolution.settings.download_concurrency == settings.download_concurrency
     assert resolution.settings.download_retries == 5

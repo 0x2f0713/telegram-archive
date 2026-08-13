@@ -6,24 +6,16 @@ import asyncio
 import logging
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 
 from telethon.errors import FloodWaitError, RPCError
 
+from app.application.archive_records import DownloadResult, MessageSnapshot
 from app.config import Settings
-from app.infrastructure.persistence.repository import ArchiveRepository, MessageSnapshot
+from app.infrastructure.persistence.repository import ArchiveRepository
 
 logger = logging.getLogger(__name__)
 DownloadProgressCallback = Callable[[int, int], None]
-
-
-@dataclass(frozen=True, slots=True)
-class DownloadResult:
-    completed: bool
-    path: Path | None
-    size: int | None
-    error: str | None = None
 
 
 class MediaDownloader:

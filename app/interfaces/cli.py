@@ -13,6 +13,7 @@ import typer
 from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
+from telethon import events
 
 from app.application.archive import ArchiveService
 from app.application.chat_selection import ChatSelectionService
@@ -32,12 +33,18 @@ from app.infrastructure.download import MediaDownloader
 from app.infrastructure.persistence.database import Database
 from app.infrastructure.persistence.repository import ArchiveRepository
 from app.infrastructure.persistence.selection import ChatSelectionRepository
+from app.infrastructure.persistence.settings import RuntimeSettingsRepository
 from app.infrastructure.telegram.client import (
     TelegramAccessError,
+    accessible_dialogs,
     connect_authorized,
     create_client,
+    flood_wait_seconds,
+    is_transient_telegram_error,
     login,
+    resolve_accessible_chats,
 )
+from app.infrastructure.telegram.translation import content_types_of, message_data
 from app.utils.logging import configure_logging, format_bytes
 
 console = Console()
@@ -55,9 +62,23 @@ def _settings() -> Settings:
     return settings
 
 
+def _chat_selection_service(
+    settings: Settings, repository: ArchiveRepository
+) -> ChatSelectionService:
+    return ChatSelectionService(
+        settings.configured_chat_ids,
+        repository,
+        ChatSelectionRepository(repository.database),
+        accessible_dialogs,
+        resolve_accessible_chats,
+    )
+
+
 async def _effective_settings(settings: Settings, database: Database) -> Settings:
     """Return settings with durable web overrides applied, or the originals."""
-    effective = (await load_runtime_settings(settings, database)).settings
+    effective = (
+        await load_runtime_settings(settings, RuntimeSettingsRepository(database))
+    ).settings
     if effective is not settings:
         configure_logging(effective.log_level)
     return effective
@@ -121,6 +142,10 @@ async def _archive_stack(
             effective,
             repository,
             downloader,
+            message_data,
+            content_types_of,
+            flood_wait_seconds,
+            is_transient_telegram_error,
             content_types,
         ),
         effective,
@@ -150,7 +175,7 @@ def chats_command() -> None:
         settings = _settings()
         database = Database(settings.database_url)
         repository = ArchiveRepository(database)
-        selection_service = ChatSelectionService(settings, repository)
+        selection_service = _chat_selection_service(settings, repository)
         client = create_client(settings)
         try:
             await database.initialize()
@@ -208,7 +233,7 @@ def sync_command(
         client = create_client(effective)
         try:
             await connect_authorized(client)
-            all_chats = await ChatSelectionService(effective, repository).resolve_with_client(
+            all_chats = await _chat_selection_service(effective, repository).resolve_with_client(
                 client
             )
             if not all_chats:
@@ -235,6 +260,9 @@ def sync_command(
                 until=until_date,
                 concurrency=effective.download_concurrency,
                 content_types=selected_types,
+                content_classifier=content_types_of,
+                rate_limit_delay=flood_wait_seconds,
+                is_transient_error=is_transient_telegram_error,
             )
             console.print(
                 f"[green]Sync complete:[/green] {result.messages} messages processed, "
@@ -264,13 +292,22 @@ def listen_command(
         client = create_client(effective)
         try:
             await connect_authorized(client)
-            chats = await ChatSelectionService(effective, repository).resolve_with_client(client)
+            chats = await _chat_selection_service(effective, repository).resolve_with_client(client)
             if not chats:
                 raise ConfigurationError(
                     "No chats are selected. Choose chats in the web dashboard or TUI, "
                     "or configure TARGET_CHATS/CONFIG_FILE."
                 )
-            listener = RealtimeListener(client, chats, archive, effective)
+            listener = RealtimeListener(
+                client,
+                chats,
+                archive,
+                effective,
+                event_builders=lambda entities: (
+                    events.NewMessage(chats=entities),
+                    events.MessageEdited(chats=entities),
+                ),
+            )
             # Install update handlers before repair so messages arriving during
             # startup recovery are still accepted.
             listener.install_handlers()
@@ -429,7 +466,7 @@ def retry_failed_command(
         client = create_client(effective)
         try:
             await connect_authorized(client)
-            chats = await ChatSelectionService(effective, repository).resolve_with_client(client)
+            chats = await _chat_selection_service(effective, repository).resolve_with_client(client)
             if not chats:
                 raise ConfigurationError(
                     "No chats are selected. Choose chats in the web dashboard or TUI, "
@@ -492,7 +529,7 @@ def doctor_command() -> None:
                 await connect_authorized(client)
                 checks.append(("Authentication", "PASS", "Telethon session is authorized"))
                 if repository:
-                    service = ChatSelectionService(settings, repository)
+                    service = _chat_selection_service(settings, repository)
                     chats = await service.resolve_with_client(client)
                     policy = await service.selections.policy()
                     if chats:

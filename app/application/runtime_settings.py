@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Protocol
 
 from app.config import Settings, resolve_runtime_overrides
-from app.infrastructure.persistence.database import Database
-from app.infrastructure.persistence.settings import RuntimeSettingsRepository
 
 logger = logging.getLogger(__name__)
 
@@ -21,11 +20,15 @@ class RuntimeSettingsResolution:
     invalid_keys: frozenset[str]
 
 
+class RuntimeSettingsReader(Protocol):
+    async def overrides(self) -> dict[str, str]: ...
+
+
 async def load_runtime_settings(
-    settings: Settings, database: Database
+    settings: Settings, repository: RuntimeSettingsReader
 ) -> RuntimeSettingsResolution:
     """Load durable overrides and ignore malformed rows with a warning."""
-    stored = await RuntimeSettingsRepository(database).overrides()
+    stored = await repository.overrides()
     effective, valid, invalid = resolve_runtime_overrides(settings, stored)
     for key in sorted(invalid):
         logger.warning("Ignoring invalid runtime setting %s", key)

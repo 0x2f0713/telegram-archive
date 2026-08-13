@@ -7,27 +7,24 @@ import csv
 import io
 import ipaddress
 import logging
-import secrets
 from collections.abc import AsyncIterator
 from dataclasses import asdict, replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Literal
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     RedirectResponse,
-    Response,
     StreamingResponse,
 )
-from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 from telethon.errors import RPCError
 
 from app.application.chat_selection import ChatDiscovery, ChatSelectionService
+from app.application.dashboard import DashboardService, MessageQuery
 from app.application.operations import (
     OPERATION_COMMANDS,
     OperationConflictError,
@@ -52,97 +49,19 @@ from app.domain.content import (
     canonical_content_type_list,
     normalize_content_types,
 )
-from app.infrastructure.persistence.read_models import (
-    DashboardRepository,
-    DashboardService,
-    MessageQuery,
-)
+from app.infrastructure.persistence.read_models import DashboardRepository
 from app.infrastructure.persistence.selection import ChatSelectionRepository
 from app.infrastructure.persistence.settings import RuntimeSettingsRepository
 from app.infrastructure.telegram.client import TelegramAccessError
-from app.infrastructure.telegram.session_account import read_session_account_id
-from app.interfaces.web.auth import TelegramQrAuthManager
-from app.interfaces.web.session import TelegramWebSession
+from app.interfaces.web.auth_routes import create_auth_router
+from app.interfaces.web.forms import form_values as _form_values
+from app.interfaces.web.forms import require_csrf as _require_csrf
+from app.interfaces.web.overview_routes import create_overview_router
+from app.interfaces.web.presentation import navigation_context, templates
 from app.interfaces.web.system import inspect_storage
-from app.utils.logging import format_bytes
 
-TEMPLATES_ROOT = Path(__file__).resolve().parent / "templates"
-templates = Jinja2Templates(directory=TEMPLATES_ROOT)
 INLINE_IMAGE_TYPES = frozenset({"image/gif", "image/jpeg", "image/png", "image/webp"})
 logger = logging.getLogger(__name__)
-
-
-def _format_datetime(value: datetime | str | None) -> str:
-    if value is None:
-        return "Never"
-    if isinstance(value, str):
-        try:
-            value = datetime.fromisoformat(value)
-        except ValueError:
-            return value
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    return value.astimezone().strftime("%Y-%m-%d %H:%M")
-
-
-templates.env.filters["bytes"] = lambda value: format_bytes(int(value or 0))
-templates.env.filters["datetime"] = _format_datetime
-
-
-def _day_label(value: datetime) -> str:
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    local = value.astimezone()
-    today = datetime.now().astimezone().date()
-    if local.date() == today:
-        return "Today"
-    if local.date() == today - timedelta(days=1):
-        return "Yesterday"
-    return local.strftime("%A, %d %B %Y")
-
-
-templates.env.filters["day_label"] = _day_label
-
-
-def _navigation_context(request: Request, section: str) -> dict[str, object]:
-    return {
-        "request": request,
-        "section": section,
-        "generated_at": datetime.now(UTC),
-        "csrf_token": request.app.state.csrf_token,
-    }
-
-
-def _safe_next_path(value: str | None) -> str:
-    """Keep post-login redirects on this origin."""
-
-    if not value or not value.startswith("/") or value.startswith("//") or "\\" in value:
-        return "/"
-    return value
-
-
-def _browser_authenticated(request: Request) -> bool:
-    session: TelegramWebSession | None = getattr(request.app.state, "web_session", None)
-    account_id = getattr(request.app.state, "account_user_id", None)
-    return bool(
-        session
-        and session.valid(request.cookies.get(session.cookie_name), account_id)
-    )
-
-
-def _set_browser_cookie(request: Request, response: RedirectResponse, account_id: int) -> None:
-    session: TelegramWebSession | None = getattr(request.app.state, "web_session", None)
-    if session is None:
-        return
-    response.set_cookie(
-        session.cookie_name,
-        session.issue(account_id),
-        max_age=session.max_age,
-        httponly=True,
-        samesite="lax",
-        secure=request.url.scheme == "https",
-        path="/",
-    )
 
 
 def _query_values(query: MessageQuery, *, include_page: bool = True) -> dict[str, str | int]:
@@ -206,17 +125,6 @@ def _message_query(
     ).normalized()
 
 
-def _chart_points(values: tuple[int, ...], width: int = 1000, height: int = 220) -> str:
-    if not values:
-        return ""
-    highest = max(values) or 1
-    last_index = max(1, len(values) - 1)
-    return " ".join(
-        f"{round(index / last_index * width, 2)},{round(height - value / highest * height, 2)}"
-        for index, value in enumerate(values)
-    )
-
-
 def _safe_csv_value(value: object | None) -> str:
     if isinstance(value, int | float):
         return str(value)
@@ -260,7 +168,7 @@ async def _system_context(
 ) -> dict[str, object]:
     """Shared context for the System page, based on effective settings."""
     resolution = await load_runtime_settings(
-        request.app.state.base_settings, request.app.state.database
+        request.app.state.base_settings, request.app.state.runtime_settings
     )
     effective: Settings = resolution.settings
     repository: DashboardRepository = request.app.state.dashboard
@@ -272,7 +180,7 @@ async def _system_context(
     selected_ids = await selection_repository.effective_known_ids(effective.configured_chat_ids)
     storage = await asyncio.to_thread(inspect_storage, effective, completed_paths)
     form_settings = merge_runtime_form_values(effective, submitted or {})
-    context = _navigation_context(request, "system")
+    context = navigation_context(request, "system")
     context.update(
         {
             "form_settings": form_settings,
@@ -318,33 +226,6 @@ def _focus_operation_action(
     return operation
 
 
-async def _form_values(
-    request: Request, *, max_bytes: int = 2048, max_fields: int = 100
-) -> dict[str, list[str]]:
-    """Read a bounded URL-encoded form without adding multipart dependencies."""
-
-    content_type = request.headers.get("content-type", "").split(";", 1)[0]
-    if content_type != "application/x-www-form-urlencoded":
-        raise HTTPException(status_code=415, detail="Expected a form submission")
-    body = await request.body()
-    if len(body) > max_bytes:
-        raise HTTPException(status_code=413, detail="Form submission is too large")
-    try:
-        return parse_qs(
-            body.decode("utf-8"),
-            keep_blank_values=True,
-            max_num_fields=max_fields,
-        )
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="Invalid form submission") from exc
-
-
-def _require_csrf(request: Request, values: dict[str, list[str]]) -> None:
-    submitted = values.get("csrf_token", [""])[0]
-    if not secrets.compare_digest(submitted, request.app.state.csrf_token):
-        raise HTTPException(status_code=403, detail="Invalid CSRF token")
-
-
 def _chat_discovery_error(exc: Exception) -> str:
     if isinstance(exc, (ConfigurationError, TelegramAccessError)):
         return str(exc)
@@ -360,66 +241,8 @@ def _chat_discovery_error(exc: Exception) -> str:
 
 def create_router(settings: Settings) -> APIRouter:
     router = APIRouter()
-
-    @router.get("/", response_class=HTMLResponse)
-    async def dashboard_page(
-        request: Request,
-        days: Literal[14, 30, 90] = 30,
-    ) -> HTMLResponse:
-        service: DashboardService = request.app.state.dashboard_service
-        overview = await service.overview(days)
-        activity_values = tuple(point.count for point in overview.activity)
-        status_lookup = dict(overview.status_counts)
-        configured = len(overview.configured_chat_ids)
-        known_configured = sum(
-            chat.telegram_chat_id in overview.configured_chat_ids for chat in overview.chats
-        )
-        if not configured:
-            next_action = (
-                "Choose archive targets",
-                "Open the Chats page or use discovery with environment defaults.",
-                "/chats",
-                "Choose chats",
-            )
-        elif not overview.stats.total_messages:
-            next_action = (
-                "Run the first archive pass",
-                "Fetch existing history before starting the live listener.",
-                "/operations",
-                "Open operations",
-            )
-        elif overview.stats.failed_downloads:
-            next_action = (
-                "Repair failed media",
-                "Retry the files that could not complete during an earlier pass.",
-                "/operations",
-                "Open operations",
-            )
-        else:
-            next_action = (
-                "Keep the archive live",
-                "Start the listener to store new messages and edits as they arrive.",
-                "/operations",
-                "Open operations",
-            )
-        context = _navigation_context(request, "overview")
-        context.update(
-            {
-                "overview": overview,
-                "days": days,
-                "activity_points": _chart_points(activity_values),
-                "activity_total": sum(activity_values),
-                "activity_peak": max(activity_values, default=0),
-                "configured_coverage": round(known_configured / configured * 100)
-                if configured
-                else 0,
-                "pending_count": status_lookup.get("pending", 0)
-                + status_lookup.get("downloading", 0),
-                "media_total": sum(count for _, count in overview.media_counts),
-                "next_action": next_action,
-            }
-        )
-        return templates.TemplateResponse(request, "dashboard.html", context)
+    router.include_router(create_overview_router())
+    router.include_router(create_auth_router())
 
     @router.get("/messages", response_class=HTMLResponse)
     async def messages_page(
@@ -450,7 +273,7 @@ def create_router(settings: Settings) -> APIRouter:
         )
         messages = await repository.messages(query)
         chats = await repository.chat_summaries()
-        context = _navigation_context(request, "messages")
+        context = navigation_context(request, "messages")
         context.update(
             {
                 "messages": messages,
@@ -476,7 +299,7 @@ def create_router(settings: Settings) -> APIRouter:
             if message.grouped_id is not None
             else ()
         )
-        context = _navigation_context(request, "messages")
+        context = navigation_context(request, "messages")
         context.update(
             {
                 "message": message,
@@ -512,7 +335,7 @@ def create_router(settings: Settings) -> APIRouter:
             effective_ids = set(
                 await selection_repository.effective_known_ids(settings.configured_chat_ids)
             )
-        context = _navigation_context(request, "chats")
+        context = navigation_context(request, "chats")
         context.update(
             {
                 "chats": chats,
@@ -548,7 +371,7 @@ def create_router(settings: Settings) -> APIRouter:
         reply_targets = (
             await repository.resolve_reply_targets(telegram_chat_id, reply_ids) if reply_ids else {}
         )
-        context = _navigation_context(request, "chats")
+        context = navigation_context(request, "chats")
         context.update(
             {
                 "chat": chat,
@@ -673,7 +496,7 @@ def create_router(settings: Settings) -> APIRouter:
         if focus:
             focus = _focus_operation_action(focus, active)
         logs = await manager.logs(int(focus["id"])) if focus else ()
-        context = _navigation_context(request, "operations")
+        context = navigation_context(request, "operations")
         context.update(
             {
                 "active_operation": active,
@@ -825,103 +648,6 @@ def create_router(settings: Settings) -> APIRouter:
             f"/operations?job={operation['id']}&started=true",
             status_code=303,
         )
-
-    @router.get("/auth/telegram", response_class=HTMLResponse)
-    async def telegram_auth_page(request: Request) -> HTMLResponse:
-        manager: TelegramQrAuthManager = request.app.state.telegram_auth
-        account_id = getattr(request.app.state, "account_user_id", None)
-        use_existing_session = getattr(manager, "use_existing_session", None)
-        snapshot = (
-            use_existing_session(account_id)
-            if account_id is not None and callable(use_existing_session)
-            else await manager.inspect_session()
-        )
-        next_path = _safe_next_path(request.query_params.get("next"))
-        context = _navigation_context(request, "account")
-        context.update(
-            {
-                "auth": snapshot,
-                "auth_status": snapshot.status.value,
-                "browser_authenticated": _browser_authenticated(request),
-                "next_path": next_path,
-                "auth_error": request.query_params.get("error"),
-            }
-        )
-        return templates.TemplateResponse(request, "telegram_auth.html", context)
-
-    @router.post("/auth/telegram/start", response_class=HTMLResponse)
-    async def start_telegram_auth(request: Request) -> RedirectResponse:
-        values = await _form_values(request)
-        _require_csrf(request, values)
-        manager: TelegramQrAuthManager = request.app.state.telegram_auth
-        await manager.start()
-        next_path = _safe_next_path(values.get("next", [""])[0])
-        return RedirectResponse(
-            f"/auth/telegram?{urlencode({'next': next_path})}",
-            status_code=303,
-        )
-
-    @router.post("/auth/telegram/continue", response_class=HTMLResponse)
-    async def continue_telegram_auth(request: Request) -> RedirectResponse:
-        values = await _form_values(request)
-        _require_csrf(request, values)
-        manager: TelegramQrAuthManager = request.app.state.telegram_auth
-        account_id = getattr(request.app.state, "account_user_id", None)
-        use_existing_session = getattr(manager, "use_existing_session", None)
-        if account_id is not None and callable(use_existing_session):
-            snapshot = use_existing_session(account_id)
-        else:
-            snapshot = await manager.inspect_session()
-            account_id = await asyncio.to_thread(
-                read_session_account_id,
-                request.app.state.settings.tg_session_name,
-            )
-        if snapshot.status.value != "connected" or account_id is None:
-            return RedirectResponse(
-                f"/auth/telegram?{urlencode({'error': 'Telegram account is not connected yet'})}",
-                status_code=303,
-            )
-        request.app.state.account_user_id = account_id
-        next_path = _safe_next_path(values.get("next", [""])[0])
-        response = RedirectResponse(next_path, status_code=303)
-        _set_browser_cookie(request, response, account_id)
-        return response
-
-    @router.post("/auth/telegram/logout", response_class=HTMLResponse)
-    async def logout_telegram_auth(request: Request) -> RedirectResponse:
-        values = await _form_values(request)
-        _require_csrf(request, values)
-        response = RedirectResponse("/auth/telegram", status_code=303)
-        session: TelegramWebSession | None = getattr(request.app.state, "web_session", None)
-        if session is not None:
-            response.delete_cookie(session.cookie_name, path="/")
-        return response
-
-    @router.get("/auth/telegram/qr.svg", include_in_schema=False)
-    async def telegram_qr_image(request: Request) -> Response:
-        manager: TelegramQrAuthManager = request.app.state.telegram_auth
-        image = await manager.qr_svg()
-        if image is None:
-            raise HTTPException(status_code=404, detail="No active QR authorization")
-        return Response(
-            image,
-            media_type="image/svg+xml",
-            headers={"Content-Disposition": 'inline; filename="telegram-login.svg"'},
-        )
-
-    @router.get("/api/v1/auth/telegram")
-    async def telegram_auth_status(request: Request) -> dict[str, str | None]:
-        manager: TelegramQrAuthManager = request.app.state.telegram_auth
-        account_id = getattr(request.app.state, "account_user_id", None)
-        use_existing_session = getattr(manager, "use_existing_session", None)
-        if account_id is not None and callable(use_existing_session):
-            use_existing_session(account_id)
-        return manager.snapshot.public_dict()
-
-    @router.get("/login", include_in_schema=False)
-    @router.get("/register", include_in_schema=False)
-    async def telegram_auth_alias() -> RedirectResponse:
-        return RedirectResponse("/auth/telegram", status_code=307)
 
     @router.get("/media/{message_id}")
     async def media_file(request: Request, message_id: int) -> FileResponse:
@@ -1100,7 +826,7 @@ def create_router(settings: Settings) -> APIRouter:
 
     @router.get("/{unknown_path:path}", response_class=HTMLResponse, include_in_schema=False)
     async def not_found(request: Request, unknown_path: str) -> HTMLResponse:
-        context = _navigation_context(request, "")
+        context = navigation_context(request, "")
         context["unknown_path"] = unknown_path
         return templates.TemplateResponse(
             request,

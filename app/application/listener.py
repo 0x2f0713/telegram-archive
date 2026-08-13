@@ -9,8 +9,6 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from telethon import events
-
 from app.application.archive import ArchiveService
 from app.config import Settings
 from app.domain import ChatInfo
@@ -29,6 +27,7 @@ class ListenerProgress:
 
 
 ListenerProgressCallback = Callable[[ListenerProgress], Awaitable[None]]
+EventBuilderFactory = Callable[[list[object]], tuple[object, object]]
 
 
 class RealtimeListener:
@@ -39,6 +38,7 @@ class RealtimeListener:
         archive: ArchiveService,
         settings: Settings,
         *,
+        event_builders: EventBuilderFactory | None = None,
         progress: ListenerProgressCallback | None = None,
         manage_signals: bool = True,
         stop_event: asyncio.Event | None = None,
@@ -47,6 +47,7 @@ class RealtimeListener:
         self.chats = chats
         self.archive = archive
         self.settings = settings
+        self.event_builders = event_builders
         self.progress = progress
         self.manage_signals = manage_signals
         self.stop_event = stop_event or asyncio.Event()
@@ -117,9 +118,12 @@ class RealtimeListener:
             return
         if self.manage_signals:
             self._install_signal_handlers()
+        if self.event_builders is None:
+            raise RuntimeError("Telegram event builders were not configured")
         entities = [chat.entity for chat in self.chats.values()]
-        self.client.add_event_handler(self._new_message, events.NewMessage(chats=entities))
-        self.client.add_event_handler(self._edited_message, events.MessageEdited(chats=entities))
+        new_message, edited_message = self.event_builders(entities)
+        self.client.add_event_handler(self._new_message, new_message)
+        self.client.add_event_handler(self._edited_message, edited_message)
         self._handlers_installed = True
 
     async def run(self) -> None:

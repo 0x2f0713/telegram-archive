@@ -7,12 +7,25 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError, RPCError
 
 from app.config import Settings
 from app.domain import ChatInfo
 from app.infrastructure.telegram.translation import chat_info
 
 logger = logging.getLogger(__name__)
+
+
+def flood_wait_seconds(error: Exception) -> int | None:
+    """Translate Telethon's rate-limit exception into an adapter-neutral delay."""
+
+    return max(1, int(error.seconds)) if isinstance(error, FloodWaitError) else None
+
+
+def is_transient_telegram_error(error: Exception) -> bool:
+    """Return whether a Telegram call is safe to retry after a short delay."""
+
+    return isinstance(error, (RPCError, ConnectionError, TimeoutError))
 
 
 class TelegramAccessError(RuntimeError):

@@ -2,9 +2,10 @@ import asyncio
 from types import SimpleNamespace
 
 from app.application.archive import ArchiveService, ProcessResult
+from app.application.archive_records import RetryCandidate
 from app.application.listener import RealtimeListener
 from app.config import Settings
-from app.infrastructure.persistence.repository import RetryCandidate
+from app.infrastructure.telegram.translation import content_types_of, message_data
 from tests.helpers import make_chat
 
 
@@ -91,6 +92,10 @@ async def test_retry_does_not_fetch_unselected_media_types() -> None:
         Settings(_env_file=None),
         repository,  # type: ignore[arg-type]
         SimpleNamespace(),  # type: ignore[arg-type]
+        message_data,
+        content_types_of,
+        lambda _error: None,
+        lambda _error: False,
         frozenset({"voice"}),
     )
     client = RecordingClient()
