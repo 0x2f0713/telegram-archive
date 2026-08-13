@@ -104,12 +104,12 @@ class OperationCommands:
         self,
         content_types: frozenset[ContentType] | None = None,
         download_progress: Callable[[str, int, int], None] | None = None,
-    ) -> tuple[Database, ArchiveRepository, ArchiveService]:
-        database = Database(self.settings.database_url)
-        repository = ArchiveRepository(database)
+    ) -> tuple[ArchiveRepository, ArchiveService]:
+        """Compose workers against the web process's single SQLite engine."""
+
+        repository = ArchiveRepository(self.database)
         downloader = MediaDownloader(self.settings, repository)
         return (
-            database,
             repository,
             ArchiveService(
                 self.settings,
@@ -132,8 +132,31 @@ class OperationCommands:
         last_report: dict[str, float] = {}
         states: dict[str, tuple[int, float, float]] = {}
         tasks: dict[str, dict[str, Any]] = {}
+        pending_update: dict[str, Any] | None = None
+        pending_force = False
+        reporter_task: asyncio.Task[None] | None = None
+
+        async def publish() -> None:
+            nonlocal pending_force, pending_update
+            while pending_update is not None:
+                update = pending_update
+                force = pending_force
+                pending_update = None
+                pending_force = False
+                await context.progress(force=force, **update)
+
+        def publish_done(completed: asyncio.Task[None]) -> None:
+            if completed.cancelled():
+                return
+            if error := completed.exception():
+                logger.error(
+                    "Could not publish download progress: %s",
+                    error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
 
         def report(filename: str, current: int, total: int) -> None:
+            nonlocal pending_force, pending_update, reporter_task
             now = monotonic()
             previous_report = last_report.get(filename, 0.0)
             if current < total and now - previous_report < 0.2:
@@ -165,24 +188,25 @@ class OperationCommands:
                 if tasks[oldest]["status"] == "downloading":
                     break
                 tasks.pop(oldest)
-            snapshot = list(tasks.values())
-            task = asyncio.create_task(
-                context.progress(
-                    force=current >= total,
-                    phase="downloading",
-                    detail=(
-                        f"Downloading {filename} ({percent or 0:.1f}%, "
-                        f"{format_bytes(round(speed))}/s)"
-                    ),
-                    download_filename=filename,
-                    download_current=current,
-                    download_total=total,
-                    download_percent=percent,
-                    download_speed=round(speed),
-                    download_tasks=snapshot,
+            pending_update = {
+                "phase": "downloading",
+                "detail": (
+                    f"Downloading {filename} ({percent or 0:.1f}%, {format_bytes(round(speed))}/s)"
+                ),
+                "download_filename": filename,
+                "download_current": current,
+                "download_total": total,
+                "download_percent": percent,
+                "download_speed": round(speed),
+                "download_tasks": list(tasks.values()),
+            }
+            pending_force = pending_force or current >= total
+            if reporter_task is None or reporter_task.done():
+                reporter_task = asyncio.create_task(
+                    publish(),
+                    name="operation-download-progress",
                 )
-            )
-            task.add_done_callback(lambda completed: completed.exception())
+                reporter_task.add_done_callback(publish_done)
 
         return report
 
@@ -214,12 +238,9 @@ class OperationCommands:
 
     async def sync(self, context: OperationContext) -> None:
         content_types = self._content_types(context.parameters)
-        database, repository, archive = self._archive_stack(
-            content_types, self._download_reporter(context)
-        )
+        repository, archive = self._archive_stack(content_types, self._download_reporter(context))
         client = self.client_factory(self.settings)
         try:
-            await database.initialize()
             await context.progress(
                 force=True,
                 phase="connecting",
@@ -326,16 +347,12 @@ class OperationCommands:
             )
         finally:
             await client.disconnect()
-            await database.close()
 
     async def retry_failed(self, context: OperationContext) -> None:
         content_types = self._content_types(context.parameters)
-        database, repository, archive = self._archive_stack(
-            content_types, self._download_reporter(context)
-        )
+        repository, archive = self._archive_stack(content_types, self._download_reporter(context))
         client = self.client_factory(self.settings)
         try:
-            await database.initialize()
             await context.progress(
                 force=True,
                 phase="connecting",
@@ -374,16 +391,12 @@ class OperationCommands:
             )
         finally:
             await client.disconnect()
-            await database.close()
 
     async def listen(self, context: OperationContext) -> None:
         content_types = self._content_types(context.parameters)
-        database, repository, archive = self._archive_stack(
-            content_types, self._download_reporter(context)
-        )
+        repository, archive = self._archive_stack(content_types, self._download_reporter(context))
         client = self.client_factory(self.settings)
         try:
-            await database.initialize()
             await context.progress(
                 force=True,
                 phase="connecting",
@@ -463,7 +476,6 @@ class OperationCommands:
             await listener.run()
         finally:
             await client.disconnect()
-            await database.close()
 
     async def doctor(self, context: OperationContext) -> None:
         checks_total = 4
@@ -514,9 +526,8 @@ class OperationCommands:
             return
 
         client = self.client_factory(self.settings)
-        database, repository, _archive = self._archive_stack()
+        repository, _archive = self._archive_stack()
         try:
-            await database.initialize()
             await connect_authorized(client)
             chats = await self._chat_selection_service(repository).resolve_with_client(
                 client
@@ -534,7 +545,6 @@ class OperationCommands:
             await context.log(f"FAIL · Telegram: {type(exc).__name__}: {exc}", "ERROR")
         finally:
             await client.disconnect()
-            await database.close()
         await context.progress(
             force=True,
             progress_current=4,

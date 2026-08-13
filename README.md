@@ -318,6 +318,7 @@ For bind-mounted files or embedding into another service, see [INTEGRATION.md](I
 - **Chat ID cannot be resolved:** run `python -m app chats`; confirm the account is still a member and copy the exact ID. The archiver will not request an inaccessible entity.
 - **A chat shows as deleted:** Telegram no longer returns a usable name for that dialog. Its Telegram ID is retained so existing archive records remain identifiable, but inaccessible content is never requested.
 - **Database is locked:** ensure only a small number of archiver processes use the same SQLite file. WAL and a 30-second busy timeout are enabled, but SQLite is not a multi-host database.
+- **QueuePool limit reached:** this indicates an old process or multiple archiver services are competing for SQLite connections. Stop duplicate host/CLI workers, rebuild and restart the service so it uses the single shared connection queue, then resume the checkpointed operation.
 - **A `.part` file remains:** the previous attempt did not complete. The next sync/retry removes the stale partial before starting a fresh transfer; it never treats it as archived media.
 - **Completed database row but missing file:** `sync` detects it during the repair pass and downloads it again when Telegram still exposes the message.
 - **FloodWait message:** leave the application running. It sleeps for Telegram's required duration. Do not run many parallel instances against the same account.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -154,6 +155,162 @@ async def test_download_reporter_tracks_each_task_with_speed(tmp_path: Path) -> 
     assert all("speed" in task and "percent" in task for task in tasks)
     assert "/s)" in str(updates[-1]["detail"])
     assert " B/s" not in str(updates[-1]["detail"])
+
+
+async def test_download_reporter_coalesces_callback_bursts(tmp_path: Path) -> None:
+    del tmp_path
+    updates: list[dict[str, object]] = []
+    first_update = asyncio.Event()
+    release = asyncio.Event()
+
+    class Context:
+        async def progress(self, **values: object) -> None:
+            updates.append(values)
+            if len(updates) == 1:
+                first_update.set()
+                await release.wait()
+
+    reporter = OperationCommands._download_reporter(Context())  # type: ignore[arg-type]
+    reporter("one.bin", 256, 1024)
+    await first_update.wait()
+    reporter("two.bin", 2048, 2048)
+    reporter("three.bin", 768, 1024)
+    reporter("four.bin", 512, 1024)
+    release.set()
+    for _ in range(20):
+        if len(updates) == 2:
+            break
+        await asyncio.sleep(0)
+
+    assert len(updates) == 2
+    assert updates[-1]["download_filename"] == "four.bin"
+    assert updates[-1]["force"] is True
+    tasks = updates[-1]["download_tasks"]
+    assert isinstance(tasks, list)
+    assert {task["filename"] for task in tasks} == {
+        "one.bin",
+        "two.bin",
+        "three.bin",
+        "four.bin",
+    }
+
+
+async def test_web_worker_archive_stack_reuses_application_database(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize()
+    manager = OperationManager(
+        settings,
+        OperationRepository(database),
+        executors={},
+    )
+    commands = OperationCommands(manager, database)
+
+    repository, archive = commands._archive_stack()
+
+    assert repository.database is database
+    assert archive.repository is repository
+    assert archive.downloader.repository is repository
+    await database.close()
+
+
+async def test_concurrent_progress_updates_are_coalesced_and_serialized(
+    tmp_path: Path,
+) -> None:
+    class TrackingOperationRepository(OperationRepository):
+        def __init__(self, database: Database) -> None:
+            super().__init__(database)
+            self.active_updates = 0
+            self.max_active_updates = 0
+            self.update_calls = 0
+
+        async def update(self, job_id: int, **values: Any):  # type: ignore[no-untyped-def]
+            self.active_updates += 1
+            self.max_active_updates = max(self.max_active_updates, self.active_updates)
+            self.update_calls += 1
+            try:
+                await asyncio.sleep(0.005)
+                return await super().update(job_id, **values)
+            finally:
+                self.active_updates -= 1
+
+    settings = _settings(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize()
+    repository = TrackingOperationRepository(database)
+    release = asyncio.Event()
+
+    async def fake_sync(context: OperationContext) -> None:
+        await context.progress(force=True, phase="syncing", detail="Ready")
+        await release.wait()
+
+    manager = OperationManager(settings, repository, executors={"sync": fake_sync})
+    await manager.startup()
+    started = await manager.start_job("sync")
+    job_id = int(started["id"])
+    await _wait_for_phase(manager, job_id, "syncing")
+    repository.update_calls = 0
+    repository.max_active_updates = 0
+
+    await asyncio.gather(
+        *(manager._progress(job_id, detail=f"Burst {index}") for index in range(40))
+    )
+
+    assert repository.update_calls == 0
+    assert (await manager.get(job_id))["detail"] == "Burst 39"
+
+    await asyncio.gather(
+        *(
+            manager._progress(job_id, force=True, detail=f"Forced {index}")
+            for index in range(20)
+        )
+    )
+    await manager._progress(job_id, force=True, detail="Final progress")
+    durable = await repository.get(job_id)
+
+    assert repository.max_active_updates == 1
+    assert durable is not None
+    assert durable.detail == "Final progress"
+
+    release.set()
+    await _wait_for_status(manager, job_id, {"completed"})
+    await manager._progress(
+        job_id,
+        force=True,
+        phase="downloading",
+        detail="Late download callback",
+    )
+    completed = await manager.get(job_id)
+
+    assert completed["status"] == "completed"
+    assert completed["phase"] == "completed"
+    assert completed["detail"] == "Final progress"
+    await manager.shutdown()
+    await database.close()
+
+
+async def test_queue_pool_timeout_has_actionable_operation_detail(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize()
+    queue_timeout = type("TimeoutError", (Exception,), {})
+
+    async def failing_sync(_context: OperationContext) -> None:
+        raise queue_timeout("QueuePool limit reached")
+
+    manager = OperationManager(
+        settings,
+        OperationRepository(database),
+        executors={"sync": failing_sync},
+    )
+    await manager.startup()
+    started = await manager.start_job("sync")
+    failed = await _wait_for_status(manager, int(started["id"]), {"failed"})
+
+    assert failed["detail"].startswith("SQLite connection queue timed out")
+    assert "Ensure only one archiver service" in failed["detail"]
+    await manager.shutdown()
+    await database.close()
 
 
 def test_operation_action_matrix() -> None:

@@ -128,6 +128,7 @@ class _Runtime:
     overlay: dict[str, Any] = field(default_factory=dict)
     task: asyncio.Task[None] | None = None
     last_flush: float = 0.0
+    progress_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,12 +420,18 @@ class OperationManager:
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"[:4000]
             logger.error("Web operation %s failed: %s", job_id, error)
+            detail = "Operation failed; review the log and retry after correcting the cause"
+            if type(exc).__name__ == "TimeoutError" and "QueuePool limit" in str(exc):
+                detail = (
+                    "SQLite connection queue timed out. Ensure only one archiver service "
+                    "uses this database, restart it, then resume the operation."
+                )
             await self._progress(
                 job_id,
                 force=True,
                 status=OperationStatus.FAILED.value,
                 phase=OperationStatus.FAILED.value,
-                detail="Operation failed; review the log and retry after correcting the cause",
+                detail=detail,
                 error=error,
                 finished_at=datetime.now(UTC),
             )
@@ -453,6 +460,21 @@ class OperationManager:
         runtime = self._runtime.get(job_id)
         if runtime is None:
             return
+        async with runtime.progress_lock:
+            await self._progress_locked(runtime, force=force, **values)
+
+    async def _progress_locked(
+        self,
+        runtime: _Runtime,
+        *,
+        force: bool = False,
+        **values: Any,
+    ) -> None:
+        if (
+            runtime.overlay.get("status") not in ACTIVE_OPERATION_STATUSES
+            and "status" not in values
+        ):
+            return
         previous_phase = runtime.overlay.get("phase")
         runtime.overlay.update(
             {
@@ -470,16 +492,17 @@ class OperationManager:
                 for key, value in runtime.overlay.items()
                 if key in PERSISTED_PROGRESS_FIELDS
             }
-            await self.repository.update(job_id, **persistent)
+            await self.repository.update(runtime.job_id, **persistent)
             runtime.last_flush = now
 
     async def _increment(self, job_id: int, **values: int) -> None:
         runtime = self._runtime.get(job_id)
         if runtime is None:
             return
-        updates = {
-            key: int(runtime.overlay.get(key, 0) or 0) + increment
-            for key, increment in values.items()
-            if key in PERSISTED_PROGRESS_FIELDS
-        }
-        await self._progress(job_id, **updates)
+        async with runtime.progress_lock:
+            updates = {
+                key: int(runtime.overlay.get(key, 0) or 0) + increment
+                for key, increment in values.items()
+                if key in PERSISTED_PROGRESS_FIELDS
+            }
+            await self._progress_locked(runtime, **updates)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from sqlalchemy import event, text
@@ -14,6 +15,8 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.infrastructure.persistence.models import Base
+
+logger = logging.getLogger(__name__)
 
 
 def async_database_url(url: str) -> str:
@@ -43,6 +46,7 @@ class Database:
         )
         event.listen(self.engine.sync_engine, "connect", self._configure_sqlite)
         self.sessions = async_sessionmaker(self.engine, class_=AsyncSession, expire_on_commit=False)
+        logger.debug("SQLite connection queue configured: pool size 1, no overflow, 60s wait")
 
     def _ensure_sqlite_directory(self) -> None:
         parsed = make_url(self.url)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import secrets
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -42,6 +43,7 @@ from app.interfaces.web.session import TelegramWebSession
 from app.utils.logging import configure_logging
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
+logger = logging.getLogger(__name__)
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -163,6 +165,7 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
         resolution = await load_runtime_settings(settings, runtime_settings)
         overridden = resolution.settings
         configure_logging(overridden.log_level)
+        logger.info("SQLite connection queue active: %s", database.engine.sync_engine.pool.status())
         app.state.base_settings = settings
         app.state.settings = overridden
         app.state.database = database

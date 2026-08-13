@@ -104,3 +104,12 @@ async def test_concurrent_archive_writes_share_the_sqlite_connection(database: D
     )
 
     assert (await repository.stats()).total_messages == 40
+
+
+async def test_sqlite_pool_is_a_single_connection_queue(database: Database) -> None:
+    pool = database.engine.sync_engine.pool
+
+    assert pool.size() == 1
+    assert pool.timeout() == 60
+    assert pool._max_overflow == 0  # type: ignore[attr-defined]
+    assert pool.checkedout() == 0
