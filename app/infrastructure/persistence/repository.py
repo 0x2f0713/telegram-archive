@@ -47,7 +47,7 @@ class ArchiveRepository:
         if not chats:
             return
         chat_by_id = {chat.telegram_chat_id: chat for chat in chats}
-        async with self.database.sessions() as session, session.begin():
+        async with self.database.transaction() as session:
             records: dict[int, Chat] = {}
             chat_ids = tuple(chat_by_id)
             # Stay below conservative SQLite variable limits for accounts with
@@ -85,7 +85,7 @@ class ArchiveRepository:
             )
 
     async def advance_checkpoint(self, telegram_chat_id: int, message_id: int) -> None:
-        async with self.database.sessions() as session, session.begin():
+        async with self.database.transaction() as session:
             await session.execute(
                 update(Chat)
                 .where(Chat.telegram_chat_id == telegram_chat_id)
@@ -157,11 +157,11 @@ class ArchiveRepository:
                 "updated_at": now,
             },
         )
-        async with self.database.sessions() as session, session.begin():
+        async with self.database.transaction() as session:
             await session.execute(statement)
 
     async def upsert_message(self, data: MessageData) -> tuple[MessageSnapshot, bool]:
-        async with self.database.sessions() as session, session.begin():
+        async with self.database.transaction() as session:
             result = await session.execute(
                 select(Message).where(
                     Message.telegram_chat_id == data.telegram_chat_id,
@@ -219,7 +219,7 @@ class ArchiveRepository:
             return _snapshot(record) if record else None
 
     async def mark_download_start(self, message_id: int, media_path: Path) -> None:
-        async with self.database.sessions() as session, session.begin():
+        async with self.database.transaction() as session:
             await session.execute(
                 update(Message)
                 .where(Message.id == message_id)
@@ -235,7 +235,7 @@ class ArchiveRepository:
     async def mark_download_completed(
         self, message_id: int, media_path: Path, media_size: int
     ) -> None:
-        async with self.database.sessions() as session, session.begin():
+        async with self.database.transaction() as session:
             await session.execute(
                 update(Message)
                 .where(Message.id == message_id)
@@ -249,7 +249,7 @@ class ArchiveRepository:
             )
 
     async def mark_download_skipped(self, message_id: int, reason: str) -> None:
-        async with self.database.sessions() as session, session.begin():
+        async with self.database.transaction() as session:
             await session.execute(
                 update(Message)
                 .where(Message.id == message_id)
@@ -261,7 +261,7 @@ class ArchiveRepository:
             )
 
     async def mark_download_failed(self, message_id: int, error: str) -> None:
-        async with self.database.sessions() as session, session.begin():
+        async with self.database.transaction() as session:
             await session.execute(
                 update(Message)
                 .where(Message.id == message_id)

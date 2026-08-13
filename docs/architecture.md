@@ -31,7 +31,7 @@ The domain contains stable archive concepts and state rules. The application lay
 
 ## SQLite concurrency
 
-The service uses one SQLite file. Its async engine therefore exposes one pooled connection with no overflow. Short repository transactions queue on that connection, preventing concurrent archive, operation-progress, and dashboard work from exhausting a multi-connection pool or creating competing SQLite writers. Network requests and media downloads must remain outside database transaction scopes.
+The service uses one SQLite file. Its async engine exposes a bounded three-connection pool with no overflow. Every write enters one application-level gate before checking out a connection, so SQLite's single writer never consumes the whole pool; remaining connections preserve web read responsiveness under archive concurrency. Progress events are coalesced, WAL permits concurrent reads, and network requests and media downloads remain outside transactions.
 
 ## Adding a feature
 

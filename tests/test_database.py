@@ -1,5 +1,8 @@
 import asyncio
+import logging
 from pathlib import Path
+from time import monotonic
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -106,10 +109,62 @@ async def test_concurrent_archive_writes_share_the_sqlite_connection(database: D
     assert (await repository.stats()).total_messages == 40
 
 
-async def test_sqlite_pool_is_a_single_connection_queue(database: Database) -> None:
+async def test_sqlite_pool_is_bounded_for_workers_and_web(database: Database) -> None:
     pool = database.engine.sync_engine.pool
 
-    assert pool.size() == 1
+    assert pool.size() == 3
     assert pool.timeout() == 60
     assert pool._max_overflow == 0  # type: ignore[attr-defined]
     assert pool.checkedout() == 0
+
+
+async def test_slow_sqlite_checkout_logs_holder_and_pool_state(
+    database: Database,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    token = object()
+    record = SimpleNamespace(
+        info={
+            "checkout_token": token,
+            "checkout_started": monotonic() - 12,
+            "checkout_task": "web-operation-8-sync",
+        }
+    )
+
+    with caplog.at_level(logging.WARNING):
+        database._warn_slow_checkout(record, token)
+
+    assert "checked out for 12." in caplog.text
+    assert "web-operation-8-sync" in caplog.text
+    assert "Pool size: 3" in caplog.text
+
+
+async def test_write_gate_queues_writers_before_connection_checkout(database: Database) -> None:
+    repository = ArchiveRepository(database)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_writer() -> None:
+        async with database.transaction() as session:
+            await session.execute(Message.__table__.select().limit(1))
+            entered.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold_writer())
+    await entered.wait()
+    queued_writer = asyncio.create_task(
+        repository.upsert_message(make_message(telegram_message_id=500))
+    )
+    try:
+        await asyncio.sleep(0.02)
+
+        assert not queued_writer.done()
+        assert database.engine.sync_engine.pool.checkedout() == 1
+        assert (await repository.stats()).total_messages == 0
+        assert database.engine.sync_engine.pool.checkedout() == 1
+    finally:
+        release.set()
+        await holder
+        await queued_writer
+
+    assert (await repository.stats()).total_messages == 1

@@ -72,7 +72,7 @@ class OperationRepository:
         self.max_logs_per_job = max_logs_per_job
 
     async def create(self, command: str, parameters: dict[str, Any]) -> OperationRecord:
-        async with self.database.sessions() as session, session.begin():
+        async with self.database.transaction() as session:
             model = OperationJob(
                 command=command,
                 status="queued",
@@ -89,7 +89,7 @@ class OperationRepository:
         if not values:
             return await self.get(job_id)
         values["updated_at"] = utc_now()
-        async with self.database.sessions() as session, session.begin():
+        async with self.database.transaction() as session:
             await session.execute(
                 update(OperationJob).where(OperationJob.id == job_id).values(**values)
             )
@@ -120,7 +120,7 @@ class OperationRepository:
     async def add_log(self, job_id: int, level: str, message: str) -> OperationLogRecord:
         normalized_level = level.upper()[:16]
         normalized_message = message.strip()[:4000] or "Operation update"
-        async with self.database.sessions() as session, session.begin():
+        async with self.database.transaction() as session:
             model = OperationLog(
                 job_id=job_id,
                 level=normalized_level,
@@ -153,7 +153,7 @@ class OperationRepository:
         """Close jobs orphaned by a previous web-process exit."""
 
         now = utc_now()
-        async with self.database.sessions() as session, session.begin():
+        async with self.database.transaction() as session:
             ids = tuple(
                 await session.scalars(
                     select(OperationJob.id).where(

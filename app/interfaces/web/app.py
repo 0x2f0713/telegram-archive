@@ -147,9 +147,7 @@ def _session_secret(settings: Settings) -> str:
 
 
 def _configured_session_secret(settings: Settings) -> str:
-    return (
-        settings.web_session_secret.get_secret_value() if settings.web_session_secret else ""
-    )
+    return settings.web_session_secret.get_secret_value() if settings.web_session_secret else ""
 
 
 def create_web_app(settings: Settings | None = None) -> FastAPI:
@@ -165,7 +163,7 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
         resolution = await load_runtime_settings(settings, runtime_settings)
         overridden = resolution.settings
         configure_logging(overridden.log_level)
-        logger.info("SQLite connection queue active: %s", database.engine.sync_engine.pool.status())
+        logger.info("SQLite connection pool active: %s", database.engine.sync_engine.pool.status())
         app.state.base_settings = settings
         app.state.settings = overridden
         app.state.database = database

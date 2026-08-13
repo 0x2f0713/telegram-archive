@@ -55,7 +55,7 @@ class ChatSelectionRepository:
 
     async def set_specific(self, chat_ids: Iterable[int]) -> ChatSelection:
         selected = tuple(sorted(set(int(chat_id) for chat_id in chat_ids)))
-        async with self.database.sessions() as session, session.begin():
+        async with self.database.transaction() as session:
             await session.execute(delete(SelectedChat))
             policy = await session.get(ArchiveSelectionPolicy, 1)
             if policy is None:
@@ -67,7 +67,7 @@ class ChatSelectionRepository:
         return ChatSelection(SelectionMode.SPECIFIC, selected)
 
     async def set_all(self) -> ChatSelection:
-        async with self.database.sessions() as session, session.begin():
+        async with self.database.transaction() as session:
             await session.execute(delete(SelectedChat))
             policy = await session.get(ArchiveSelectionPolicy, 1)
             if policy is None:
@@ -78,7 +78,7 @@ class ChatSelectionRepository:
         return ChatSelection(SelectionMode.ALL)
 
     async def use_environment(self) -> ChatSelection:
-        async with self.database.sessions() as session, session.begin():
+        async with self.database.transaction() as session:
             await session.execute(delete(SelectedChat))
             await session.execute(
                 delete(ArchiveSelectionPolicy).where(ArchiveSelectionPolicy.id == 1)
