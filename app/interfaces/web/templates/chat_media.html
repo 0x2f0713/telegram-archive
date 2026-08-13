@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}Media · {{ chat.title }} | Telegram Archiver{% endblock %}
+{% block content %}
+<nav class="breadcrumb" aria-label="Breadcrumb"><a href="/archive/chats">Archived chats</a><span aria-hidden="true">/</span><a href="/chats/{{ chat.telegram_chat_id }}">{{ chat.title }}</a><span aria-hidden="true">/</span><span>Media</span></nav>
+<header class="page-heading conversation-heading media-gallery-heading">
+  <div>
+    <p class="eyebrow">{{ chat.type|capitalize }} archive · {{ chat.telegram_chat_id }}</p>
+    <h1>{{ chat.title }}</h1>
+    <p>Browse the photos and videos archived from this chat.</p>
+  </div>
+  <div class="heading-actions">
+    <span class="result-count">{{ media.total }} {{ kind if kind != 'all' else 'media items' }}</span>
+    <a class="button secondary" href="/messages?chat={{ chat.telegram_chat_id }}&media_only=true">Open explorer view</a>
+  </div>
+</header>
+
+<nav class="chat-view-tabs" aria-label="{{ chat.title }} views">
+  <a href="/chats/{{ chat.telegram_chat_id }}">Messages</a>
+  <a href="/chats/{{ chat.telegram_chat_id }}/media" aria-current="page">Media</a>
+</nav>
+
+<div class="media-gallery-toolbar">
+  <nav class="media-kind-tabs" aria-label="Filter media">
+    <a href="/chats/{{ chat.telegram_chat_id }}/media" {% if kind == 'all' %}aria-current="page"{% endif %}>All</a>
+    <a href="/chats/{{ chat.telegram_chat_id }}/media?kind=photos" {% if kind == 'photos' %}aria-current="page"{% endif %}>Photos</a>
+    <a href="/chats/{{ chat.telegram_chat_id }}/media?kind=videos" {% if kind == 'videos' %}aria-current="page"{% endif %}>Videos</a>
+  </nav>
+  {% if media.total %}<span>Newest first · page {{ media.page }} of {{ media.pages }}</span>{% endif %}
+</div>
+
+{% if media.items %}
+<div class="media-gallery" data-media-gallery>
+  {% set active_month = namespace(value='') %}
+  {% for item in media.items %}
+    {% set month = item.message_date|month_label %}
+    {% set item_kind = preview_kind(item.mime_type) %}
+    {% if month != active_month.value %}
+      {% if not loop.first %}</div></section>{% endif %}
+      {% set active_month.value = month %}
+      <section class="media-month" aria-labelledby="media-month-{{ loop.index }}">
+        <header><h2 id="media-month-{{ loop.index }}">{{ month }}</h2></header>
+        <div class="media-grid">
+    {% endif %}
+      <a class="media-grid-item media-grid-{{ item_kind }}" href="/messages/{{ item.id }}" data-gallery-item data-media-kind="{{ item_kind }}" data-media-src="/media/{{ item.id }}" data-detail-url="/messages/{{ item.id }}" data-download-url="/media/{{ item.id }}" data-caption="{{ (item.text or item.filename or ('Telegram message #' ~ item.telegram_message_id))|truncate(160, True) }}" data-meta="{{ item.sender_name or 'Unknown sender' }} · {{ item.message_date|datetime }}" aria-label="Open {{ 'video' if item_kind == 'video' else 'photo' }} from {{ item.message_date|datetime }}">
+        {% if item_kind == 'image' %}
+          <img src="/media/{{ item.id }}" alt="Photo from {{ item.sender_name or 'unknown sender' }}" loading="lazy" decoding="async">
+        {% else %}
+          <video data-gallery-thumbnail data-src="/media/{{ item.id }}" muted playsinline preload="none" aria-hidden="true"></video>
+          <span class="media-grid-play" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false"><path d="M8.5 5.7v12.6L18.6 12 8.5 5.7Z"/></svg>
+          </span>
+        {% endif %}
+        <span class="media-grid-meta"><time datetime="{{ item.message_date.isoformat() }}">{{ item.message_date|datetime }}</time>{% if item_kind == 'video' %}<span>Video</span>{% endif %}</span>
+      </a>
+    {% if loop.last %}</div></section>{% endif %}
+  {% endfor %}
+</div>
+
+{% if media.pages > 1 %}
+<nav class="pagination media-pagination" aria-label="Media pages">
+  <div>{% if previous_url %}<a class="button secondary" href="{{ previous_url }}">Newer media</a>{% endif %}</div>
+  <span>Page {{ media.page }} of {{ media.pages }}</span>
+  <div>{% if next_url %}<a class="button secondary" href="{{ next_url }}">Older media</a>{% endif %}</div>
+</nav>
+{% endif %}
+{% else %}
+<div class="empty-state media-gallery-empty">
+  <span class="empty-mark" aria-hidden="true"></span>
+  <strong>No {{ kind if kind != 'all' else 'visual media' }} archived for this chat.</strong>
+  <p>{% if kind != 'all' %}Try another media filter.{% else %}Photos and videos appear here after they have downloaded successfully.{% endif %}</p>
+  {% if kind != 'all' %}<a class="button secondary" href="/chats/{{ chat.telegram_chat_id }}/media">Show all media</a>{% else %}<a class="button secondary" href="/chats/{{ chat.telegram_chat_id }}">Back to messages</a>{% endif %}
+</div>
+{% endif %}
+
+<dialog class="media-viewer" data-media-viewer aria-labelledby="media-viewer-title">
+  <div class="media-viewer-shell">
+    <header class="media-viewer-header">
+      <div>
+        <span data-media-viewer-counter></span>
+        <h2 id="media-viewer-title" data-media-viewer-title>Media preview</h2>
+        <p data-media-viewer-meta></p>
+      </div>
+      <button type="button" class="media-viewer-close" data-media-viewer-close aria-label="Close media viewer">
+        <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="m6.8 5.4 5.2 5.2 5.2-5.2 1.4 1.4-5.2 5.2 5.2 5.2-1.4 1.4-5.2-5.2-5.2 5.2-1.4-1.4 5.2-5.2-5.2-5.2 1.4-1.4Z"/></svg>
+      </button>
+    </header>
+    <div class="media-viewer-stage">
+      <button type="button" class="media-viewer-nav media-viewer-previous" data-media-viewer-previous aria-label="Previous media">
+        <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="m14.7 5.3-6.7 6.7 6.7 6.7 1.4-1.4-5.3-5.3 5.3-5.3-1.4-1.4Z"/></svg>
+      </button>
+      <div class="media-viewer-content" data-media-viewer-content></div>
+      <button type="button" class="media-viewer-nav media-viewer-next" data-media-viewer-next aria-label="Next media">
+        <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="m9.3 18.7 6.7-6.7-6.7-6.7-1.4 1.4 5.3 5.3-5.3 5.3 1.4 1.4Z"/></svg>
+      </button>
+    </div>
+    <footer class="media-viewer-footer">
+      <a class="text-action" data-media-viewer-detail href="#">Open message</a>
+      <a class="button secondary" data-media-viewer-download href="#" download>Download original</a>
+    </footer>
+  </div>
+</dialog>
+{% endblock %}

@@ -39,6 +39,12 @@ def _day_label(value: datetime) -> str:
     return local.strftime("%A, %d %B %Y")
 
 
+def _month_label(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone().strftime("%B %Y")
+
+
 def navigation_context(request: Request, section: str) -> dict[str, object]:
     return {
         "request": request,
@@ -51,3 +57,4 @@ def navigation_context(request: Request, section: str) -> dict[str, object]:
 templates.env.filters["bytes"] = lambda value: format_bytes(int(value or 0))
 templates.env.filters["datetime"] = _format_datetime
 templates.env.filters["day_label"] = _day_label
+templates.env.filters["month_label"] = _month_label

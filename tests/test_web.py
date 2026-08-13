@@ -257,6 +257,77 @@ async def test_conversation_video_bubble_reserves_preview_width(tmp_path: Path) 
     assert '<video class="bubble-media"' in response.text
 
 
+async def test_chat_media_gallery_is_scoped_filterable_and_linked_from_messages(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize()
+    archive = ArchiveRepository(database)
+    chat = make_chat(title="Gallery <Room>")
+    other_chat = make_chat(telegram_chat_id=-1001234567891, title="Other Room")
+    await archive.upsert_chats((chat, other_chat))
+
+    async def complete_media(
+        message_id: int,
+        mime_type: str,
+        filename: str,
+        *,
+        chat_id: int = chat.telegram_chat_id,
+    ) -> int:
+        record, _ = await archive.upsert_message(
+            make_message(
+                telegram_chat_id=chat_id,
+                telegram_message_id=message_id,
+                text="caption <script>alert(1)</script>",
+                media_type="video" if mime_type.startswith("video/") else "photo",
+                mime_type=mime_type,
+                original_filename=filename,
+                extension=Path(filename).suffix,
+            )
+        )
+        media_path = settings.download_dir / str(chat_id) / filename
+        media_path.parent.mkdir(parents=True, exist_ok=True)
+        media_path.write_bytes(b"archived media")
+        await archive.mark_download_completed(record.id, media_path, media_path.stat().st_size)
+        return record.id
+
+    photo_id = await complete_media(51, "image/jpeg", "photo.jpg")
+    video_id = await complete_media(52, "video/mp4", "video.mp4")
+    other_id = await complete_media(
+        53,
+        "image/png",
+        "other.png",
+        chat_id=other_chat.telegram_chat_id,
+    )
+    await database.close()
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            conversation = await client.get(f"/chats/{chat.telegram_chat_id}")
+            gallery = await client.get(f"/chats/{chat.telegram_chat_id}/media")
+            videos = await client.get(
+                f"/chats/{chat.telegram_chat_id}/media",
+                params={"kind": "videos"},
+            )
+
+    assert conversation.status_code == 200
+    assert f'href="/chats/{chat.telegram_chat_id}/media"' in conversation.text
+    assert gallery.status_code == 200
+    assert "Gallery &lt;Room&gt;" in gallery.text
+    assert f'data-media-src="/media/{photo_id}"' in gallery.text
+    assert f'data-media-src="/media/{video_id}"' in gallery.text
+    assert f"/media/{other_id}" not in gallery.text
+    assert "<script>alert(1)</script>" not in gallery.text
+    assert 'data-media-kind="image"' in gallery.text
+    assert 'data-media-kind="video"' in gallery.text
+    assert videos.status_code == 200
+    assert f'data-media-src="/media/{video_id}"' in videos.text
+    assert f'data-media-src="/media/{photo_id}"' not in videos.text
+
+
 async def test_conversation_thread_404_for_unknown_chat(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     application = create_web_app(settings)

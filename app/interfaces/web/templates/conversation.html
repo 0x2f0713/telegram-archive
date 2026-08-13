@@ -13,6 +13,11 @@
   </div>
 </header>
 
+<nav class="chat-view-tabs" aria-label="{{ chat.title }} views">
+  <a href="/chats/{{ chat.telegram_chat_id }}" aria-current="page">Messages</a>
+  <a href="/chats/{{ chat.telegram_chat_id }}/media">Media</a>
+</nav>
+
 <section class="conversation-thread" aria-label="Conversation with {{ chat.title }}">
   {% if has_older %}
   <div class="thread-history-control">

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from app.application.dashboard import DashboardService, MessageQuery
+from app.application.dashboard import ChatMediaQuery, DashboardService, MessageQuery
 from app.infrastructure.persistence.database import Database
 from app.infrastructure.persistence.read_models import DashboardRepository
 from app.infrastructure.persistence.repository import ArchiveRepository
@@ -106,6 +106,73 @@ async def test_dashboard_message_filters_and_pagination(database: Database, tmp_
     assert latest_only.total == 3
     assert oldest_first.items[0].telegram_message_id == 10
     assert largest_first.items[0].telegram_message_id == 10
+
+
+async def test_chat_media_is_visual_completed_scoped_filtered_and_paginated(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    archive = ArchiveRepository(database)
+    chat_id = -1001234567890
+    other_chat_id = -1001234567891
+    await archive.upsert_chats(
+        (
+            make_chat(telegram_chat_id=chat_id, title="Gallery Room"),
+            make_chat(telegram_chat_id=other_chat_id, title="Other Room"),
+        )
+    )
+    base = datetime.now(UTC)
+
+    async def complete_media(
+        message_id: int,
+        mime_type: str,
+        filename: str,
+        *,
+        target_chat_id: int = chat_id,
+    ) -> int:
+        record, _ = await archive.upsert_message(
+            make_message(
+                telegram_chat_id=target_chat_id,
+                telegram_message_id=message_id,
+                message_date=base + timedelta(minutes=message_id),
+                mime_type=mime_type,
+                original_filename=filename,
+                extension=Path(filename).suffix,
+            )
+        )
+        media_path = tmp_path / str(target_chat_id) / filename
+        media_path.parent.mkdir(parents=True, exist_ok=True)
+        media_path.write_bytes(b"media")
+        await archive.mark_download_completed(record.id, media_path, media_path.stat().st_size)
+        return record.id
+
+    photo_id = await complete_media(21, "image/jpeg", "photo.jpg")
+    video_id = await complete_media(22, "video/mp4", "video.mp4")
+    await complete_media(23, "application/pdf", "document.pdf")
+    await complete_media(24, "image/png", "other.png", target_chat_id=other_chat_id)
+    failed, _ = await archive.upsert_message(
+        make_message(
+            telegram_message_id=25,
+            message_date=base + timedelta(minutes=25),
+            mime_type="image/webp",
+            original_filename="failed.webp",
+            extension=".webp",
+        )
+    )
+    await archive.mark_download_failed(failed.id, "network error")
+    dashboard = DashboardRepository(database)
+
+    all_media = await dashboard.chat_media(ChatMediaQuery(chat_id=chat_id))
+    photos = await dashboard.chat_media(ChatMediaQuery(chat_id=chat_id, kind="photos"))
+    videos = await dashboard.chat_media(ChatMediaQuery(chat_id=chat_id, kind="videos"))
+    last_page = await dashboard.chat_media(ChatMediaQuery(chat_id=chat_id, page=99, page_size=1))
+
+    assert [message.id for message in all_media.items] == [video_id, photo_id]
+    assert [message.id for message in photos.items] == [photo_id]
+    assert [message.id for message in videos.items] == [video_id]
+    assert last_page.page == 2
+    assert last_page.pages == 2
+    assert [message.id for message in last_page.items] == [photo_id]
 
 
 async def test_archived_chat_summaries_are_searchable_paginated_and_pin_active_chat(

@@ -13,6 +13,14 @@ from typing import Protocol
 
 from app.application.archive_records import ArchiveStats
 
+GALLERY_IMAGE_MIME_TYPES = (
+    "image/avif",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ChatSummary:
@@ -94,6 +102,23 @@ class MessageQuery:
 
 
 @dataclass(frozen=True, slots=True)
+class ChatMediaQuery:
+    chat_id: int
+    kind: str = "all"
+    page: int = 1
+    page_size: int = 72
+
+    def normalized(self) -> ChatMediaQuery:
+        kind = self.kind.strip().casefold()
+        return ChatMediaQuery(
+            chat_id=self.chat_id,
+            kind=kind if kind in {"all", "photos", "videos"} else "all",
+            page=max(1, self.page),
+            page_size=min(100, max(1, self.page_size)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class MessagePage:
     items: tuple[MessageView, ...]
     total: int
@@ -139,6 +164,8 @@ class DashboardReader(Protocol):
     ) -> ArchivedChatPage: ...
 
     async def messages(self, query: MessageQuery | None = None) -> MessagePage: ...
+
+    async def chat_media(self, query: ChatMediaQuery) -> MessagePage: ...
 
     async def attention_messages(self, limit: int = 12) -> tuple[MessageView, ...]: ...
 

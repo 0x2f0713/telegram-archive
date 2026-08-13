@@ -13,6 +13,7 @@ import {
 import { setupChatSelection } from "./chat-selection.js";
 import { setupOperationForms, setupOperationMonitor } from "./operations.js";
 import { setupVideoPlayers } from "./media-player.js";
+import { setupMediaGallery } from "./media-gallery.js";
 
 function initialize() {
   setupThemes();
@@ -26,6 +27,7 @@ function initialize() {
   setupOperationMonitor();
   setupOperationForms();
   setupVideoPlayers();
+  setupMediaGallery();
 }
 
 if (document.readyState === "loading") {

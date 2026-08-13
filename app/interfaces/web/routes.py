@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 from dataclasses import asdict, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -24,7 +25,12 @@ from pydantic import ValidationError
 from telethon.errors import RPCError
 
 from app.application.chat_selection import ChatDiscovery, ChatSelectionService
-from app.application.dashboard import DashboardService, MessageQuery
+from app.application.dashboard import (
+    GALLERY_IMAGE_MIME_TYPES,
+    ChatMediaQuery,
+    DashboardService,
+    MessageQuery,
+)
 from app.application.operations import (
     OPERATION_COMMANDS,
     OperationConflictError,
@@ -60,7 +66,7 @@ from app.interfaces.web.overview_routes import create_overview_router
 from app.interfaces.web.presentation import navigation_context, templates
 from app.interfaces.web.system import inspect_storage
 
-INLINE_IMAGE_TYPES = frozenset({"image/gif", "image/jpeg", "image/png", "image/webp"})
+INLINE_IMAGE_TYPES = frozenset(GALLERY_IMAGE_MIME_TYPES)
 logger = logging.getLogger(__name__)
 
 
@@ -103,6 +109,16 @@ def _archived_chat_page_url(search: str, page: int) -> str:
     if page > 1:
         values["page"] = page
     return f"/archive/chats?{urlencode(values)}" if values else "/archive/chats"
+
+
+def _chat_media_page_url(chat_id: int, kind: str, page: int) -> str:
+    values: dict[str, str | int] = {}
+    if kind != "all":
+        values["kind"] = kind
+    if page > 1:
+        values["page"] = page
+    base = f"/chats/{chat_id}/media"
+    return f"{base}?{urlencode(values)}" if values else base
 
 
 def _operation_chat_id(operation: dict[str, object] | None) -> int | None:
@@ -439,6 +455,40 @@ def create_router(settings: Settings) -> APIRouter:
             }
         )
         return templates.TemplateResponse(request, "conversation.html", context)
+
+    @router.get("/chats/{telegram_chat_id}/media", response_class=HTMLResponse)
+    async def chat_media_page(
+        request: Request,
+        telegram_chat_id: int,
+        kind: Literal["all", "photos", "videos"] = Query(default="all"),
+        page: int = Query(default=1, ge=1),
+    ) -> HTMLResponse:
+        repository: DashboardRepository = request.app.state.dashboard
+        chat = await repository.chat_summary(telegram_chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        media = await repository.chat_media(
+            ChatMediaQuery(chat_id=telegram_chat_id, kind=kind, page=page)
+        )
+        context = navigation_context(request, "archived-chats")
+        context.update(
+            {
+                "chat": chat,
+                "media": media,
+                "kind": kind,
+                "previous_url": (
+                    _chat_media_page_url(telegram_chat_id, kind, media.page - 1)
+                    if media.page > 1
+                    else None
+                ),
+                "next_url": (
+                    _chat_media_page_url(telegram_chat_id, kind, media.page + 1)
+                    if media.page < media.pages
+                    else None
+                ),
+            }
+        )
+        return templates.TemplateResponse(request, "chat_media.html", context)
 
     @router.post("/chats/selection")
     async def save_chat_selection(request: Request) -> RedirectResponse:

@@ -7,8 +7,10 @@ from datetime import date, datetime, time, timedelta
 from sqlalchemy import String, case, cast, func, or_, select
 
 from app.application.dashboard import (
+    GALLERY_IMAGE_MIME_TYPES,
     ActivityPoint,
     ArchivedChatPage,
+    ChatMediaQuery,
     ChatSummary,
     MessagePage,
     MessageQuery,
@@ -281,6 +283,45 @@ class DashboardRepository:
             items=tuple(MessageView(*row) for row in rows),
             total=total,
             page=query.page,
+            page_size=query.page_size,
+        )
+
+    async def chat_media(self, query: ChatMediaQuery) -> MessagePage:
+        """Return one newest-first page of browser-previewable media for a chat."""
+
+        query = query.normalized()
+        normalized_mime = func.lower(func.coalesce(Message.mime_type, ""))
+        photo_condition = normalized_mime.in_(GALLERY_IMAGE_MIME_TYPES)
+        video_condition = normalized_mime.like("video/%")
+        kind_condition = {
+            "photos": photo_condition,
+            "videos": video_condition,
+        }.get(query.kind, or_(photo_condition, video_condition))
+        conditions = (
+            Message.telegram_chat_id == query.chat_id,
+            Message.download_status == DownloadState.COMPLETED.value,
+            Message.media_path.is_not(None),
+            kind_condition,
+        )
+        count_statement = select(func.count(Message.id)).where(*conditions)
+        async with self.database.sessions() as session:
+            total = int(await session.scalar(count_statement) or 0)
+            pages = max(1, (total + query.page_size - 1) // query.page_size)
+            page = min(query.page, pages)
+            statement = (
+                select(*_message_columns())
+                .select_from(Message)
+                .outerjoin(Chat, Chat.telegram_chat_id == Message.telegram_chat_id)
+                .where(*conditions)
+                .order_by(Message.message_date.desc(), Message.telegram_message_id.desc())
+                .offset((page - 1) * query.page_size)
+                .limit(query.page_size)
+            )
+            rows = (await session.execute(statement)).all()
+        return MessagePage(
+            items=tuple(MessageView(*row) for row in rows),
+            total=total,
+            page=page,
             page_size=query.page_size,
         )
 
