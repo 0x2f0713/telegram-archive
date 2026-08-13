@@ -96,6 +96,24 @@ def _export_url(query: MessageQuery) -> str:
     return f"/exports/messages.csv?{urlencode(_query_values(query, include_page=False))}"
 
 
+def _archived_chat_page_url(search: str, page: int) -> str:
+    values: dict[str, str | int] = {}
+    if search:
+        values["q"] = search
+    if page > 1:
+        values["page"] = page
+    return f"/archive/chats?{urlencode(values)}" if values else "/archive/chats"
+
+
+def _operation_chat_id(operation: dict[str, object] | None) -> int | None:
+    if not operation or operation.get("chat_id") is None:
+        return None
+    try:
+        return int(operation["chat_id"])
+    except (TypeError, ValueError):
+        return None
+
+
 def _message_query(
     *,
     q: str,
@@ -351,6 +369,44 @@ def create_router(settings: Settings) -> APIRouter:
         )
         return templates.TemplateResponse(request, "chats.html", context)
 
+    @router.get("/archive/chats", response_class=HTMLResponse)
+    async def archived_chats_page(
+        request: Request,
+        q: str = Query(default="", max_length=100),
+        page: int = Query(default=1, ge=1),
+    ) -> HTMLResponse:
+        repository: DashboardRepository = request.app.state.dashboard
+        manager: OperationManager = request.app.state.operations
+        search = q.strip()
+        active_operation = await manager.active()
+        active_chat_id = _operation_chat_id(active_operation)
+        archived = await repository.archived_chat_summaries(
+            search,
+            page=page,
+            page_size=50,
+            include_chat_id=active_chat_id,
+        )
+        context = navigation_context(request, "archived-chats")
+        context.update(
+            {
+                "archived": archived,
+                "search": search,
+                "active_chat_id": active_chat_id,
+                "active_operation": active_operation,
+                "previous_url": (
+                    _archived_chat_page_url(search, archived.page - 1)
+                    if archived.page > 1
+                    else None
+                ),
+                "next_url": (
+                    _archived_chat_page_url(search, archived.page + 1)
+                    if archived.page < archived.pages
+                    else None
+                ),
+            }
+        )
+        return templates.TemplateResponse(request, "archived_chats.html", context)
+
     @router.get("/chats/{telegram_chat_id}", response_class=HTMLResponse)
     async def conversation_page(
         request: Request,
@@ -371,7 +427,7 @@ def create_router(settings: Settings) -> APIRouter:
         reply_targets = (
             await repository.resolve_reply_targets(telegram_chat_id, reply_ids) if reply_ids else {}
         )
-        context = navigation_context(request, "chats")
+        context = navigation_context(request, "archived-chats")
         context.update(
             {
                 "chat": chat,
@@ -705,61 +761,6 @@ def create_router(settings: Settings) -> APIRouter:
             }
         except OperationNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @router.get("/api/v1/chats/quick-access")
-    async def api_quick_chats(
-        request: Request,
-        q: str = Query(default="", max_length=100),
-        limit: int = Query(default=20, ge=1, le=50),
-    ) -> dict[str, object]:
-        repository: DashboardRepository = request.app.state.dashboard
-        manager: OperationManager = request.app.state.operations
-        active_operation = await manager.active()
-        active_chat_id: int | None = None
-        if active_operation and active_operation.get("chat_id") is not None:
-            try:
-                active_chat_id = int(active_operation["chat_id"])
-            except (TypeError, ValueError):
-                active_chat_id = None
-        chats = await repository.quick_chat_summaries(q, limit, active_chat_id)
-        ordered = sorted(
-            chats,
-            key=lambda chat: chat.telegram_chat_id != active_chat_id,
-        )
-        return {
-            "items": [
-                {
-                    "telegram_chat_id": chat.telegram_chat_id,
-                    "title": chat.title,
-                    "username": chat.username,
-                    "type": chat.type,
-                    "message_count": chat.message_count,
-                    "media_count": chat.media_count,
-                    "completed_count": chat.completed_count,
-                    "failed_count": chat.failed_count,
-                    "newest_message_date": (
-                        chat.newest_message_date.isoformat()
-                        if chat.newest_message_date
-                        else None
-                    ),
-                    "active": chat.telegram_chat_id == active_chat_id,
-                    "active_command": (
-                        active_operation.get("command")
-                        if chat.telegram_chat_id == active_chat_id and active_operation
-                        else None
-                    ),
-                    "active_phase": (
-                        active_operation.get("phase")
-                        if chat.telegram_chat_id == active_chat_id and active_operation
-                        else None
-                    ),
-                    "href": f"/chats/{chat.telegram_chat_id}",
-                }
-                for chat in ordered[:limit]
-            ],
-            "query": q.strip(),
-            "active_chat_id": active_chat_id,
-        }
 
     @router.get("/api/v1/messages")
     async def api_messages(

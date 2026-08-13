@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ chat.title }} | Telegram Archiver{% endblock %}
 {% block content %}
-<nav class="breadcrumb" aria-label="Breadcrumb"><a href="/chats">Coverage</a><span aria-hidden="true">/</span><span>{{ chat.title }}</span></nav>
+<nav class="breadcrumb" aria-label="Breadcrumb"><a href="/archive/chats">Archived chats</a><span aria-hidden="true">/</span><span>{{ chat.title }}</span></nav>
 <header class="page-heading conversation-heading">
   <div>
     <p class="eyebrow">{{ chat.type|capitalize }} archive · {{ chat.telegram_chat_id }}</p>

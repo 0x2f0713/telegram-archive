@@ -108,7 +108,7 @@ async def test_dashboard_message_filters_and_pagination(database: Database, tmp_
     assert largest_first.items[0].telegram_message_id == 10
 
 
-async def test_quick_chat_summaries_prioritize_recent_archives_and_include_active_empty_chat(
+async def test_archived_chat_summaries_are_searchable_paginated_and_pin_active_chat(
     database: Database,
     tmp_path: Path,
 ) -> None:
@@ -139,19 +139,28 @@ async def test_quick_chat_summaries_prioritize_recent_archives_and_include_activ
     )
     dashboard = DashboardRepository(database)
 
-    archived = await dashboard.quick_chat_summaries()
-    active_search = await dashboard.quick_chat_summaries(
+    archived = await dashboard.archived_chat_summaries()
+    active_search = await dashboard.archived_chat_summaries(
         "active_empty",
         include_chat_id=active_empty_chat_id,
     )
-    active_only = await dashboard.quick_chat_summaries(
-        limit=1,
+    active_only = await dashboard.archived_chat_summaries(
+        page_size=1,
         include_chat_id=active_empty_chat_id,
     )
-    id_search = await dashboard.quick_chat_summaries(str(older_chat_id))
+    second_page = await dashboard.archived_chat_summaries(page=2, page_size=1)
+    last_page = await dashboard.archived_chat_summaries(page=99, page_size=1)
+    id_search = await dashboard.archived_chat_summaries(str(older_chat_id))
 
-    assert [chat.title for chat in archived] == ["Release Room", "Earlier Archive"]
-    assert [chat.title for chat in active_search] == ["Active Empty Room"]
-    assert active_search[0].message_count == 0
-    assert [chat.telegram_chat_id for chat in active_only] == [active_empty_chat_id]
-    assert [chat.telegram_chat_id for chat in id_search] == [older_chat_id]
+    assert [chat.title for chat in archived.items] == ["Release Room", "Earlier Archive"]
+    assert archived.total == 2
+    assert archived.pages == 1
+    assert [chat.title for chat in active_search.items] == ["Active Empty Room"]
+    assert active_search.items[0].message_count == 0
+    assert [chat.telegram_chat_id for chat in active_only.items] == [active_empty_chat_id]
+    assert active_only.total == 3
+    assert active_only.pages == 3
+    assert [chat.title for chat in second_page.items] == ["Earlier Archive"]
+    assert last_page.page == 2
+    assert [chat.title for chat in last_page.items] == ["Earlier Archive"]
+    assert [chat.telegram_chat_id for chat in id_search.items] == [older_chat_id]

@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}Archived chats | Telegram Archiver{% endblock %}
+{% block content %}
+<header class="page-heading archive-directory-heading">
+  <div>
+    <p class="eyebrow">Conversation archive</p>
+    <h1>Archived chats</h1>
+    <p>Open every conversation already stored in SQLite, including the chat currently being archived.</p>
+  </div>
+  <div class="heading-actions">
+    <span class="result-count">{{ "{:,}".format(archived.total) }} chat{{ '' if archived.total == 1 else 's' }}</span>
+    <a class="button secondary" href="/chats">Manage coverage</a>
+  </div>
+</header>
+
+<form class="archive-directory-search" method="get" action="/archive/chats" role="search">
+  <label>
+    <span>Search archived chats</span>
+    <input type="search" name="q" value="{{ search }}" placeholder="Title, username, type, or Telegram ID" autocomplete="off">
+  </label>
+  <button class="button primary" type="submit">Search</button>
+  {% if search %}<a class="button text-button" href="/archive/chats">Clear</a>{% endif %}
+</form>
+
+<section class="archive-directory" aria-labelledby="archive-directory-title">
+  <header class="archive-directory-summary">
+    <div>
+      <h2 id="archive-directory-title">{{ 'Search results' if search else 'All archived chats' }}</h2>
+      <p>{% if search %}{{ "{:,}".format(archived.total) }} result{{ '' if archived.total == 1 else 's' }} for “{{ search }}”.{% else %}Ordered by the latest stored message.{% endif %}</p>
+    </div>
+    {% if archived.total %}<span>Page {{ archived.page }} of {{ archived.pages }}</span>{% endif %}
+  </header>
+
+  {% if archived.items %}
+  <div class="archive-directory-list">
+    {% for chat in archived.items %}
+    {% set is_active = chat.telegram_chat_id == active_chat_id %}
+    <article class="archive-chat-row{{ ' is-active' if is_active else '' }}">
+      <div class="archive-chat-identity">
+        <span class="chat-type">{{ chat.type }}</span>
+        <h3><a href="/chats/{{ chat.telegram_chat_id }}">{{ chat.title }}</a></h3>
+        <small>{{ '@' ~ chat.username if chat.username else 'Telegram ID ' ~ chat.telegram_chat_id }}</small>
+        {% if is_active %}<strong class="archive-live-state"><i aria-hidden="true"></i>Archiving now <small>{{ active_operation.phase|replace('-', ' ') }}</small></strong>{% endif %}
+      </div>
+      <dl class="archive-chat-metrics">
+        <div><dt>Messages</dt><dd>{{ "{:,}".format(chat.message_count) }}</dd></div>
+        <div><dt>Media</dt><dd>{{ "{:,}".format(chat.media_count) }}</dd></div>
+        <div><dt>Files</dt><dd>{{ "{:,}".format(chat.completed_count) }}</dd></div>
+        <div class="{{ 'has-failures' if chat.failed_count else '' }}"><dt>Failed</dt><dd>{{ "{:,}".format(chat.failed_count) }}</dd></div>
+      </dl>
+      <div class="archive-chat-recency">
+        <span>Latest stored message</span>
+        {% if chat.newest_message_date %}<time datetime="{{ chat.newest_message_date.isoformat() }}">{{ chat.newest_message_date|datetime }}</time>{% else %}<strong>Starting archive</strong>{% endif %}
+      </div>
+      <div class="archive-chat-actions">
+        <a class="button secondary" href="/chats/{{ chat.telegram_chat_id }}">Open chat</a>
+        <a href="/messages?chat={{ chat.telegram_chat_id }}">Explorer</a>
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+
+  {% if archived.pages > 1 %}
+  <nav class="pagination" aria-label="Archived chat pages">
+    <div>{% if previous_url %}<a class="button secondary" href="{{ previous_url }}">Previous</a>{% endif %}</div>
+    <span>Page {{ archived.page }} of {{ archived.pages }}</span>
+    <div>{% if next_url %}<a class="button secondary" href="{{ next_url }}">Next</a>{% endif %}</div>
+  </nav>
+  {% endif %}
+  {% elif search %}
+  <div class="empty-state archive-directory-empty">
+    <strong>No archived chats match “{{ search }}”.</strong>
+    <p>Try a title, username, chat type, or Telegram ID.</p>
+    <a class="button secondary" href="/archive/chats">Clear search</a>
+  </div>
+  {% else %}
+  <div class="empty-state archive-directory-empty">
+    <strong>No conversations are archived yet.</strong>
+    <p>Choose Telegram chats, then run a historical sync or start the listener.</p>
+    <div><a class="button primary" href="/operations">Open operations</a><a class="button secondary" href="/chats">Choose chats</a></div>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

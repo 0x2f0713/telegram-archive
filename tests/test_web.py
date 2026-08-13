@@ -67,6 +67,7 @@ async def test_web_pages_api_and_media_delivery(tmp_path: Path) -> None:
         transport = httpx.ASGITransport(app=application)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             dashboard = await client.get("/")
+            archived_chats = await client.get("/archive/chats")
             messages = await client.get("/messages", params={"q": "quarterly"})
             detail = await client.get(f"/messages/{message_id}")
             media = await client.get(f"/media/{message_id}")
@@ -78,8 +79,13 @@ async def test_web_pages_api_and_media_delivery(tmp_path: Path) -> None:
     assert "Archive overview" in dashboard.text
     assert "Recommended next action" in dashboard.text
     assert "Archived chats" in dashboard.text
-    assert 'data-quick-chat-dialog' in dashboard.text
+    assert 'href="/archive/chats"' in dashboard.text
+    assert "data-quick-chat-dialog" not in dashboard.text
     assert dashboard.headers["content-security-policy"].startswith("default-src 'self'")
+    assert archived_chats.status_code == 200
+    assert "All archived chats" in archived_chats.text
+    assert "Release &lt;Room&gt;" in archived_chats.text
+    assert f'href="/chats/{-1001234567890}"' in archived_chats.text
     assert messages.status_code == 200
     assert "Quarterly &lt;script&gt;" in messages.text
     assert "<script>alert(1)</script>" not in messages.text
@@ -92,7 +98,7 @@ async def test_web_pages_api_and_media_delivery(tmp_path: Path) -> None:
     assert api_messages.json()["total"] == 1
 
 
-async def test_quick_chat_api_pins_active_empty_chat_before_recent_archives(
+async def test_archived_chat_page_pins_active_empty_chat_before_recent_archives(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -134,31 +140,18 @@ async def test_quick_chat_api_pins_active_empty_chat_before_recent_archives(
         await asyncio.wait_for(ready.wait(), timeout=1)
         transport = httpx.ASGITransport(app=application)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.get("/api/v1/chats/quick-access")
-            search = await client.get(
-                "/api/v1/chats/quick-access",
-                params={"q": "live_empty"},
-            )
+            response = await client.get("/archive/chats")
+            search = await client.get("/archive/chats", params={"q": "live_empty"})
         release.set()
 
     assert response.status_code == 200
-    assert response.json()["items"][0] == {
-        "telegram_chat_id": active_chat_id,
-        "title": "Live Empty Room",
-        "username": "live_empty",
-        "type": "supergroup",
-        "message_count": 0,
-        "media_count": 0,
-        "completed_count": 0,
-        "failed_count": 0,
-        "newest_message_date": None,
-        "active": True,
-        "active_command": "sync",
-        "active_phase": "syncing",
-        "href": f"/chats/{active_chat_id}",
-    }
-    assert response.json()["items"][1]["title"] == "Release <Room>"
-    assert [item["title"] for item in search.json()["items"]] == ["Live Empty Room"]
+    assert response.text.index("Live Empty Room") < response.text.index("Release &lt;Room&gt;")
+    assert "Archiving now" in response.text
+    assert "syncing" in response.text
+    assert f'href="/chats/{active_chat_id}"' in response.text
+    assert search.status_code == 200
+    assert "Live Empty Room" in search.text
+    assert "Release &lt;Room&gt;" not in search.text
 
 
 def _seed_session_account(tmp_path: Path, account_id: int) -> Path:
@@ -224,6 +217,8 @@ async def test_conversation_thread_renders_bubbles_with_outgoing_alignment(
     assert text.count("bubble-out") == 2
     assert text.count("bubble-in") == 2
     assert "Reply to message #1000" in text
+    assert '<a href="/archive/chats">Archived chats</a>' in text
+    assert 'class="archive-chat-link" href="/archive/chats" aria-current="page"' in text
     assert 'class="thread-divider"' in text
     assert 'style="' not in text
     assert "sender-hue-" in text
@@ -839,9 +834,10 @@ async def test_web_system_settings_saves_applies_and_resets(tmp_path: Path) -> N
             )
             assert reset_one.status_code == 200
             assert 'name="download_concurrency" min="1" max="20" value="2"' in reset_one.text
-            assert "download_concurrency" not in await RuntimeSettingsRepository(
-                application.state.database
-            ).overrides()
+            assert (
+                "download_concurrency"
+                not in await RuntimeSettingsRepository(application.state.database).overrides()
+            )
 
             reset = await client.post(
                 "/system/settings/reset", data={"csrf_token": application.state.csrf_token}

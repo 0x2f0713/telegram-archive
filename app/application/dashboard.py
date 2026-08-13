@@ -29,6 +29,18 @@ class ChatSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class ArchivedChatPage:
+    items: tuple[ChatSummary, ...]
+    total: int
+    page: int
+    page_size: int
+
+    @property
+    def pages(self) -> int:
+        return max(1, (self.total + self.page_size - 1) // self.page_size)
+
+
+@dataclass(frozen=True, slots=True)
 class MessageView:
     id: int
     telegram_chat_id: int
@@ -118,12 +130,13 @@ class ArchiveStatsReader(Protocol):
 class DashboardReader(Protocol):
     async def chat_summaries(self) -> tuple[ChatSummary, ...]: ...
 
-    async def quick_chat_summaries(
+    async def archived_chat_summaries(
         self,
         search: str = "",
-        limit: int = 20,
+        page: int = 1,
+        page_size: int = 50,
         include_chat_id: int | None = None,
-    ) -> tuple[ChatSummary, ...]: ...
+    ) -> ArchivedChatPage: ...
 
     async def messages(self, query: MessageQuery | None = None) -> MessagePage: ...
 

@@ -8,6 +8,7 @@ from sqlalchemy import String, case, cast, func, or_, select
 
 from app.application.dashboard import (
     ActivityPoint,
+    ArchivedChatPage,
     ChatSummary,
     MessagePage,
     MessageQuery,
@@ -105,23 +106,23 @@ class DashboardRepository:
             for row in rows
         )
 
-    async def quick_chat_summaries(
+    async def archived_chat_summaries(
         self,
         search: str = "",
-        limit: int = 20,
+        page: int = 1,
+        page_size: int = 50,
         include_chat_id: int | None = None,
-    ) -> tuple[ChatSummary, ...]:
-        """Return a bounded recent-chat list for global archive navigation."""
+    ) -> ArchivedChatPage:
+        """Return one searchable page of chats with archived messages."""
 
         normalized_search = search.strip()[:100]
-        normalized_limit = min(50, max(1, limit))
+        normalized_page = max(1, page)
+        normalized_page_size = min(100, max(1, page_size))
         aggregate = (
             select(
                 Message.telegram_chat_id.label("chat_id"),
                 func.count(Message.id).label("message_count"),
-                func.sum(case((Message.has_media.is_(True), 1), else_=0)).label(
-                    "media_count"
-                ),
+                func.sum(case((Message.has_media.is_(True), 1), else_=0)).label("media_count"),
                 func.sum(
                     case((Message.download_status == DownloadState.COMPLETED.value, 1), else_=0)
                 ).label("completed_count"),
@@ -155,47 +156,62 @@ class DashboardRepository:
             .outerjoin(aggregate, aggregate.c.chat_id == Chat.telegram_chat_id)
             .where(archive_condition)
         )
+        count_statement = (
+            select(func.count(Chat.id))
+            .outerjoin(aggregate, aggregate.c.chat_id == Chat.telegram_chat_id)
+            .where(archive_condition)
+        )
         if normalized_search:
             pattern = f"%{normalized_search}%"
-            statement = statement.where(
-                or_(
-                    Chat.title.ilike(pattern),
-                    Chat.username.ilike(pattern),
-                    Chat.type.ilike(pattern),
-                    cast(Chat.telegram_chat_id, String).ilike(pattern),
-                )
+            search_condition = or_(
+                Chat.title.ilike(pattern),
+                Chat.username.ilike(pattern),
+                Chat.type.ilike(pattern),
+                cast(Chat.telegram_chat_id, String).ilike(pattern),
             )
+            statement = statement.where(search_condition)
+            count_statement = count_statement.where(search_condition)
         order_by = []
         if include_chat_id is not None:
-            order_by.append(
-                case((Chat.telegram_chat_id == include_chat_id, 0), else_=1)
-            )
-        statement = statement.order_by(
-            *order_by,
-            aggregate.c.newest_message_date.desc(),
-            Chat.title.collate("NOCASE"),
-        ).limit(normalized_limit)
+            order_by.append(case((Chat.telegram_chat_id == include_chat_id, 0), else_=1))
         async with self.database.sessions() as session:
+            total = int(await session.scalar(count_statement) or 0)
+            pages = max(1, (total + normalized_page_size - 1) // normalized_page_size)
+            normalized_page = min(normalized_page, pages)
+            statement = (
+                statement.order_by(
+                    *order_by,
+                    aggregate.c.newest_message_date.desc(),
+                    Chat.title.collate("NOCASE"),
+                )
+                .offset((normalized_page - 1) * normalized_page_size)
+                .limit(normalized_page_size)
+            )
             rows = (await session.execute(statement)).all()
-        return tuple(
-            ChatSummary(
-                row.telegram_chat_id,
-                display_chat_title(
+        return ArchivedChatPage(
+            items=tuple(
+                ChatSummary(
                     row.telegram_chat_id,
-                    row.title,
+                    display_chat_title(
+                        row.telegram_chat_id,
+                        row.title,
+                        row.username,
+                        row.type,
+                    ),
                     row.username,
                     row.type,
-                ),
-                row.username,
-                row.type,
-                row.last_synced_message_id,
-                row[5],
-                row[6],
-                row[7],
-                row[8],
-                row[9],
-            )
-            for row in rows
+                    row.last_synced_message_id,
+                    row[5],
+                    row[6],
+                    row[7],
+                    row[8],
+                    row[9],
+                )
+                for row in rows
+            ),
+            total=total,
+            page=normalized_page,
+            page_size=normalized_page_size,
         )
 
     @staticmethod
