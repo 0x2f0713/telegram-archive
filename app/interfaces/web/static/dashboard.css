@@ -613,14 +613,41 @@ main { width: min(100%, 92rem); margin: 0 auto; padding: clamp(3rem, 6vw, 5.5rem
 .archive-chat-recency time, .archive-chat-recency strong { color: var(--ink-soft); font: 0.68rem monospace; }
 .archive-chat-actions { display: grid; min-width: 7rem; justify-items: stretch; gap: 0.35rem; }
 .archive-chat-actions > a:last-child { display: inline-flex; min-height: 2.75rem; align-items: center; justify-content: center; color: var(--accent); font-size: 0.72rem; font-weight: 650; }
+.archive-chat-actions > a:not(.button) { display: inline-flex; min-height: 2.75rem; align-items: center; justify-content: center; color: var(--accent); font-size: 0.72rem; font-weight: 650; }
+.archive-delete-trigger { min-height: 2.75rem; padding: 0 0.7rem; border: 1px solid transparent; border-radius: var(--radius-sm); background: transparent; font-size: 0.7rem; font-weight: 650; }
+.archive-delete-trigger:hover:not(:disabled) { border-color: var(--danger); }
+.archive-delete-trigger:disabled { cursor: not-allowed; opacity: 0.42; }
+.archive-deletion-feedback { margin-bottom: 1rem; }
+.selection-feedback.warning { border-left: 3px solid var(--warning); background: var(--warning-soft); }
 .archive-directory-empty { margin-top: 1rem; }
 .archive-directory-empty > div { display: flex; flex-wrap: wrap; gap: 0.65rem; }
+
+.archive-delete-dialog { width: min(calc(100% - 2rem), 38rem); max-height: calc(100dvh - 2rem); padding: 0; border: 1px solid var(--line-strong); border-radius: var(--radius-lg); background: var(--surface); color: var(--ink); box-shadow: var(--shadow); overflow: auto; }
+.archive-delete-dialog::backdrop { background: rgba(2, 8, 6, 0.74); backdrop-filter: blur(0.55rem); }
+.archive-delete-dialog[open] { animation: dialog-in var(--motion-base) var(--spring); }
+.archive-delete-dialog form { display: grid; gap: 1.25rem; padding: clamp(1.25rem, 4vw, 2rem); }
+.archive-delete-dialog header .eyebrow { margin-bottom: 0.45rem; color: var(--danger); }
+.archive-delete-dialog h2 { margin: 0; font-size: clamp(1.6rem, 4vw, 2.25rem); letter-spacing: -0.04em; }
+.archive-delete-dialog header > p:last-child { margin: 0.7rem 0 0; color: var(--ink-soft); }
+.archive-delete-target { display: grid; gap: 0.2rem; padding: 1rem; border: 1px solid color-mix(in srgb, var(--danger) 32%, var(--line)); border-radius: var(--radius-sm); background: color-mix(in srgb, var(--danger-soft) 48%, var(--surface-raised)); }
+.archive-delete-target > span { color: var(--ink-faint); font-size: 0.68rem; }
+.archive-delete-target > strong { overflow-wrap: anywhere; font-size: 1rem; }
+.archive-delete-target small { color: var(--ink-soft); font-size: 0.72rem; }
+.archive-delete-dialog ul { display: grid; gap: 0.5rem; margin: 0; padding-left: 1.25rem; color: var(--ink-soft); font-size: 0.8rem; }
+.archive-delete-confirmation { display: grid; gap: 0.5rem; color: var(--ink-soft); font-size: 0.78rem; }
+.archive-delete-confirmation strong { color: var(--danger); font-family: monospace; letter-spacing: 0.06em; }
+.archive-delete-confirmation input { width: 100%; min-height: 3rem; padding: 0 0.85rem; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--bg); color: var(--ink); font-size: 1rem; }
+.archive-delete-confirmation input:focus { border-color: var(--danger); outline: 3px solid color-mix(in srgb, var(--danger) 22%, transparent); outline-offset: 1px; }
+.archive-delete-dialog footer { display: grid; grid-template-columns: 1fr 1fr; gap: 0.65rem; padding-top: 0.3rem; }
+.archive-delete-dialog footer .button { width: 100%; }
+.archive-delete-dialog footer .danger-button:disabled { cursor: not-allowed; opacity: 0.42; transform: none; }
 
 @media (max-width: 75rem) {
   .archive-chat-row { grid-template-columns: minmax(15rem, 1fr) auto; }
   .archive-chat-metrics { grid-column: 1; }
   .archive-chat-recency { grid-column: 2; grid-row: 1; justify-items: end; text-align: right; }
   .archive-chat-actions { grid-column: 2; grid-row: 2; grid-template-columns: auto auto; align-items: center; }
+  .archive-delete-trigger { grid-column: 1 / -1; }
 }
 
 @media (max-width: 47.9375rem) {
@@ -634,6 +661,7 @@ main { width: min(100%, 92rem); margin: 0 auto; padding: clamp(3rem, 6vw, 5.5rem
   .archive-chat-metrics { grid-column: 1; }
   .archive-chat-recency { grid-column: 1; grid-row: auto; justify-items: start; text-align: left; }
   .archive-chat-actions { grid-column: 1; grid-row: auto; width: 100%; grid-template-columns: 1fr 1fr; }
+  .archive-delete-dialog form { gap: 1rem; }
 }
 
 /* Chat-scoped photo and video gallery */

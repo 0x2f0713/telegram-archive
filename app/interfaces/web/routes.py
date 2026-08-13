@@ -24,6 +24,7 @@ from fastapi.responses import (
 from pydantic import ValidationError
 from telethon.errors import RPCError
 
+from app.application.archive_deletion import ChatArchiveDeletionService
 from app.application.chat_selection import ChatDiscovery, ChatSelectionService
 from app.application.dashboard import (
     GALLERY_IMAGE_MIME_TYPES,
@@ -109,6 +110,20 @@ def _archived_chat_page_url(search: str, page: int) -> str:
     if page > 1:
         values["page"] = page
     return f"/archive/chats?{urlencode(values)}" if values else "/archive/chats"
+
+
+def _archived_chat_feedback_url(
+    search: str,
+    page: int,
+    **feedback: str | int,
+) -> str:
+    values: dict[str, str | int] = {}
+    if search:
+        values["q"] = search
+    if page > 1:
+        values["page"] = page
+    values.update(feedback)
+    return f"/archive/chats?{urlencode(values)}"
 
 
 def _chat_media_page_url(chat_id: int, kind: str, page: int) -> str:
@@ -390,6 +405,11 @@ def create_router(settings: Settings) -> APIRouter:
         request: Request,
         q: str = Query(default="", max_length=100),
         page: int = Query(default=1, ge=1),
+        deleted: bool = False,
+        deleted_messages: int = Query(default=0, ge=0),
+        deleted_files: int = Query(default=0, ge=0),
+        cleanup_warnings: int = Query(default=0, ge=0),
+        delete_error: Literal["active", "confirmation", "missing"] | None = None,
     ) -> HTMLResponse:
         repository: DashboardRepository = request.app.state.dashboard
         manager: OperationManager = request.app.state.operations
@@ -409,6 +429,21 @@ def create_router(settings: Settings) -> APIRouter:
                 "search": search,
                 "active_chat_id": active_chat_id,
                 "active_operation": active_operation,
+                "deletion_globally_blocked": bool(
+                    active_operation is not None and active_chat_id is None
+                ),
+                "deletion_success": deleted,
+                "deleted_messages": deleted_messages,
+                "deleted_files": deleted_files,
+                "cleanup_warnings": cleanup_warnings,
+                "deletion_error": {
+                    "active": (
+                        "This chat is currently being archived. Stop or finish that operation "
+                        "before deleting its local archive."
+                    ),
+                    "confirmation": "Type DELETE exactly to confirm archive deletion.",
+                    "missing": "That chat no longer has a local archive to delete.",
+                }.get(delete_error),
                 "previous_url": (
                     _archived_chat_page_url(search, archived.page - 1)
                     if archived.page > 1
@@ -422,6 +457,59 @@ def create_router(settings: Settings) -> APIRouter:
             }
         )
         return templates.TemplateResponse(request, "archived_chats.html", context)
+
+    @router.post("/archive/chats/{telegram_chat_id}/delete")
+    async def delete_archived_chat(
+        request: Request,
+        telegram_chat_id: int,
+    ) -> RedirectResponse:
+        values = await _form_values(request, max_bytes=4096, max_fields=10)
+        _require_csrf(request, values)
+        search = values.get("q", [""])[0].strip()[:100]
+        try:
+            page = max(1, int(values.get("page", ["1"])[0]))
+        except ValueError:
+            page = 1
+        if values.get("confirmation", [""])[0].strip() != "DELETE":
+            return RedirectResponse(
+                _archived_chat_feedback_url(
+                    search,
+                    page,
+                    delete_error="confirmation",
+                ),
+                status_code=303,
+            )
+
+        manager: OperationManager = request.app.state.operations
+        active_operation = await manager.active()
+        active_chat_id = _operation_chat_id(active_operation)
+        if active_operation and (active_chat_id is None or active_chat_id == telegram_chat_id):
+            return RedirectResponse(
+                _archived_chat_feedback_url(search, page, delete_error="active"),
+                status_code=303,
+            )
+
+        service = ChatArchiveDeletionService(request.app.state.archive)
+        result = await service.delete(
+            telegram_chat_id,
+            request.app.state.settings.download_dir,
+        )
+        if result is None:
+            return RedirectResponse(
+                _archived_chat_feedback_url(search, page, delete_error="missing"),
+                status_code=303,
+            )
+        return RedirectResponse(
+            _archived_chat_feedback_url(
+                search,
+                page,
+                deleted="true",
+                deleted_messages=result.messages_deleted,
+                deleted_files=result.files_deleted,
+                cleanup_warnings=result.files_failed + result.files_skipped,
+            ),
+            status_code=303,
+        )
 
     @router.get("/chats/{telegram_chat_id}", response_class=HTMLResponse)
     async def conversation_page(

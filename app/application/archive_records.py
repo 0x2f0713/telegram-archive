@@ -52,6 +52,30 @@ class ArchiveStats:
 
 
 @dataclass(frozen=True, slots=True)
+class ChatArchiveDeletionTarget:
+    telegram_chat_id: int
+    title: str
+    message_count: int
+    media_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ChatArchiveDeletionResult:
+    telegram_chat_id: int
+    title: str
+    messages_deleted: int
+    files_deleted: int
+    bytes_deleted: int
+    files_missing: int
+    files_skipped: int
+    files_failed: int
+
+    @property
+    def cleanup_complete(self) -> bool:
+        return self.files_skipped == 0 and self.files_failed == 0
+
+
+@dataclass(frozen=True, slots=True)
 class DownloadResult:
     completed: bool
     path: Path | None

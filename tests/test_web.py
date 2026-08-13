@@ -154,6 +154,118 @@ async def test_archived_chat_page_pins_active_empty_chat_before_recent_archives(
     assert "Release &lt;Room&gt;" not in search.text
 
 
+async def test_archived_chat_delete_requires_confirmation_and_removes_local_archive(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    message_id, media_path = await _seed(settings)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            page = await client.get("/archive/chats")
+            csrf_token = application.state.csrf_token
+            no_csrf = await client.post(
+                f"/archive/chats/{-1001234567890}/delete",
+                data={"confirmation": "DELETE"},
+            )
+            invalid = await client.post(
+                f"/archive/chats/{-1001234567890}/delete",
+                data={
+                    "csrf_token": csrf_token,
+                    "confirmation": "delete",
+                    "q": "Release",
+                    "page": "1",
+                },
+            )
+            before_delete = await client.get(f"/messages/{message_id}")
+            deleted = await client.post(
+                f"/archive/chats/{-1001234567890}/delete",
+                data={
+                    "csrf_token": csrf_token,
+                    "confirmation": "DELETE",
+                    "q": "Release",
+                    "page": "1",
+                },
+            )
+            feedback = await client.get(deleted.headers["location"])
+            detail = await client.get(f"/messages/{message_id}")
+            media = await client.get(f"/media/{message_id}")
+            conversation = await client.get(f"/chats/{-1001234567890}")
+
+    assert page.status_code == 200
+    assert "Delete archive" in page.text
+    assert "data-archive-delete-dialog" in page.text
+    assert 'data-chat-title="Release &lt;Room&gt;"' in page.text
+    assert no_csrf.status_code == 403
+    assert invalid.status_code == 303
+    assert "delete_error=confirmation" in invalid.headers["location"]
+    assert before_delete.status_code == 200
+    assert deleted.status_code == 303
+    assert "deleted=true" in deleted.headers["location"]
+    assert "deleted_messages=1" in deleted.headers["location"]
+    assert feedback.status_code == 200
+    assert "Archive deleted." in feedback.text
+    assert "Release &lt;Room&gt;" not in feedback.text
+    assert detail.status_code == 404
+    assert media.status_code == 404
+    assert conversation.status_code == 200
+    assert "No messages archived for this chat" in conversation.text
+    assert not media_path.exists()
+
+
+async def test_archived_chat_delete_is_blocked_while_that_chat_is_active(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    message_id, media_path = await _seed(settings)
+    application = create_web_app(settings)
+    ready = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_sync(context: OperationContext) -> None:
+        await context.progress(
+            force=True,
+            phase="syncing",
+            detail="Processing protected chat",
+            chat_id=-1001234567890,
+            chat_title="Release Room",
+        )
+        ready.set()
+        await release.wait()
+
+    async with application.router.lifespan_context(application):
+        application.state.operations = OperationManager(
+            settings,
+            OperationRepository(application.state.database),
+            executors={"sync": fake_sync},
+        )
+        await application.state.operations.startup()
+        await application.state.operations.start_job("sync")
+        await asyncio.wait_for(ready.wait(), timeout=1)
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            page = await client.get("/archive/chats")
+            response = await client.post(
+                f"/archive/chats/{-1001234567890}/delete",
+                data={
+                    "csrf_token": application.state.csrf_token,
+                    "confirmation": "DELETE",
+                },
+            )
+            retained = await client.get(f"/messages/{message_id}")
+        release.set()
+
+    assert page.status_code == 200
+    assert "Finish the active archive operation before deleting this chat" in page.text
+    assert "disabled" in page.text
+    assert response.status_code == 303
+    assert "delete_error=active" in response.headers["location"]
+    assert retained.status_code == 200
+    assert media_path.is_file()
+
+
 def _seed_session_account(tmp_path: Path, account_id: int) -> Path:
     session_path = tmp_path / "telegram_session.session"
     connection = sqlite3.connect(session_path)

@@ -5,11 +5,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.application.archive_records import (
     ArchiveStats,
+    ChatArchiveDeletionTarget,
     ChatNewest,
     MessageSnapshot,
     RetryCandidate,
@@ -82,6 +83,69 @@ class ArchiveRepository:
         async with self.database.sessions() as session:
             return await session.scalar(
                 select(Chat.last_synced_message_id).where(Chat.telegram_chat_id == telegram_chat_id)
+            )
+
+    async def delete_chat_archive(
+        self,
+        telegram_chat_id: int,
+    ) -> ChatArchiveDeletionTarget | None:
+        """Delete one chat's messages while preserving identity and sync checkpoints.
+
+        Media paths still referenced by another chat are omitted from the cleanup
+        target so filesystem cleanup cannot break retained archive records.
+        """
+
+        async with self.database.transaction() as session:
+            chat = await session.scalar(
+                select(Chat).where(Chat.telegram_chat_id == telegram_chat_id)
+            )
+            if chat is None:
+                return None
+            message_count = int(
+                await session.scalar(
+                    select(func.count(Message.id)).where(
+                        Message.telegram_chat_id == telegram_chat_id
+                    )
+                )
+                or 0
+            )
+            if message_count == 0:
+                return None
+            recorded_paths = tuple(
+                path
+                for path in await session.scalars(
+                    select(Message.media_path)
+                    .where(
+                        Message.telegram_chat_id == telegram_chat_id,
+                        Message.media_path.is_not(None),
+                    )
+                    .distinct()
+                )
+                if path
+            )
+            shared_paths: set[str] = set()
+            for offset in range(0, len(recorded_paths), 500):
+                chunk = recorded_paths[offset : offset + 500]
+                shared_paths.update(
+                    path
+                    for path in await session.scalars(
+                        select(Message.media_path)
+                        .where(
+                            Message.telegram_chat_id != telegram_chat_id,
+                            Message.media_path.in_(chunk),
+                        )
+                        .distinct()
+                    )
+                    if path
+                )
+            await session.execute(
+                delete(Message).where(Message.telegram_chat_id == telegram_chat_id)
+            )
+            return ChatArchiveDeletionTarget(
+                telegram_chat_id=telegram_chat_id,
+                title=chat.title,
+                message_count=message_count,
+                media_paths=tuple(path for path in recorded_paths if path not in shared_paths),
             )
 
     async def advance_checkpoint(self, telegram_chat_id: int, message_id: int) -> None:

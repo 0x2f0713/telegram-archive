@@ -11,6 +11,7 @@ import {
   setupThemes,
 } from "./core.js";
 import { setupChatSelection } from "./chat-selection.js";
+import { setupArchiveDeletion } from "./archive-deletion.js";
 import { setupOperationForms, setupOperationMonitor } from "./operations.js";
 import { setupVideoPlayers } from "./media-player.js";
 import { setupMediaGallery } from "./media-gallery.js";
@@ -24,6 +25,7 @@ function initialize() {
   setupMobileMenu();
   setupTelegramAuth();
   setupChatSelection();
+  setupArchiveDeletion();
   setupOperationMonitor();
   setupOperationForms();
   setupVideoPlayers();
