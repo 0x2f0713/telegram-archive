@@ -128,7 +128,12 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-        if request.url.path.startswith("/static/"):
+        if request.url.path in {
+            "/static/assets/dashboard.css",
+            "/static/assets/dashboard.js",
+        }:
+            response.headers["Cache-Control"] = "private, no-cache"
+        elif request.url.path.startswith("/static/"):
             response.headers["Cache-Control"] = "private, max-age=3600"
         else:
             response.headers["Cache-Control"] = "no-store"

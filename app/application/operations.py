@@ -47,6 +47,8 @@ PERSISTED_PROGRESS_FIELDS = frozenset(
 )
 RUNTIME_PROGRESS_FIELDS = frozenset(
     {
+        "chat_id",
+        "chat_title",
         "download_filename",
         "download_current",
         "download_total",

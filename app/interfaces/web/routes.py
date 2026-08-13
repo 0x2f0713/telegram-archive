@@ -706,6 +706,61 @@ def create_router(settings: Settings) -> APIRouter:
         except OperationNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @router.get("/api/v1/chats/quick-access")
+    async def api_quick_chats(
+        request: Request,
+        q: str = Query(default="", max_length=100),
+        limit: int = Query(default=20, ge=1, le=50),
+    ) -> dict[str, object]:
+        repository: DashboardRepository = request.app.state.dashboard
+        manager: OperationManager = request.app.state.operations
+        active_operation = await manager.active()
+        active_chat_id: int | None = None
+        if active_operation and active_operation.get("chat_id") is not None:
+            try:
+                active_chat_id = int(active_operation["chat_id"])
+            except (TypeError, ValueError):
+                active_chat_id = None
+        chats = await repository.quick_chat_summaries(q, limit, active_chat_id)
+        ordered = sorted(
+            chats,
+            key=lambda chat: chat.telegram_chat_id != active_chat_id,
+        )
+        return {
+            "items": [
+                {
+                    "telegram_chat_id": chat.telegram_chat_id,
+                    "title": chat.title,
+                    "username": chat.username,
+                    "type": chat.type,
+                    "message_count": chat.message_count,
+                    "media_count": chat.media_count,
+                    "completed_count": chat.completed_count,
+                    "failed_count": chat.failed_count,
+                    "newest_message_date": (
+                        chat.newest_message_date.isoformat()
+                        if chat.newest_message_date
+                        else None
+                    ),
+                    "active": chat.telegram_chat_id == active_chat_id,
+                    "active_command": (
+                        active_operation.get("command")
+                        if chat.telegram_chat_id == active_chat_id and active_operation
+                        else None
+                    ),
+                    "active_phase": (
+                        active_operation.get("phase")
+                        if chat.telegram_chat_id == active_chat_id and active_operation
+                        else None
+                    ),
+                    "href": f"/chats/{chat.telegram_chat_id}",
+                }
+                for chat in ordered[:limit]
+            ],
+            "query": q.strip(),
+            "active_chat_id": active_chat_id,
+        }
+
     @router.get("/api/v1/messages")
     async def api_messages(
         request: Request,

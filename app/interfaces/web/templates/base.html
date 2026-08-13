@@ -35,6 +35,9 @@
 
       <div class="topbar-actions">
         <span class="local-state"><span aria-hidden="true"></span>Local only</span>
+        {% if section != 'account' %}<button class="quick-chat-trigger" type="button" data-quick-chat-open aria-haspopup="dialog" aria-controls="quick-chat-dialog" aria-expanded="false">
+          Archived chats <span class="quick-chat-active-badge" data-quick-chat-active-badge hidden></span>
+        </button>{% endif %}
         <button class="command-trigger" type="button" data-command-open aria-haspopup="dialog">
           Jump to <kbd>⌘ K</kbd>
         </button>
@@ -57,6 +60,7 @@
           <a href="/operations" {% if section == 'operations' %}aria-current="page"{% endif %}>Operations</a>
           <a href="/system" {% if section == 'system' %}aria-current="page"{% endif %}>System</a>
           <a href="/auth/telegram" {% if section == 'account' %}aria-current="page"{% endif %}>Account</a>
+          {% if section != 'account' %}<button type="button" data-quick-chat-open aria-haspopup="dialog" aria-controls="quick-chat-dialog" aria-expanded="false"><span>Archived chats</span><small>Open a conversation</small></button>{% endif %}
           <button type="button" data-command-open>Open command menu</button>
           <label>Theme
             <select data-theme-select>
@@ -69,6 +73,26 @@
       </details>
     </div>
   </header>
+
+  {% if section != 'account' %}<dialog id="quick-chat-dialog" class="quick-chat-dialog" data-quick-chat-dialog aria-labelledby="quick-chat-title">
+    <header class="quick-chat-head">
+      <div>
+        <span>Archive navigation</span>
+        <h2 id="quick-chat-title">Archived chats</h2>
+      </div>
+      <button type="button" class="dialog-close" data-quick-chat-close>Close</button>
+    </header>
+    <label class="quick-chat-search">
+      <span>Find a chat</span>
+      <input type="search" autocomplete="off" placeholder="Title, username, type, or Telegram ID" data-quick-chat-search>
+    </label>
+    <p class="quick-chat-status sr-only" data-quick-chat-status role="status" aria-live="polite"></p>
+    <div class="quick-chat-results" data-quick-chat-results aria-busy="false"></div>
+    <footer class="quick-chat-foot">
+      <span><kbd>↑</kbd><kbd>↓</kbd> move <kbd>Esc</kbd> close</span>
+      <a href="/chats">Manage coverage</a>
+    </footer>
+  </dialog>{% endif %}
 
   <main id="main-content" tabindex="-1">
     {% block content %}{% endblock %}

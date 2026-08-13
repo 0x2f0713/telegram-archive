@@ -260,6 +260,8 @@ class OperationCommands:
                     progress_total=progress.total,
                     retry_attempted=progress.attempted,
                     retry_completed=progress.completed,
+                    chat_id=progress.chat_id,
+                    chat_title=progress.chat_title,
                 )
 
             attempted, repaired = await archive.retry_candidates(
@@ -285,6 +287,8 @@ class OperationCommands:
                     chats_total=progress.chats_total,
                     messages_processed=progress.messages_processed,
                     downloads_completed=progress.downloads_completed + repaired,
+                    chat_id=progress.chat_id,
+                    chat_title=progress.chat_title,
                 )
                 if progress.phase == "chat-complete":
                     await context.log(progress.detail)
@@ -350,6 +354,8 @@ class OperationCommands:
                     retry_completed=progress.completed,
                     downloads_completed=progress.completed,
                     chats_total=len(chats),
+                    chat_id=progress.chat_id,
+                    chat_title=progress.chat_title,
                 )
 
             attempted, completed = await archive.retry_candidates(
@@ -393,14 +399,18 @@ class OperationCommands:
             )
 
             async def listener_progress(progress: ListenerProgress) -> None:
-                await context.increment(
-                    messages_processed=1,
-                    downloads_completed=int(progress.downloaded),
-                )
-                action = "edit" if progress.edited else "message"
+                if progress.stage == "completed":
+                    await context.increment(
+                        messages_processed=1,
+                        downloads_completed=int(progress.downloaded),
+                    )
+                noun = "edit" if progress.edited else "message"
+                action = "Archived" if progress.stage == "completed" else "Archiving"
                 await context.progress(
                     phase="listening",
-                    detail=f"Archived {action} {progress.message_id} from {progress.chat_title}",
+                    detail=f"{action} {noun} {progress.message_id} from {progress.chat_title}",
+                    chat_id=progress.chat_id,
+                    chat_title=progress.chat_title,
                 )
 
             listener = RealtimeListener(
@@ -426,6 +436,8 @@ class OperationCommands:
                     progress_total=progress.total,
                     retry_attempted=progress.attempted,
                     retry_completed=progress.completed,
+                    chat_id=progress.chat_id,
+                    chat_title=progress.chat_title,
                 )
 
             attempted, repaired = await archive.retry_candidates(

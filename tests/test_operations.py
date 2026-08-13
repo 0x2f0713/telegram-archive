@@ -70,6 +70,8 @@ async def test_operation_progress_history_and_single_job_exclusion(tmp_path: Pat
             chats_total=2,
             messages_processed=25,
             downloads_completed=3,
+            chat_id=-1001234567890,
+            chat_title="Test Community",
             download_tasks=[
                 {
                     "filename": "clip.mp4",
@@ -103,6 +105,8 @@ async def test_operation_progress_history_and_single_job_exclusion(tmp_path: Pat
     assert running["phase"] == "syncing"
     assert running["progress_percent"] == 50.0
     assert running["messages_processed"] == 25
+    assert running["chat_id"] == -1001234567890
+    assert running["chat_title"] == "Test Community"
     assert running["download_tasks"] == [
         {
             "filename": "clip.mp4",

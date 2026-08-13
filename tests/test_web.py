@@ -70,12 +70,15 @@ async def test_web_pages_api_and_media_delivery(tmp_path: Path) -> None:
             messages = await client.get("/messages", params={"q": "quarterly"})
             detail = await client.get(f"/messages/{message_id}")
             media = await client.get(f"/media/{message_id}")
+            dashboard_script = await client.get("/static/assets/dashboard.js")
             stats = await client.get("/api/v1/stats")
             api_messages = await client.get("/api/v1/messages", params={"q": "Alice"})
 
     assert dashboard.status_code == 200
     assert "Archive overview" in dashboard.text
     assert "Recommended next action" in dashboard.text
+    assert "Archived chats" in dashboard.text
+    assert 'data-quick-chat-dialog' in dashboard.text
     assert dashboard.headers["content-security-policy"].startswith("default-src 'self'")
     assert messages.status_code == 200
     assert "Quarterly &lt;script&gt;" in messages.text
@@ -84,8 +87,78 @@ async def test_web_pages_api_and_media_delivery(tmp_path: Path) -> None:
     assert media.status_code == 200
     assert media.content == b"safe archive bytes"
     assert media.headers["content-disposition"].startswith("attachment")
+    assert dashboard_script.headers["cache-control"] == "private, no-cache"
     assert stats.json()["stats"]["total_messages"] == 1
     assert api_messages.json()["total"] == 1
+
+
+async def test_quick_chat_api_pins_active_empty_chat_before_recent_archives(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    await _seed(settings)
+    active_chat_id = -1001234567892
+    database = Database(settings.database_url)
+    await database.initialize()
+    await ArchiveRepository(database).upsert_chat(
+        make_chat(
+            telegram_chat_id=active_chat_id,
+            title="Live Empty Room",
+            username="live_empty",
+        )
+    )
+    await database.close()
+    application = create_web_app(settings)
+    ready = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_sync(context: OperationContext) -> None:
+        await context.progress(
+            force=True,
+            phase="syncing",
+            detail="Processing Live Empty Room",
+            chat_id=active_chat_id,
+            chat_title="Live Empty Room",
+        )
+        ready.set()
+        await release.wait()
+
+    async with application.router.lifespan_context(application):
+        application.state.operations = OperationManager(
+            settings,
+            OperationRepository(application.state.database),
+            executors={"sync": fake_sync},
+        )
+        await application.state.operations.startup()
+        await application.state.operations.start_job("sync")
+        await asyncio.wait_for(ready.wait(), timeout=1)
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/api/v1/chats/quick-access")
+            search = await client.get(
+                "/api/v1/chats/quick-access",
+                params={"q": "live_empty"},
+            )
+        release.set()
+
+    assert response.status_code == 200
+    assert response.json()["items"][0] == {
+        "telegram_chat_id": active_chat_id,
+        "title": "Live Empty Room",
+        "username": "live_empty",
+        "type": "supergroup",
+        "message_count": 0,
+        "media_count": 0,
+        "completed_count": 0,
+        "failed_count": 0,
+        "newest_message_date": None,
+        "active": True,
+        "active_command": "sync",
+        "active_phase": "syncing",
+        "href": f"/chats/{active_chat_id}",
+    }
+    assert response.json()["items"][1]["title"] == "Release <Room>"
+    assert [item["title"] for item in search.json()["items"]] == ["Live Empty Room"]
 
 
 def _seed_session_account(tmp_path: Path, account_id: int) -> Path:

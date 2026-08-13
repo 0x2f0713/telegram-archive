@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import String, case, cast, func, or_, select
 
 from app.application.dashboard import (
     ActivityPoint,
@@ -82,6 +82,99 @@ class DashboardRepository:
             .outerjoin(aggregate, aggregate.c.chat_id == Chat.telegram_chat_id)
             .order_by(Chat.title.collate("NOCASE"))
         )
+        async with self.database.sessions() as session:
+            rows = (await session.execute(statement)).all()
+        return tuple(
+            ChatSummary(
+                row.telegram_chat_id,
+                display_chat_title(
+                    row.telegram_chat_id,
+                    row.title,
+                    row.username,
+                    row.type,
+                ),
+                row.username,
+                row.type,
+                row.last_synced_message_id,
+                row[5],
+                row[6],
+                row[7],
+                row[8],
+                row[9],
+            )
+            for row in rows
+        )
+
+    async def quick_chat_summaries(
+        self,
+        search: str = "",
+        limit: int = 20,
+        include_chat_id: int | None = None,
+    ) -> tuple[ChatSummary, ...]:
+        """Return a bounded recent-chat list for global archive navigation."""
+
+        normalized_search = search.strip()[:100]
+        normalized_limit = min(50, max(1, limit))
+        aggregate = (
+            select(
+                Message.telegram_chat_id.label("chat_id"),
+                func.count(Message.id).label("message_count"),
+                func.sum(case((Message.has_media.is_(True), 1), else_=0)).label(
+                    "media_count"
+                ),
+                func.sum(
+                    case((Message.download_status == DownloadState.COMPLETED.value, 1), else_=0)
+                ).label("completed_count"),
+                func.sum(
+                    case((Message.download_status == DownloadState.FAILED.value, 1), else_=0)
+                ).label("failed_count"),
+                func.max(Message.message_date).label("newest_message_date"),
+            )
+            .group_by(Message.telegram_chat_id)
+            .subquery()
+        )
+        archive_condition = func.coalesce(aggregate.c.message_count, 0) > 0
+        if include_chat_id is not None:
+            archive_condition = or_(
+                archive_condition,
+                Chat.telegram_chat_id == include_chat_id,
+            )
+        statement = (
+            select(
+                Chat.telegram_chat_id,
+                Chat.title,
+                Chat.username,
+                Chat.type,
+                Chat.last_synced_message_id,
+                func.coalesce(aggregate.c.message_count, 0),
+                func.coalesce(aggregate.c.media_count, 0),
+                func.coalesce(aggregate.c.completed_count, 0),
+                func.coalesce(aggregate.c.failed_count, 0),
+                aggregate.c.newest_message_date,
+            )
+            .outerjoin(aggregate, aggregate.c.chat_id == Chat.telegram_chat_id)
+            .where(archive_condition)
+        )
+        if normalized_search:
+            pattern = f"%{normalized_search}%"
+            statement = statement.where(
+                or_(
+                    Chat.title.ilike(pattern),
+                    Chat.username.ilike(pattern),
+                    Chat.type.ilike(pattern),
+                    cast(Chat.telegram_chat_id, String).ilike(pattern),
+                )
+            )
+        order_by = []
+        if include_chat_id is not None:
+            order_by.append(
+                case((Chat.telegram_chat_id == include_chat_id, 0), else_=1)
+            )
+        statement = statement.order_by(
+            *order_by,
+            aggregate.c.newest_message_date.desc(),
+            Chat.title.collate("NOCASE"),
+        ).limit(normalized_limit)
         async with self.database.sessions() as session:
             rows = (await session.execute(statement)).all()
         return tuple(

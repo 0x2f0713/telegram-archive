@@ -24,6 +24,7 @@ class ListenerProgress:
     edited: bool
     downloaded: bool
     skipped: bool
+    stage: str = "completed"
 
 
 ListenerProgressCallback = Callable[[ListenerProgress], Awaitable[None]]
@@ -88,6 +89,18 @@ class RealtimeListener:
             self._schedule(self._process_event(event.message, chat, edited=True))
 
     async def _process_event(self, message: Any, chat: ChatInfo, *, edited: bool) -> None:
+        if self.progress:
+            await self.progress(
+                ListenerProgress(
+                    chat_id=chat.telegram_chat_id,
+                    chat_title=chat.title,
+                    message_id=int(message.id),
+                    edited=edited,
+                    downloaded=False,
+                    skipped=False,
+                    stage="started",
+                )
+            )
         result = await self.archive.process_message(message, chat, edited=edited)
         if self.progress:
             await self.progress(
@@ -98,6 +111,7 @@ class RealtimeListener:
                     edited=edited,
                     downloaded=result.downloaded,
                     skipped=result.skipped,
+                    stage="completed",
                 )
             )
 

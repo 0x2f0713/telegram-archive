@@ -40,6 +40,8 @@ class RetryProgress:
     attempted: int
     completed: int
     detail: str
+    chat_id: int | None = None
+    chat_title: str | None = None
 
 
 RetryProgressCallback = Callable[[RetryProgress], Awaitable[None]]
@@ -206,6 +208,25 @@ class ArchiveService:
         for current, candidate in enumerate(candidates, start=1):
             if stop_event and stop_event.is_set():
                 break
+            chat = chats.get(candidate.telegram_chat_id)
+            chat_title = chat.title if chat is not None else None
+            if progress:
+                await progress(
+                    RetryProgress(
+                        phase="repairing",
+                        current=current - 1,
+                        total=total,
+                        attempted=attempted,
+                        completed=completed,
+                        detail=(
+                            f"Checking media in {chat_title}"
+                            if chat_title
+                            else f"Checking chat {candidate.telegram_chat_id}"
+                        ),
+                        chat_id=candidate.telegram_chat_id,
+                        chat_title=chat_title,
+                    )
+                )
             if candidate.download_status == DownloadState.COMPLETED.value and candidate.media_path:
                 if await asyncio.to_thread(Path(candidate.media_path).is_file):
                     if progress:
@@ -217,10 +238,11 @@ class ArchiveService:
                                 attempted=attempted,
                                 completed=completed,
                                 detail="Verified an existing completed file",
+                                chat_id=candidate.telegram_chat_id,
+                                chat_title=chat_title,
                             )
                         )
                     continue
-            chat = chats.get(candidate.telegram_chat_id)
             if chat is None:
                 if progress:
                     await progress(
@@ -231,6 +253,7 @@ class ArchiveService:
                             attempted=attempted,
                             completed=completed,
                             detail="Skipped a candidate outside the active chat selection",
+                            chat_id=candidate.telegram_chat_id,
                         )
                     )
                 continue
@@ -244,6 +267,8 @@ class ArchiveService:
                             attempted=attempted,
                             completed=completed,
                             detail="Skipped a media type outside this operation selection",
+                            chat_id=candidate.telegram_chat_id,
+                            chat_title=chat_title,
                         )
                     )
                 continue
@@ -274,6 +299,8 @@ class ArchiveService:
                                         detail=(
                                             f"Telegram requested a {wait_seconds}s FloodWait"
                                         ),
+                                        chat_id=candidate.telegram_chat_id,
+                                        chat_title=chat_title,
                                     )
                                 )
                             if await wait_or_stop(stop_event, wait_seconds):
@@ -313,6 +340,8 @@ class ArchiveService:
                             attempted=attempted,
                             completed=completed,
                             detail=f"Retry failed for message {candidate.telegram_message_id}",
+                            chat_id=candidate.telegram_chat_id,
+                            chat_title=chat_title,
                         )
                     )
                 continue
@@ -329,6 +358,8 @@ class ArchiveService:
                             attempted=attempted,
                             completed=completed,
                             detail="Telegram message is no longer available",
+                            chat_id=candidate.telegram_chat_id,
+                            chat_title=chat_title,
                         )
                     )
                 continue
@@ -343,6 +374,8 @@ class ArchiveService:
                         attempted=attempted,
                         completed=completed,
                         detail=f"Processed retry candidate {current} of {total}",
+                        chat_id=candidate.telegram_chat_id,
+                        chat_title=chat_title,
                     )
                 )
         return attempted, completed

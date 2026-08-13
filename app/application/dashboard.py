@@ -118,6 +118,13 @@ class ArchiveStatsReader(Protocol):
 class DashboardReader(Protocol):
     async def chat_summaries(self) -> tuple[ChatSummary, ...]: ...
 
+    async def quick_chat_summaries(
+        self,
+        search: str = "",
+        limit: int = 20,
+        include_chat_id: int | None = None,
+    ) -> tuple[ChatSummary, ...]: ...
+
     async def messages(self, query: MessageQuery | None = None) -> MessagePage: ...
 
     async def attention_messages(self, limit: int = 12) -> tuple[MessageView, ...]: ...

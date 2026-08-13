@@ -106,3 +106,52 @@ async def test_dashboard_message_filters_and_pagination(database: Database, tmp_
     assert latest_only.total == 3
     assert oldest_first.items[0].telegram_message_id == 10
     assert largest_first.items[0].telegram_message_id == 10
+
+
+async def test_quick_chat_summaries_prioritize_recent_archives_and_include_active_empty_chat(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    await _seed_archive(database, tmp_path / "report.pdf")
+    archive = ArchiveRepository(database)
+    older_chat_id = -1001234567891
+    active_empty_chat_id = -1001234567892
+    await archive.upsert_chats(
+        (
+            make_chat(
+                telegram_chat_id=older_chat_id,
+                title="Earlier Archive",
+                username="earlier_archive",
+            ),
+            make_chat(
+                telegram_chat_id=active_empty_chat_id,
+                title="Active Empty Room",
+                username="active_empty",
+            ),
+        )
+    )
+    await archive.upsert_message(
+        make_message(
+            telegram_chat_id=older_chat_id,
+            telegram_message_id=20,
+            message_date=datetime.now(UTC) - timedelta(days=2),
+        )
+    )
+    dashboard = DashboardRepository(database)
+
+    archived = await dashboard.quick_chat_summaries()
+    active_search = await dashboard.quick_chat_summaries(
+        "active_empty",
+        include_chat_id=active_empty_chat_id,
+    )
+    active_only = await dashboard.quick_chat_summaries(
+        limit=1,
+        include_chat_id=active_empty_chat_id,
+    )
+    id_search = await dashboard.quick_chat_summaries(str(older_chat_id))
+
+    assert [chat.title for chat in archived] == ["Release Room", "Earlier Archive"]
+    assert [chat.title for chat in active_search] == ["Active Empty Room"]
+    assert active_search[0].message_count == 0
+    assert [chat.telegram_chat_id for chat in active_only] == [active_empty_chat_id]
+    assert [chat.telegram_chat_id for chat in id_search] == [older_chat_id]
