@@ -2,8 +2,33 @@ x-runtime-volumes: &runtime-volumes
   - ${ARCHIVER_DATA_DIR:-./data}:/app/data
   - ${ARCHIVER_DOWNLOADS_DIR:-./downloads}:/app/downloads
 
+# Host-side ffmpeg: bind-mounted binaries and their dynamic libraries keep the
+# image slim. FFMPEG_LD_LIBRARY_PATH points the ffmpeg child process at the
+# host libs; the app itself never uses them. Device nodes enable Rockchip MPP
+# hardware decode/encode (h264_rkmpp, hevc_rkmpp).
+x-ffmpeg-volumes: &ffmpeg-volumes
+  - ${FFMPEG_BIN:-/usr/bin/ffmpeg}:/usr/local/bin/ffmpeg:ro
+  - ${FFPROBE_BIN:-/usr/bin/ffprobe}:/usr/local/bin/ffprobe:ro
+  - ${FFMPEG_LIB_DIR:-/usr/lib}:/opt/host-libs:ro
+
+x-ffmpeg-devices: &ffmpeg-devices
+  - /dev/dri:/dev/dri:rw
+  - /dev/mpp_service:/dev/mpp_service:rw
+  - /dev/rga:/dev/rga:rw
+  - /dev/dma_heap:/dev/dma_heap:rw
+
 x-runtime-user: &runtime-user
-  user: "${ARCHIVER_UID:-10001}:${ARCHIVER_GID:-10001}"
+  user: "${ARCHIVER_UID:-1001}:${ARCHIVER_GID:-1001}"
+  # Rockchip MPP device nodes are owned by host groups video(44)/render(109).
+  group_add: ["44", "109"]
+
+x-all-volumes: &all-volumes
+  - ${ARCHIVER_DATA_DIR:-./data}:/app/data
+  - ${ARCHIVER_DOWNLOADS_DIR:-./downloads}:/app/downloads
+  - ${FFMPEG_BIN:-/usr/bin/ffmpeg}:/usr/local/bin/ffmpeg:ro
+  - ${FFPROBE_BIN:-/usr/bin/ffprobe}:/usr/local/bin/ffprobe:ro
+  - ${FFMPEG_LIB_DIR:-./.ffmpeg-libs}:/opt/host-libs:ro
+  - ${SSH_DIR:-/home/namhh/.ssh}:/app/.ssh:ro
 
 services:
   telegram-archiver:
@@ -16,7 +41,15 @@ services:
       TG_SESSION_NAME: /app/data/telegram_session
       DATABASE_URL: sqlite:////app/data/archive.db
       DOWNLOAD_DIR: /app/downloads
-    volumes: *runtime-volumes
+      FFMPEG_BIN: /usr/local/bin/ffmpeg
+      FFPROBE_BIN: /usr/local/bin/ffprobe
+      FFMPEG_LD_LIBRARY_PATH: /opt/host-libs
+      # The host-built mpp userspace expects glibc 2.35; this container runs
+      # 2.36, so hevc_rkmpp DECODE fails at runtime (encode is unaffected).
+      # Software decode keeps transcodes working; hardware encoding stays on.
+      VIDEO_HWACCEL: none
+    volumes: *all-volumes
+    devices: *ffmpeg-devices
     command: listen
     init: true
     restart: unless-stopped
@@ -36,7 +69,24 @@ services:
       DOWNLOAD_DIR: /app/downloads
       WEB_HOST: 0.0.0.0
       WEB_PORT: 8686
-    volumes: *runtime-volumes
+      FFMPEG_BIN: /usr/local/bin/ffmpeg
+      FFPROBE_BIN: /usr/local/bin/ffprobe
+      FFMPEG_LD_LIBRARY_PATH: /opt/host-libs
+      # The host-built mpp userspace expects glibc 2.35; this container runs
+      # 2.36, so hevc_rkmpp DECODE fails at runtime (encode is unaffected).
+      # Software decode keeps transcodes working; hardware encoding stays on.
+      VIDEO_HWACCEL: none
+      # HEVC transcodes run on the Orange Pi 3B (192.168.1.2), which has its
+      # own native Rockchip ffmpeg (hw decode + h264_rkmpp encode) and mounts
+      # the archive over NFS at the host path. Falls back to a local transcode
+      # when the remote is unreachable.
+      FFMPEG_REMOTE_HOST: namhh@192.168.1.2
+      FFMPEG_REMOTE_BIN: /usr/local/bin/ffmpeg
+      FFMPEG_REMOTE_IDENTITY: /app/.ssh/id_ed25519
+      FFMPEG_REMOTE_KNOWN_HOSTS: /app/.ssh/known_hosts
+      HOST_DOWNLOAD_DIR: /mnt/disk2/telegram-archiver/downloads
+    volumes: *all-volumes
+    devices: *ffmpeg-devices
     ports:
       - "127.0.0.1:${WEB_HOST_PORT:-8686}:8686"
     command: web

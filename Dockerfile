@@ -6,8 +6,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN groupadd --gid 10001 archiver \
-    && useradd --uid 10001 --gid archiver --create-home archiver
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1001 archiver \
+    && useradd --uid 1001 --gid archiver --create-home archiver
 
 COPY requirements.txt pyproject.toml README.md ./
 RUN python -m pip install --upgrade pip \

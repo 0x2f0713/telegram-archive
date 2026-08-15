@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.application.archive_records import (
@@ -390,6 +390,28 @@ class ArchiveRepository:
             candidates.extend(RetryCandidate(*row) for row in rows)
             last_id = rows[-1].id
         return candidates
+
+    async def completed_video_paths(self) -> tuple[tuple[str, int], ...]:
+        """Return ``(media_path, media_size)`` for every completed video file.
+
+        Results are plain rows so no session stays open while the caller
+        performs filesystem work.
+        """
+        statement = (
+            select(Message.media_path, Message.media_size)
+            .where(
+                Message.download_status == DownloadState.COMPLETED.value,
+                Message.media_path.is_not(None),
+                or_(
+                    Message.media_type.in_(("video", "video_note")),
+                    func.lower(func.coalesce(Message.mime_type, "")).like("video/%"),
+                ),
+            )
+            .order_by(Message.id)
+        )
+        async with self.database.sessions() as session:
+            rows = (await session.execute(statement)).all()
+        return tuple((path, int(size or 0)) for path, size in rows if path)
 
     async def stats(self) -> ArchiveStats:
         async with self.database.sessions() as session:

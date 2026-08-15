@@ -44,9 +44,11 @@ function setupVideoPlayer(video) {
   const badge = host.querySelector("[data-video-speed]");
   const size = Number.parseInt(host.dataset.mediaSize || "0", 10);
   const PROBE_BYTES = 4 * 1024 * 1024;
+  const PROBE_START_SECONDS = 5;
   const BUFFER_AHEAD_SECONDS = 20;
   let probe = null;
   let probeSpeed = 0;
+  let variantTimer = null;
 
   const config = {
     controls: [
@@ -105,7 +107,7 @@ function setupVideoPlayer(video) {
   };
   const startProbe = () => {
     if (probe || !size) return;
-    if (bufferedAhead() >= BUFFER_AHEAD_SECONDS) return;
+    if (bufferedAhead() >= PROBE_START_SECONDS) return;
     const offset = Math.min(
       size - 1,
       Math.floor((video.currentTime / Math.max(video.duration, 1)) * size),
@@ -140,12 +142,79 @@ function setupVideoPlayer(video) {
   const stopProbeWhenBuffered = () => {
     if (bufferedAhead() >= BUFFER_AHEAD_SECONDS) stopProbe();
   };
+  const stopVariantPoll = () => {
+    if (variantTimer) {
+      window.clearInterval(variantTimer);
+      variantTimer = null;
+    }
+    delete video.dataset.variantPolling;
+  };
+  const pollVariant = () => {
+    const statusUrl = host.dataset.variantStatusUrl;
+    const variantUrl = host.dataset.variantUrl;
+    if (!statusUrl || !variantUrl || video.dataset.variantSwapped) return;
+    if (video.dataset.variantPolling) return;
+    video.dataset.variantPolling = "true";
+    if (badge) {
+      badge.hidden = false;
+      badge.textContent = "Preparing H.264 stream…";
+    }
+    // Warm the variant: the status endpoint only reports state, the transcode
+    // is started by a request to the variant URL itself (404 while pending).
+    fetch(variantUrl, { credentials: "same-origin", cache: "no-store" }).catch(() => {});
+    variantTimer = window.setInterval(async () => {
+      let state;
+      try {
+        const response = await fetch(statusUrl, {
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok) {
+          stopVariantPoll();
+          if (badge) badge.hidden = true;
+          return;
+        }
+        state = await response.json();
+      } catch {
+        return;
+      }
+      if (!state.enabled) {
+        stopVariantPoll();
+        if (badge) badge.hidden = true;
+        return;
+      }
+      if (state.ready) {
+        stopVariantPoll();
+        video.dataset.variantSwapped = "true";
+        video.src = variantUrl;
+        video.load();
+        const attempt = video.play();
+        attempt?.catch?.(() => {});
+      } else if (badge && state.transcoding) {
+        const percent = Number.isFinite(state.progress)
+          ? ` (${Math.round(state.progress * 100)}%)`
+          : "";
+        badge.textContent = `Preparing H.264 stream${percent}…`;
+      } else {
+        stopVariantPoll();
+        if (badge) badge.hidden = true;
+      }
+    }, 2000);
+  };
+  const handlePlaybackError = () => {
+    stopProbe();
+    if (video.dataset.variantSwapped) return;
+    pollVariant();
+  };
 
   video.addEventListener("play", startProbe);
   video.addEventListener("waiting", startProbe);
   video.addEventListener("seeked", startProbe);
+  video.addEventListener("pause", stopProbe);
   video.addEventListener("canplaythrough", stopProbe);
   video.addEventListener("playing", stopProbeWhenBuffered);
+  video.addEventListener("error", handlePlaybackError);
   videoPlayers.set(video, {
     player,
     stopProbe,
@@ -153,8 +222,11 @@ function setupVideoPlayer(video) {
       video.removeEventListener("play", startProbe);
       video.removeEventListener("waiting", startProbe);
       video.removeEventListener("seeked", startProbe);
+      video.removeEventListener("pause", stopProbe);
       video.removeEventListener("canplaythrough", stopProbe);
       video.removeEventListener("playing", stopProbeWhenBuffered);
+      video.removeEventListener("error", handlePlaybackError);
+      stopVariantPoll();
     },
   });
   return player;
@@ -169,6 +241,8 @@ function destroyVideoPlayer(video) {
   state.player.destroy();
   videoPlayers.delete(video);
   delete video.dataset.playerReady;
+  delete video.dataset.variantSwapped;
+  delete video.dataset.variantPolling;
 }
 
 function setupVideoPlayers() {

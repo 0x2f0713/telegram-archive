@@ -142,7 +142,10 @@ function setupOperationMonitor() {
       && commands.dataset.activeOperation !== String(operation.id),
     );
     document.querySelectorAll("[data-operation-start-form] button[type='submit']").forEach((button) => {
-      const needsSelection = button.closest("form")?.querySelector('[name="command"]')?.value !== "doctor";
+      const needsSelection = button.closest("form")?.querySelector('[name="command"]')?.value
+        !== "doctor"
+        && button.closest("form")?.querySelector('[name="command"]')?.value
+        !== "optimize-media";
       const selectedCount = Number.parseInt(commands.dataset.selectedChats || "0", 10);
       const disabled = operation.active || anotherOperationIsActive || (needsSelection && selectedCount <= 0);
       button.disabled = disabled;

@@ -1,47 +1,10 @@
 import { destroyVideoPlayer, setupVideoPlayer } from "./media-player.js";
 
-function setupGalleryThumbnails(gallery) {
-  const thumbnails = [...gallery.querySelectorAll("video[data-gallery-thumbnail]")];
-  if (!thumbnails.length) return;
-
-  const loadThumbnail = (video) => {
-    if (video.src || !video.dataset.src) return;
-    video.src = video.dataset.src;
-    video.preload = "metadata";
-    video.addEventListener(
-      "loadedmetadata",
-      () => {
-        if (Number.isFinite(video.duration) && video.duration > 0.1) video.currentTime = 0.1;
-      },
-      { once: true },
-    );
-    video.load();
-  };
-
-  if (!("IntersectionObserver" in window)) {
-    thumbnails.forEach(loadThumbnail);
-    return;
-  }
-
-  const observer = new IntersectionObserver(
-    (entries) => {
-      entries.forEach((entry) => {
-        if (!entry.isIntersecting) return;
-        loadThumbnail(entry.target);
-        observer.unobserve(entry.target);
-      });
-    },
-    { rootMargin: "320px 0px" },
-  );
-  thumbnails.forEach((video) => observer.observe(video));
-}
-
 function setupMediaGallery() {
   const gallery = document.querySelector("[data-media-gallery]");
   const dialog = document.querySelector("[data-media-viewer]");
   if (!gallery || !dialog) return;
 
-  setupGalleryThumbnails(gallery);
   const items = [...gallery.querySelectorAll("[data-gallery-item]")];
   const content = dialog.querySelector("[data-media-viewer-content]");
   const title = dialog.querySelector("[data-media-viewer-title]");
@@ -78,11 +41,16 @@ function setupMediaGallery() {
       playerHost.dataset.videoPlayer = "";
       playerHost.dataset.videoFill = "";
       playerHost.dataset.mediaSize = item.dataset.mediaSize || "0";
+      playerHost.dataset.variantUrl = item.dataset.variantUrl || "";
+      playerHost.dataset.variantStatusUrl = item.dataset.variantStatusUrl || "";
       media.src = item.dataset.mediaSrc;
       media.className = "media-viewer-video";
       media.controls = true;
       media.playsInline = true;
       media.preload = "metadata";
+      if (item.dataset.variantStatusUrl) {
+        media.poster = `${item.dataset.mediaSrc}/poster`;
+      }
       speedBadge.className = "video-speed-badge";
       speedBadge.dataset.videoSpeed = "";
       speedBadge.ariaHidden = "true";

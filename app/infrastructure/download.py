@@ -12,10 +12,19 @@ from telethon.errors import FloodWaitError, RPCError
 
 from app.application.archive_records import DownloadResult, MessageSnapshot
 from app.config import Settings
+from app.infrastructure.ffmpeg import (
+    FfmpegCapabilities,
+    extract_poster,
+    probe_capabilities,
+    remux_faststart,
+)
 from app.infrastructure.persistence.repository import ArchiveRepository
+from app.infrastructure.transcode import POSTER_SUFFIX
 
 logger = logging.getLogger(__name__)
 DownloadProgressCallback = Callable[[int, int], None]
+
+_VIDEO_SUFFIXES = frozenset({".mp4", ".mkv", ".mov", ".m4v", ".webm", ".avi"})
 
 
 class MediaDownloader:
@@ -25,6 +34,23 @@ class MediaDownloader:
         self.settings = settings
         self.repository = repository
         self._semaphore = asyncio.Semaphore(settings.download_concurrency)
+        self._capabilities: FfmpegCapabilities | None = None
+
+    async def _ffmpeg(self) -> FfmpegCapabilities:
+        if self._capabilities is None:
+            self._capabilities = await probe_capabilities(self.settings)
+        return self._capabilities
+
+    async def _optimize(self, target: Path) -> None:
+        """Remux for instant playback and cache a poster frame when enabled."""
+        capabilities = await self._ffmpeg()
+        if not capabilities.available:
+            return
+        if self.settings.media_faststart:
+            await remux_faststart(self.settings, capabilities, target)
+        if self.settings.media_variants and target.suffix.casefold() in _VIDEO_SUFFIXES:
+            poster = target.with_name(f"{target.stem}{POSTER_SUFFIX}")
+            await extract_poster(self.settings, capabilities, target, poster)
 
     async def download(
         self,
@@ -48,6 +74,8 @@ class MediaDownloader:
                     if not downloaded_path or not await asyncio.to_thread(temp_path.is_file):
                         raise OSError("Telegram returned no completed media file")
                     size = await asyncio.to_thread(self._finalize, temp_path, target)
+                    await self._optimize(target)
+                    size = await asyncio.to_thread(self._current_size, target)
                     await self.repository.mark_download_completed(record.id, target, size)
                     return DownloadResult(True, target, size)
                 except asyncio.CancelledError:
@@ -93,4 +121,8 @@ class MediaDownloader:
     @staticmethod
     def _finalize(temp_path: Path, target: Path) -> int:
         os.replace(temp_path, target)
+        return target.stat().st_size
+
+    @staticmethod
+    def _current_size(target: Path) -> int:
         return target.stat().st_size

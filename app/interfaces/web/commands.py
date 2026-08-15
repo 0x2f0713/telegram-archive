@@ -33,6 +33,7 @@ from app.config import ConfigurationError, Settings
 from app.domain import ALL_CONTENT_TYPES, ContentType, normalize_content_types
 from app.domain.content import canonical_content_type_list
 from app.infrastructure.download import MediaDownloader
+from app.infrastructure.ffmpeg import extract_poster, probe_capabilities, remux_faststart
 from app.infrastructure.persistence.database import Database
 from app.infrastructure.persistence.repository import ArchiveRepository
 from app.infrastructure.persistence.selection import ChatSelectionRepository
@@ -45,9 +46,14 @@ from app.infrastructure.telegram.client import (
     resolve_accessible_chats,
 )
 from app.infrastructure.telegram.translation import content_types_of, message_data
+from app.infrastructure.transcode import POSTER_SUFFIX, is_faststart
 from app.utils.logging import format_bytes
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_media_path(raw_path: str) -> Path:
+    return Path(raw_path).expanduser().resolve()
 
 
 class OperationCommands:
@@ -73,11 +79,10 @@ class OperationCommands:
             "listen": self.listen,
             "retry-failed": self.retry_failed,
             "doctor": self.doctor,
+            "optimize-media": self.optimize_media,
         }
 
-    def _chat_selection_service(
-        self, repository: ArchiveRepository
-    ) -> ChatSelectionService:
+    def _chat_selection_service(self, repository: ArchiveRepository) -> ChatSelectionService:
         return ChatSelectionService(
             self.settings.configured_chat_ids,
             repository,
@@ -529,9 +534,7 @@ class OperationCommands:
         repository, _archive = self._archive_stack()
         try:
             await connect_authorized(client)
-            chats = await self._chat_selection_service(repository).resolve_with_client(
-                client
-            )
+            chats = await self._chat_selection_service(repository).resolve_with_client(client)
             if chats:
                 await context.log(
                     f"PASS · Telegram session authorized; {len(chats)} selected chats accessible"
@@ -552,3 +555,65 @@ class OperationCommands:
         )
         if failed:
             raise OperationExecutionError("One or more doctor checks failed")
+
+    async def optimize_media(self, context: OperationContext) -> None:
+        """Make completed videos play instantly: faststart remux and posters."""
+        repository = ArchiveRepository(self.database)
+        capabilities = await probe_capabilities(self.settings)
+        if not capabilities.available:
+            raise OperationExecutionError(
+                "ffmpeg is not available in this environment; media optimization is disabled"
+            )
+        candidates = await repository.completed_video_paths()
+        if not candidates:
+            await context.progress(
+                force=True,
+                phase="optimizing",
+                detail="No completed videos to optimize",
+            )
+            return
+        faststarted = 0
+        posters = 0
+        total = len(candidates)
+        for index, (raw_path, _size) in enumerate(candidates, start=1):
+            if context.stop_event.is_set():
+                return
+            media_path = await asyncio.to_thread(_resolve_media_path, raw_path)
+            if not await asyncio.to_thread(media_path.is_file):
+                continue
+            needs_faststart = not await is_faststart(media_path)
+            poster_target = media_path.with_name(f"{media_path.stem}{POSTER_SUFFIX}")
+            needs_poster = self.settings.media_variants and not await asyncio.to_thread(
+                poster_target.is_file
+            )
+            if not needs_faststart and not needs_poster:
+                continue
+            actions = "faststart" if needs_faststart else ""
+            if needs_poster:
+                actions = "faststart + poster" if actions else "poster"
+            await context.progress(
+                force=(index == 1),
+                phase="optimizing",
+                detail=f"Optimizing {media_path.name} ({index}/{total}): {actions}",
+                progress_current=index - 1,
+                progress_total=total,
+            )
+            try:
+                if needs_faststart:
+                    await remux_faststart(self.settings, capabilities, media_path)
+                    faststarted += 1
+                if needs_poster:
+                    await extract_poster(self.settings, capabilities, media_path, poster_target)
+                    posters += 1
+            except Exception as exc:
+                logger.error("Could not optimize %s: %s", media_path, exc)
+        await context.progress(
+            force=True,
+            progress_current=total,
+            progress_total=total,
+            phase="optimizing",
+            detail=(
+                f"Optimized {total} completed videos: "
+                f"{faststarted} faststarted, {posters} posters written"
+            ),
+        )

@@ -12,6 +12,7 @@ class OperationCommand(StrEnum):
     LISTEN = "listen"
     RETRY_FAILED = "retry-failed"
     DOCTOR = "doctor"
+    OPTIMIZE_MEDIA = "optimize-media"
 
 
 class OperationStatus(StrEnum):

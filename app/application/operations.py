@@ -87,9 +87,7 @@ class OperationStore(Protocol):
 
     async def active(self) -> OperationRecord | None: ...
 
-    async def add_log(
-        self, job_id: int, level: str, message: str
-    ) -> OperationLogRecord: ...
+    async def add_log(self, job_id: int, level: str, message: str) -> OperationLogRecord: ...
 
     async def logs(self, job_id: int, limit: int = 100) -> tuple[OperationLogRecord, ...]: ...
 
@@ -116,6 +114,7 @@ def operation_action(command: str, status: str, *, enabled: bool = True) -> dict
         OperationCommand.LISTEN: "Restart listener",
         OperationCommand.RETRY_FAILED: "Retry failed media",
         OperationCommand.DOCTOR: "Run diagnostics",
+        OperationCommand.OPTIMIZE_MEDIA: "Optimize media",
     }
     return {"kind": "retry", "label": labels[operation_command], "enabled": enabled}
 
@@ -195,9 +194,7 @@ class OperationManager:
             record = await self._start_job_locked(normalized, safe_parameters)
         return await self.get(record.id)
 
-    async def _start_job_locked(
-        self, command: str, parameters: dict[str, Any]
-    ) -> OperationRecord:
+    async def _start_job_locked(self, command: str, parameters: dict[str, Any]) -> OperationRecord:
         """Create and schedule a job while ``self._lock`` is held."""
         record = await self.repository.create(command, parameters)
         runtime = _Runtime(job_id=record.id, command=command)

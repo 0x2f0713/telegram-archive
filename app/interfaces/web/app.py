@@ -19,9 +19,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.application.chat_selection import ChatSelectionService
 from app.application.dashboard import DashboardService
+from app.application.media_variants import MediaVariantService
 from app.application.operations import OperationManager
 from app.application.runtime_settings import load_runtime_settings
 from app.config import ConfigurationError, Settings
+from app.infrastructure.ffmpeg import probe_capabilities
 from app.infrastructure.persistence.database import Database
 from app.infrastructure.persistence.operations import OperationRepository
 from app.infrastructure.persistence.read_models import DashboardRepository
@@ -35,6 +37,7 @@ from app.infrastructure.telegram.client import (
     resolve_accessible_chats,
 )
 from app.infrastructure.telegram.session_account import read_session_account_id
+from app.infrastructure.transcode import VariantManager
 from app.interfaces.web.auth import TelegramQrAuthManager
 from app.interfaces.web.commands import OperationCommands
 from app.interfaces.web.presentation import templates
@@ -137,6 +140,16 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             response.headers["Cache-Control"] = "private, no-cache"
         elif request.url.path.startswith("/static/"):
             response.headers["Cache-Control"] = "private, max-age=3600"
+        elif (
+            request.url.path.startswith("/media/")
+            and not request.url.path.endswith("/variant-status")
+            and response.status_code in {200, 206}
+        ):
+            # Completed archive media is immutable: the file is finalized once
+            # and never rewritten, and each message id maps to a unique file.
+            # Private immutable caching makes back/forward navigation and
+            # gallery reopens instant without re-downloading multi-GB videos.
+            response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
         else:
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -186,6 +199,12 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
             app.state.chat_selections,
             overridden.configured_chat_ids,
         )
+        capabilities = await probe_capabilities(overridden)
+        app.state.variant_manager = VariantManager(overridden, capabilities)
+        app.state.media_variants = MediaVariantService(
+            enabled=overridden.media_variants,
+            ports=app.state.variant_manager,
+        )
         app.state.csrf_token = secrets.token_urlsafe(32)
         app.state.telegram_auth = TelegramQrAuthManager(overridden)
         app.state.web_session = web_session
@@ -203,6 +222,7 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
             yield
         finally:
             await app.state.operations.shutdown()
+            await app.state.variant_manager.shutdown()
             await app.state.telegram_auth.close()
             await database.close()
 

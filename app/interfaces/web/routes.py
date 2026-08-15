@@ -32,6 +32,7 @@ from app.application.dashboard import (
     DashboardService,
     MessageQuery,
 )
+from app.application.media_variants import MediaVariantService
 from app.application.operations import (
     OPERATION_COMMANDS,
     OperationConflictError,
@@ -185,6 +186,26 @@ def _safe_csv_value(value: object | None) -> str:
 
 def _resolved_media_paths(download_dir: Path, media_path: str) -> tuple[Path, Path]:
     return download_dir.expanduser().resolve(), Path(media_path).expanduser().resolve()
+
+
+async def _completed_media(request: Request, message_id: int) -> tuple[Path, str | None]:
+    """Resolve the archived file for a completed media record.
+
+    Applies the same download-directory containment check used by the media
+    route and returns ``(media_path, mime_type)`` or raises HTTP 404/403.
+    """
+    repository: DashboardRepository = request.app.state.dashboard
+    message = await repository.message(message_id)
+    if message is None or message.download_status != "completed" or not message.media_path:
+        raise HTTPException(status_code=404, detail="Completed media not found")
+    download_root, media_path = await asyncio.to_thread(
+        _resolved_media_paths, request.app.state.settings.download_dir, message.media_path
+    )
+    if download_root != media_path and download_root not in media_path.parents:
+        raise HTTPException(status_code=403, detail="Media path is outside DOWNLOAD_DIR")
+    if not await asyncio.to_thread(media_path.is_file):
+        raise HTTPException(status_code=404, detail="Media file is missing")
+    return media_path, message.mime_type
 
 
 def _preview_kind(mime_type: str | None) -> str:
@@ -843,26 +864,57 @@ def create_router(settings: Settings) -> APIRouter:
             status_code=303,
         )
 
-    @router.get("/media/{message_id}")
+    @router.api_route("/media/{message_id}", methods=["GET", "HEAD"])
     async def media_file(request: Request, message_id: int) -> FileResponse:
-        repository: DashboardRepository = request.app.state.dashboard
-        message = await repository.message(message_id)
-        if message is None or message.download_status != "completed" or not message.media_path:
-            raise HTTPException(status_code=404, detail="Completed media not found")
-        download_root, media_path = await asyncio.to_thread(
-            _resolved_media_paths, settings.download_dir, message.media_path
-        )
-        if download_root != media_path and download_root not in media_path.parents:
-            raise HTTPException(status_code=403, detail="Media path is outside DOWNLOAD_DIR")
-        if not await asyncio.to_thread(media_path.is_file):
-            raise HTTPException(status_code=404, detail="Media file is missing")
+        media_path, mime_type = await _completed_media(request, message_id)
         return FileResponse(
             media_path,
-            media_type=message.mime_type or "application/octet-stream",
+            media_type=mime_type or "application/octet-stream",
             filename=media_path.name,
             content_disposition_type=(
-                "inline" if _preview_kind(message.mime_type) != "file" else "attachment"
+                "inline" if _preview_kind(mime_type) != "file" else "attachment"
             ),
+        )
+
+    @router.api_route("/media/{message_id}/variant", methods=["GET", "HEAD"])
+    async def media_variant(request: Request, message_id: int) -> FileResponse:
+        """Serve the playable H.264 variant of a video once transcoding is done.
+
+        H.264 originals are served as-is; HEVC files return 404 until their
+        cached variant exists, and the player polls the status endpoint.
+        """
+        media_path, _ = await _completed_media(request, message_id)
+        service: MediaVariantService = request.app.state.media_variants
+        playable = await service.playable_path(media_path)
+        if playable is None or playable == media_path:
+            raise HTTPException(status_code=404, detail="Playable variant not available")
+        return FileResponse(
+            playable,
+            media_type="video/mp4",
+            filename=media_path.name,
+            content_disposition_type="inline",
+        )
+
+    @router.get("/media/{message_id}/variant-status")
+    async def media_variant_status(request: Request, message_id: int) -> dict[str, object]:
+        media_path, _ = await _completed_media(request, message_id)
+        service: MediaVariantService = request.app.state.media_variants
+        return service.status(media_path).as_dict()
+
+    @router.get("/media/{message_id}/poster")
+    async def media_poster(request: Request, message_id: int) -> FileResponse:
+        """Serve a cached JPEG poster frame for a video."""
+        media_path, mime_type = await _completed_media(request, message_id)
+        if mime_type and not mime_type.casefold().startswith("video/"):
+            raise HTTPException(status_code=404, detail="Poster not available")
+        service: MediaVariantService = request.app.state.media_variants
+        poster = await service.poster_path(media_path)
+        if poster is None:
+            raise HTTPException(status_code=404, detail="Poster not available")
+        return FileResponse(
+            poster,
+            media_type="image/jpeg",
+            content_disposition_type="inline",
         )
 
     @router.get("/healthz")

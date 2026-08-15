@@ -136,7 +136,7 @@ class OperationJob(Base):
     __tablename__ = "operation_jobs"
     __table_args__ = (
         CheckConstraint(
-            "command IN ('sync', 'listen', 'retry-failed', 'doctor')",
+            "command IN ('sync', 'listen', 'retry-failed', 'doctor', 'optimize-media')",
             name="ck_operation_jobs_command",
         ),
         CheckConstraint(

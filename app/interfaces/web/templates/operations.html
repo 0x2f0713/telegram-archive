@@ -204,6 +204,15 @@
       <div class="command-card-signal">Secrets remain redacted</div>
       <button class="button secondary" type="submit" {% if active_operation %}disabled aria-disabled="true"{% endif %}>Run diagnostics</button>
     </form>
+
+    <form class="operation-command-card" method="post" action="/operations/start" data-operation-start-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="command" value="optimize-media">
+      <div class="command-card-heading"><span>05</span><div><p>Playback tuning</p><h3>Optimize media</h3></div></div>
+      <p>Faststart completed videos for instant playback and cache JPEG poster frames for galleries.</p>
+      <div class="command-card-signal">Runs locally with ffmpeg; no Telegram traffic</div>
+      <button class="button secondary" type="submit" {% if active_operation %}disabled aria-disabled="true"{% endif %}>Optimize media</button>
+    </form>
   </div>
 </section>
 

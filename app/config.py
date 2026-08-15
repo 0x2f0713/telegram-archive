@@ -26,6 +26,8 @@ RUNTIME_OVERRIDE_FIELDS: frozenset[str] = frozenset(
         "keywords",
         "log_level",
         "web_refresh_seconds",
+        "media_faststart",
+        "media_variants",
     }
 )
 
@@ -35,6 +37,8 @@ _BOOL_OVERRIDES: frozenset[str] = frozenset(
         "download_videos",
         "download_documents",
         "download_audio",
+        "media_faststart",
+        "media_variants",
     }
 )
 
@@ -98,6 +102,43 @@ class Settings(BaseSettings):
     web_session_secret: SecretStr | None = None
     web_refresh_seconds: int = Field(default=15, ge=5, le=3600)
     tui_refresh_seconds: int = Field(default=5, ge=1, le=3600)
+
+    # ffmpeg is optional; when absent, faststart remuxing, poster generation,
+    # and HEVC fallback variants are disabled gracefully.
+    ffmpeg_bin: str = "ffmpeg"
+    ffprobe_bin: str = "ffprobe"
+    #: Extra library search path for a host-mounted ffmpeg (bind-mounted
+    #: binaries). Applied only to the ffmpeg child process, never the app.
+    ffmpeg_ld_library_path: str = ""
+
+    #: Optional ssh target (e.g. ``namhh@192.168.1.2``) that runs HEVC
+    #: transcodes with its own Rockchip ffmpeg over an NFS-shared archive.
+    #: Empty disables remote transcoding; a connectivity failure falls back
+    #: to a local transcode.
+    ffmpeg_remote_host: str = ""
+    #: Remote ffmpeg binary (a wrapper that sets LD_LIBRARY_PATH is expected).
+    ffmpeg_remote_bin: str = "/usr/local/bin/ffmpeg"
+    #: SSH private key path (inside the app container) for the remote host.
+    ffmpeg_remote_identity: str = ""
+    #: SSH known_hosts path (inside the app container) for the remote host.
+    ffmpeg_remote_known_hosts: str = ""
+    #: Host path that ``download_dir`` maps to, used to translate arguments
+    #: for remote transcoding (the remote host mounts the same files via NFS).
+    host_download_dir: str = ""
+
+    #: Remux completed videos with -movflags +faststart (moov at file start)
+    #: so browsers can start playback without fetching the file tail.
+    media_faststart: bool = True
+    #: Transcode HEVC videos to an H.264 variant on first view and serve
+    #: JPEG poster thumbnails in galleries and players.
+    media_variants: bool = True
+
+    #: Hardware decode mode for ffmpeg child processes. ``auto``/``rkmpp``
+    #: enables MPP hardware decode when the h264_rkmpp encoder exists; ``none``
+    #: forces software decode (hardware encoding is unaffected). Set to
+    #: ``none`` where the MPP userspace is built for a different glibc than the
+    #: container's (hevc_rkmpp then fails at runtime).
+    video_hwaccel: str = "auto"
 
     @field_validator("log_level")
     @classmethod

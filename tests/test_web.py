@@ -1002,12 +1002,12 @@ async def test_web_system_settings_saves_applies_and_resets(tmp_path: Path) -> N
             assert 'name="max_file_size_mb" min="0" value="100"' in saved.text
             assert 'name="web_refresh_seconds" min="5" max="3600" value="30"' in saved.text
             assert '<option value="DEBUG" selected' in saved.text
-            assert saved.text.count(">overridden<") == 6
+            assert saved.text.count(">overridden<") == 8
 
             applied = await client.get("/system")
             assert 'name="download_concurrency" min="1" max="20" value="7"' in applied.text
             assert '<option value="DEBUG" selected' in applied.text
-            assert applied.text.count(">overridden<") == 6
+            assert applied.text.count(">overridden<") == 8
 
             reset_one = await client.post(
                 "/system/settings",
