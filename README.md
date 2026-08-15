@@ -312,6 +312,39 @@ Then open `http://127.0.0.1:9090`. The Compose mapping is `127.0.0.1:${WEB_HOST_
 
 For bind-mounted files or embedding into another service, see [INTEGRATION.md](INTEGRATION.md).
 
+### Media delivery and transcoding
+
+Posters and HEVC→H.264 variants use a host-side ffmpeg when one is mounted. `FFMPEG_BIN`, `FFPROBE_BIN`, and `FFMPEG_LIB_DIR` point at the binaries and their dynamic libraries; `FFMPEG_LD_LIBRARY_PATH` is applied only to ffmpeg child processes, never the app. Keep `FFMPEG_LIB_DIR` curated (no `libc`/`libm`/`libpthread`) so the container's own runtime is never shadowed. Without ffmpeg, galleries fall back to the original video and no posters are extracted.
+
+Rockchip boards ship an MPP userspace built for their host glibc. In a container with a different glibc, `hevc_rkmpp` **decode** fails at runtime while `h264_rkmpp` **encode** still works, so set `VIDEO_HWACCEL=none` (software decode, hardware encode) there:
+
+```dotenv
+FFMPEG_BIN=/usr/bin/ffmpeg
+FFPROBE_BIN=/usr/bin/ffprobe
+FFMPEG_LIB_DIR=./.ffmpeg-libs
+VIDEO_HWACCEL=none
+```
+
+### Remote transcoding node
+
+HEVC transcodes can run on a second machine with its own working Rockchip ffmpeg, leaving the app host's VPU free. The setup assumes both machines share the archive via NFS at the **same absolute path** (e.g. `/mnt/disk2/telegram-archiver/downloads`) and that the remote `uid` matches the archive owner:
+
+1. Install the host's Rockchip ffmpeg natively on the node (do not replace `/usr/bin/ffmpeg`): binaries in `/usr/local/lib/ffmpeg-custom/` with a `/usr/local/bin/ffmpeg` wrapper that sets `LD_LIBRARY_PATH=/usr/local/lib/ffmpeg-custom`, and verify `h264_rkmpp`/`hevc_rkmpp` are present.
+2. Export the archive over NFS from the app host and mount it on the node at the identical path.
+3. Give the container passwordless SSH access: `SSH_DIR` (default `~/.ssh`) is bind-mounted read-only at `/app/.ssh`; the image ships `openssh-client`.
+
+Then enable remote transcoding on the web service:
+
+```dotenv
+FFMPEG_REMOTE_HOST=namhh@192.168.1.2
+FFMPEG_REMOTE_BIN=/usr/local/bin/ffmpeg
+FFMPEG_REMOTE_IDENTITY=/app/.ssh/id_ed25519
+FFMPEG_REMOTE_KNOWN_HOSTS=/app/.ssh/known_hosts
+HOST_DOWNLOAD_DIR=/mnt/disk2/telegram-archiver/downloads
+```
+
+The app translates container paths to `HOST_DOWNLOAD_DIR` before invoking the remote command, forces `-hwaccel rkmpp` (the node's native MPP works), and streams progress over ssh unchanged. If ssh fails (host down, key rejected), the transcode automatically falls back to a local run. Leave `FFMPEG_REMOTE_HOST` empty to always transcode locally.
+
 ## Recovery and troubleshooting
 
 - **Not authenticated:** run `python -m app login` in the same environment and with the same `TG_SESSION_NAME` used by other commands.
