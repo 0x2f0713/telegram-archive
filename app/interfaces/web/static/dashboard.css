@@ -710,6 +710,20 @@ main { width: min(100%, 92rem); margin: 0 auto; padding: clamp(3rem, 6vw, 5.5rem
 .media-viewer-stage { position: relative; display: grid; min-width: 0; min-height: 0; place-items: center; background: #020403; overflow: hidden; touch-action: pan-y; }
 .media-viewer-content { position: relative; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; }
 .media-viewer-asset { position: absolute; inset: 0; display: block; width: 100%; height: 100%; min-width: 0; min-height: 0; max-width: 100%; max-height: 100%; background: #020403; object-fit: contain; }
+.media-viewer-player { position: absolute; inset: 0; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; background: #020403; container-type: inline-size; }
+.media-viewer-player .plyr { --plyr-color-main: var(--accent); --plyr-video-control-color: var(--ink); --plyr-video-control-color-hover: var(--on-accent); --plyr-control-icon-size: 1rem; --plyr-control-spacing: 0.65rem; --plyr-control-radius: 0.35rem; --plyr-video-progress-buffered-background: color-mix(in srgb, var(--ink) 38%, transparent); width: 100%; height: 100%; min-width: 0; max-width: 100%; max-height: 100%; aspect-ratio: auto; border: 0; border-radius: 0; background: #020403; color: var(--ink); overflow: hidden; }
+.media-viewer-player .plyr__video-wrapper { width: 100%; height: 100%; min-height: 0; aspect-ratio: auto; background: #020403; }
+.media-viewer-player .plyr video, .media-viewer-player .media-viewer-video { display: block; width: 100% !important; height: 100% !important; min-width: 0; min-height: 0; max-width: 100%; max-height: 100% !important; margin: 0; border-radius: 0; background: #020403; object-fit: contain; }
+.media-viewer-player .plyr__controls { z-index: 2; min-height: 3.4rem; background: linear-gradient(180deg, rgba(5, 11, 9, 0), rgba(5, 11, 9, 0.94)) !important; color: var(--ink) !important; }
+.media-viewer-player .plyr__control { color: var(--ink) !important; opacity: 1 !important; }
+.media-viewer-player .plyr__control:hover, .media-viewer-player .plyr__control:focus-visible { background: var(--accent) !important; color: var(--on-accent) !important; }
+.media-viewer-player .plyr__control > svg { width: var(--plyr-control-icon-size); height: var(--plyr-control-icon-size); fill: currentColor !important; stroke: currentColor; opacity: 1 !important; }
+.media-viewer-player .plyr__control--overlaid { border: 1px solid color-mix(in srgb, var(--on-accent) 32%, transparent); background: var(--accent) !important; color: var(--on-accent) !important; box-shadow: 0 0 0 0.45rem color-mix(in srgb, var(--accent) 18%, transparent); }
+.media-viewer-player .plyr__control--overlaid > svg { width: 1.35rem; height: 1.35rem; fill: currentColor !important; }
+.media-viewer-player .plyr__progress input[type="range"] { color: var(--accent); accent-color: var(--accent); }
+.media-viewer-player .plyr__menu__container { border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--surface-raised); color: var(--ink); }
+.media-viewer-player .plyr__menu__container [role="menuitemradio"] { color: var(--ink); }
+.media-viewer-player .plyr__menu__container [role="menuitemradio"][aria-checked="true"] { color: var(--accent); }
 .media-viewer-nav { position: absolute; top: 50%; z-index: 2; width: 3.25rem; height: 3.25rem; transform: translateY(-50%); }
 .media-viewer-nav:disabled { cursor: not-allowed; opacity: 0.22; }
 .media-viewer-previous { left: 1rem; }
@@ -742,8 +756,11 @@ main { width: min(100%, 92rem); margin: 0 auto; padding: clamp(3rem, 6vw, 5.5rem
   .media-viewer-header > div { grid-template-columns: auto minmax(0, 1fr); }
   .media-viewer-header p { display: none; }
   .media-viewer-nav { top: auto; bottom: 1rem; width: 3rem; height: 3rem; transform: none; }
+  .media-viewer[data-media-kind="video"] .media-viewer-nav { top: 50%; bottom: auto; transform: translateY(-50%); }
   .media-viewer-previous { left: 0.75rem; }
   .media-viewer-next { right: 0.75rem; }
   .media-viewer-footer { min-height: 4.4rem; padding: 0.55rem 0.75rem; }
   .media-viewer-footer .button { min-height: 2.7rem; padding-inline: 0.75rem; }
+  .media-viewer-player .plyr__time--duration, .media-viewer-player [data-plyr="pip"] { display: none !important; }
+  .media-viewer-player .plyr__volume input[type="range"] { display: none; }
 }

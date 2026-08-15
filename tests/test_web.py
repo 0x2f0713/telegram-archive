@@ -431,6 +431,7 @@ async def test_chat_media_gallery_is_scoped_filterable_and_linked_from_messages(
     assert "Gallery &lt;Room&gt;" in gallery.text
     assert f'data-media-src="/media/{photo_id}"' in gallery.text
     assert f'data-media-src="/media/{video_id}"' in gallery.text
+    assert 'data-media-size="14"' in gallery.text
     assert f"/media/{other_id}" not in gallery.text
     assert "<script>alert(1)</script>" not in gallery.text
     assert 'data-media-kind="image"' in gallery.text

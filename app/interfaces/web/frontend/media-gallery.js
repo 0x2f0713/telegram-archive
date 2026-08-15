@@ -1,3 +1,5 @@
+import { destroyVideoPlayer, setupVideoPlayer } from "./media-player.js";
+
 function setupGalleryThumbnails(gallery) {
   const thumbnails = [...gallery.querySelectorAll("video[data-gallery-thumbnail]")];
   if (!thumbnails.length) return;
@@ -56,28 +58,46 @@ function setupMediaGallery() {
   let returnFocus = null;
   let pointerStart = null;
 
-  const stopMedia = () => {
-    content.querySelectorAll("video").forEach((video) => video.pause());
+  const clearMedia = () => {
+    content.querySelectorAll("video").forEach((video) => destroyVideoPlayer(video));
+    content.replaceChildren();
   };
 
   const render = (index) => {
     if (index < 0 || index >= items.length) return;
-    stopMedia();
+    clearMedia();
     activeIndex = index;
     const item = items[activeIndex];
     const caption = item.dataset.caption || "Archived media";
-    const media = document.createElement(item.dataset.mediaKind === "video" ? "video" : "img");
-    media.src = item.dataset.mediaSrc;
-    media.className = "media-viewer-asset";
-    if (media instanceof HTMLVideoElement) {
+    dialog.dataset.mediaKind = item.dataset.mediaKind;
+    if (item.dataset.mediaKind === "video") {
+      const playerHost = document.createElement("div");
+      const media = document.createElement("video");
+      const speedBadge = document.createElement("span");
+      playerHost.className = "media-viewer-player";
+      playerHost.dataset.videoPlayer = "";
+      playerHost.dataset.videoFill = "";
+      playerHost.dataset.mediaSize = item.dataset.mediaSize || "0";
+      media.src = item.dataset.mediaSrc;
+      media.className = "media-viewer-video";
       media.controls = true;
       media.playsInline = true;
       media.preload = "metadata";
+      speedBadge.className = "video-speed-badge";
+      speedBadge.dataset.videoSpeed = "";
+      speedBadge.ariaHidden = "true";
+      speedBadge.hidden = true;
+      playerHost.append(media, speedBadge);
+      content.replaceChildren(playerHost);
+      setupVideoPlayer(media);
     } else {
+      const media = document.createElement("img");
+      media.src = item.dataset.mediaSrc;
+      media.className = "media-viewer-asset";
       media.alt = caption;
       media.decoding = "async";
+      content.replaceChildren(media);
     }
-    content.replaceChildren(media);
     if (title) title.textContent = caption;
     if (meta) meta.textContent = item.dataset.meta || "";
     if (counter) counter.textContent = `${activeIndex + 1} / ${items.length}`;
@@ -115,12 +135,12 @@ function setupMediaGallery() {
     if (event.target === dialog) dialog.close();
   });
   dialog.addEventListener("close", () => {
-    stopMedia();
-    content.replaceChildren();
+    clearMedia();
+    delete dialog.dataset.mediaKind;
     returnFocus?.focus();
   });
   dialog.addEventListener("keydown", (event) => {
-    if (event.target instanceof HTMLVideoElement) return;
+    if (event.target instanceof Element && event.target.closest("[data-video-player]")) return;
     if (event.key === "ArrowLeft") {
       event.preventDefault();
       render(activeIndex - 1);
@@ -130,7 +150,7 @@ function setupMediaGallery() {
     }
   });
   dialog.addEventListener("pointerdown", (event) => {
-    if (!event.isPrimary || event.target.closest("a, button, video")) return;
+    if (!event.isPrimary || event.target.closest("a, button, input, video, [data-video-player]")) return;
     pointerStart = { x: event.clientX, y: event.clientY };
   });
   dialog.addEventListener("pointerup", (event) => {
