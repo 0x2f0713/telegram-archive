@@ -167,6 +167,20 @@ class Settings(BaseSettings):
     #: WebP quality for thumbnails (1-100).
     thumbnail_quality: int = Field(default=75, ge=10, le=100)
 
+    #: Generate poster frames for videos in TeraBox mode and cache locally.
+    terabox_generate_posters: bool = True
+    #: Transcode HEVC videos to H.264 in TeraBox mode for browser compatibility.
+    terabox_transcode_hevc: bool = True
+    #: Store both original and H.264 variant on TeraBox (when transcoding).
+    terabox_store_both: bool = True
+
+    #: Local directory for cached video byte ranges (TeraBox mode seeking).
+    video_cache_dir: Path = Path("data/video_cache")
+    #: Maximum size of video cache in GB.
+    video_cache_max_size_gb: int = Field(default=5, ge=1, le=100)
+    #: Maximum age of cached video segments in days.
+    video_cache_max_age_days: int = Field(default=7, ge=1, le=365)
+
     #: Hardware decode mode for ffmpeg child processes. ``auto``/``rkmpp``
     #: enables MPP hardware decode when the h264_rkmpp encoder exists; ``none``
     #: forces software decode (hardware encoding is unaffected). Set to
@@ -238,21 +252,20 @@ class Settings(BaseSettings):
     def with_terabox_policy(self) -> Settings:
         """Apply TeraBox mode constraints on top of resolved settings.
 
-        Remote-only archives keep pristine originals: faststart remuxing and
-        HEVC variants would rewrite or multiply uploads and cannot be cached
-        usefully on the read-only mount.
+        Remote-only archives keep pristine originals: HEVC variants would rewrite
+        or multiply uploads and cannot be cached usefully on the read-only mount.
+        Faststart remuxing IS enabled (moov atom at start for instant playback).
+        Poster generation is handled via local thumbnail cache (not uploaded).
         """
         if not self.terabox_enabled:
             return self
         updates: dict[str, object] = {}
-        if self.media_faststart:
-            updates["media_faststart"] = False
         if self.media_variants:
             updates["media_variants"] = False
         if updates:
             logger.info(
-                "TeraBox storage mode: faststart and media variants are disabled "
-                "so only pristine originals are uploaded"
+                "TeraBox storage mode: media variants (HEVC transcode, old poster system) "
+                "are disabled; faststart and local posters are enabled"
             )
             return self.model_copy(update=updates)
         return self

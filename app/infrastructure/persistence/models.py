@@ -115,6 +115,7 @@ class Message(Base):
     has_media: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     media_type: Mapped[str | None] = mapped_column(String(32))
     media_path: Mapped[str | None] = mapped_column(Text)
+    media_variant_path: Mapped[str | None] = mapped_column(Text)
     media_size: Mapped[int | None] = mapped_column(BigInteger)
     telegram_document_id: Mapped[int | None] = mapped_column(BigInteger)
     mime_type: Mapped[str | None] = mapped_column(String(255))

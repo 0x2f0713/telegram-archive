@@ -37,6 +37,7 @@ def _message_columns():
         Message.has_media,
         Message.media_type,
         Message.media_path,
+        Message.media_variant_path,
         Message.media_size,
         Message.mime_type,
         Message.filename,

@@ -44,7 +44,7 @@ def test_terabox_policy_disables_local_only_media_flags() -> None:
 
     effective = settings.with_terabox_policy()
 
-    assert effective.media_faststart is False
+    assert effective.media_faststart is True
     assert effective.media_variants is False
 
 

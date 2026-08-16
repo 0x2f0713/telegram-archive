@@ -7,7 +7,7 @@ import csv
 import io
 import ipaddress
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import asdict, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -19,6 +19,7 @@ from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     RedirectResponse,
+    Response,
     StreamingResponse,
 )
 from pydantic import ValidationError
@@ -396,6 +397,7 @@ def create_router(settings: Settings) -> APIRouter:
                 "message": message,
                 "preview_kind": _preview_kind(message.mime_type),
                 "album": album,
+                "terabox_enabled": request.app.state.settings.terabox_enabled,
             }
         )
         return templates.TemplateResponse(request, "message_detail.html", context)
@@ -583,6 +585,7 @@ def create_router(settings: Settings) -> APIRouter:
                 "older_url": f"/chats/{telegram_chat_id}?page={page + 1}",
                 "reply_targets": reply_targets,
                 "account_user_id": request.app.state.account_user_id,
+                "terabox_enabled": request.app.state.settings.terabox_enabled,
             }
         )
         return templates.TemplateResponse(request, "conversation.html", context)
@@ -887,24 +890,154 @@ def create_router(settings: Settings) -> APIRouter:
         )
 
     @router.api_route("/media/{message_id}", methods=["GET", "HEAD"])
-    async def media_file(request: Request, message_id: int) -> FileResponse:
-        media_path, mime_type = await _completed_media(request, message_id)
-        return FileResponse(
-            media_path,
-            media_type=mime_type or "application/octet-stream",
-            filename=media_path.name,
-            content_disposition_type=(
-                "inline" if _preview_kind(mime_type) != "file" else "attachment"
+    async def media_file(request: Request, message_id: int) -> Response:
+        """Serve media file with byte-range caching for TeraBox mode.
+
+        For TeraBox mode with video_cache enabled, serves from local byte-range
+        cache when available, otherwise streams from FUSE mount while caching.
+        """
+        repository: DashboardRepository = request.app.state.dashboard
+        message = await repository.message(message_id)
+        if message is None or message.download_status != "completed" or not message.media_path:
+            raise HTTPException(status_code=404, detail="Completed media not found")
+
+        settings = request.app.state.settings
+        roots = await asyncio.to_thread(settings.media_storage_roots)
+        download_root, media_path = await asyncio.to_thread(
+            _resolved_media_paths, roots, message.media_path
+        )
+        if download_root != media_path and download_root not in media_path.parents:
+            raise HTTPException(status_code=403, detail="Media path is outside DOWNLOAD_DIR")
+        if not await asyncio.to_thread(media_path.is_file):
+            raise HTTPException(status_code=404, detail="Media file is missing")
+
+        # Get file size and mime type
+        file_size = await asyncio.to_thread(lambda: media_path.stat().st_size)
+        mime_type = message.mime_type or "application/octet-stream"
+
+        # Parse Range header
+        range_header = request.headers.get("range")
+        start = 0
+        end = file_size - 1
+        if range_header:
+            try:
+                range_part = range_header.replace("bytes=", "")
+                range_start, range_end = range_part.split("-")
+                start = int(range_start) if range_start else 0
+                end = int(range_end) if range_end else file_size - 1
+            except (ValueError, AttributeError):
+                pass
+        start = max(0, min(start, file_size - 1))
+        end = max(start, min(end, file_size - 1))
+        content_length = end - start + 1
+
+        # Check if video cache is enabled and this is a video
+        is_video = mime_type and mime_type.casefold().startswith("video/")
+        video_cache = getattr(request.app.state, "video_cache", None)
+        cache_enabled = is_video and video_cache is not None and settings.video_cache_dir
+
+        async def stream_from_cache_or_fuse() -> AsyncGenerator[bytes, None]:
+            """Stream bytes from cache or FUSE, caching as we go."""
+
+            def _read_chunk(path: Path, offset: int, size: int) -> bytes:
+                with path.open("rb") as f:
+                    f.seek(offset)
+                    return f.read(size)
+
+            if not cache_enabled:
+                # No cache - stream directly from FUSE
+                remaining = content_length
+                chunk_size = 64 * 1024
+                current_pos = start
+                while remaining > 0:
+                    read_size = min(chunk_size, remaining)
+                    chunk = await asyncio.to_thread(_read_chunk, media_path, current_pos, read_size)
+                    if not chunk:
+                        break
+                    yield chunk
+                    current_pos += len(chunk)
+                    remaining -= len(chunk)
+                return
+
+            # Try to serve from cache first
+            cached = await video_cache.get_range(message_id, start, end)
+            if cached is not None:
+                # Fully cached - serve from cache
+                yield cached
+                return
+
+            # Not fully cached - stream from FUSE while caching
+            chunk_size = 64 * 1024
+            remaining = content_length
+            current_pos = start
+
+            while remaining > 0:
+                read_size = min(chunk_size, remaining)
+                chunk = await asyncio.to_thread(_read_chunk, media_path, current_pos, read_size)
+                if not chunk:
+                    break
+
+                # Cache this chunk
+                cache_chunk_start = (current_pos // chunk_size) * chunk_size
+                await video_cache.store_range(message_id, cache_chunk_start, chunk)
+
+                yield chunk
+                current_pos += len(chunk)
+                remaining -= len(chunk)
+
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(content_length),
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Content-Disposition": (
+                f'inline; filename="{media_path.name}"'
+                if _preview_kind(mime_type) != "file"
+                else f'attachment; filename="{media_path.name}"'
             ),
+        }
+        if range_header:
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            status_code = 206
+        else:
+            status_code = 200
+
+        return StreamingResponse(
+            stream_from_cache_or_fuse(),
+            status_code=status_code,
+            media_type=mime_type,
+            headers=headers,
         )
 
     @router.api_route("/media/{message_id}/variant", methods=["GET", "HEAD"])
     async def media_variant(request: Request, message_id: int) -> FileResponse:
-        """Serve the playable H.264 variant of a video once transcoding is done.
+        """Serve the playable H.264 variant of a video.
 
-        H.264 originals are served as-is; HEVC files return 404 until their
-        cached variant exists, and the player polls the status endpoint.
+        In TeraBox mode with HEVC transcoding, the variant is stored at a
+        predictable path alongside the original. In local mode, the transcode
+        manager handles on-demand transcoding.
         """
+        repository: DashboardRepository = request.app.state.dashboard
+        message = await repository.message(message_id)
+        if message is None or message.download_status != "completed":
+            raise HTTPException(status_code=404, detail="Completed media not found")
+
+        # Check for pre-generated variant path (TeraBox mode with HEVC transcode)
+        if message.media_variant_path:
+            roots = await asyncio.to_thread(request.app.state.settings.media_storage_roots)
+            download_root, variant_path = await asyncio.to_thread(
+                _resolved_media_paths, roots, message.media_variant_path
+            )
+            if download_root != variant_path and download_root not in variant_path.parents:
+                raise HTTPException(status_code=403, detail="Variant path is outside DOWNLOAD_DIR")
+            if await asyncio.to_thread(variant_path.is_file):
+                return FileResponse(
+                    variant_path,
+                    media_type="video/mp4",
+                    filename=variant_path.name,
+                    content_disposition_type="inline",
+                )
+
+        # Fallback: use transcode manager for local mode (on-demand transcode)
         media_path, _ = await _completed_media(request, message_id)
         service: MediaVariantService = request.app.state.media_variants
         playable = await service.playable_path(media_path)
@@ -940,12 +1073,13 @@ def create_router(settings: Settings) -> APIRouter:
         )
 
     @router.get("/media/{message_id}/thumb")
-    async def media_thumbnail(request: Request, message_id: int) -> FileResponse:
-        """Serve a local WebP thumbnail for fast gallery loading.
+    async def media_thumbnail(
+        request: Request, message_id: int, poster: bool = False
+    ) -> FileResponse:
+        """Serve a local WebP thumbnail or poster for fast gallery loading.
 
-        In TeraBox mode, thumbnails are generated at download time and cached
-        locally. If the thumbnail is missing, fall back to the full media file
-        from the FUSE mount.
+        In TeraBox mode, thumbnails/posters are generated at download time and cached
+        locally. If missing, fall back to the full media file from the FUSE mount.
         """
         repository: DashboardRepository = request.app.state.dashboard
         message = await repository.message(message_id)
@@ -955,11 +1089,13 @@ def create_router(settings: Settings) -> APIRouter:
         # Check local thumbnail cache first
         settings = request.app.state.settings
         if settings.thumbnail_cache_dir:
-            thumb_path = (
-                settings.thumbnail_cache_dir.expanduser().resolve()
-                / str(message.telegram_chat_id)
-                / f"{message_id}.webp"
+            cache_root = settings.thumbnail_cache_dir.expanduser().resolve() / str(
+                message.telegram_chat_id
             )
+            if poster:
+                thumb_path = cache_root / f"{message_id}.poster.webp"
+            else:
+                thumb_path = cache_root / f"{message_id}.webp"
             if await asyncio.to_thread(thumb_path.is_file):
                 return FileResponse(
                     thumb_path,
@@ -971,7 +1107,7 @@ def create_router(settings: Settings) -> APIRouter:
                     },
                 )
 
-        # Fallback: serve from FUSE mount (full image)
+        # Fallback: serve from FUSE mount (full image/video)
         media_path, mime_type = await _completed_media(request, message_id)
         return FileResponse(
             media_path,

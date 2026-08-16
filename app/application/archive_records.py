@@ -18,6 +18,7 @@ class MessageSnapshot:
     telegram_message_id: int
     has_media: bool
     media_path: str | None
+    media_variant_path: str | None
     media_size: int | None
     download_status: str
     download_attempts: int

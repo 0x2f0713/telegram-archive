@@ -27,6 +27,7 @@ def _snapshot(message: Message) -> MessageSnapshot:
         telegram_message_id=message.telegram_message_id,
         has_media=message.has_media,
         media_path=message.media_path,
+        media_variant_path=message.media_variant_path,
         media_size=message.media_size,
         download_status=message.download_status,
         download_attempts=message.download_attempts,
@@ -303,20 +304,23 @@ class ArchiveRepository:
             )
 
     async def mark_download_completed(
-        self, message_id: int, media_path: Path, media_size: int
+        self,
+        message_id: int,
+        media_path: Path,
+        media_size: int,
+        variant_mount_path: str | None = None,
     ) -> None:
         async with self.database.transaction() as session:
-            await session.execute(
-                update(Message)
-                .where(Message.id == message_id)
-                .values(
-                    download_status=DownloadState.COMPLETED.value,
-                    download_error=None,
-                    media_path=str(media_path),
-                    media_size=media_size,
-                    updated_at=utc_now(),
-                )
-            )
+            values = {
+                "download_status": DownloadState.COMPLETED.value,
+                "download_error": None,
+                "media_path": str(media_path),
+                "media_size": media_size,
+                "updated_at": utc_now(),
+            }
+            if variant_mount_path is not None:
+                values["media_variant_path"] = variant_mount_path
+            await session.execute(update(Message).where(Message.id == message_id).values(values))
 
     async def mark_download_skipped(self, message_id: int, reason: str) -> None:
         async with self.database.transaction() as session:

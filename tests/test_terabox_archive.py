@@ -35,7 +35,9 @@ class RecordingRepository:
     async def mark_download_start(self, _message_id: int, _path: Path) -> None:
         return None
 
-    async def mark_download_completed(self, _message_id: int, path: Path, size: int) -> None:
+    async def mark_download_completed(
+        self, _message_id: int, path: Path, size: int, _variant_mount_path: str | None = None
+    ) -> None:
         self.completed.append((path, size))
 
     async def mark_download_skipped(self, _message_id: int, reason: str) -> None:
@@ -91,6 +93,7 @@ def _record(telegram_chat_id: int) -> MessageSnapshot:
         telegram_message_id=42,
         has_media=True,
         media_path=None,
+        media_variant_path=None,
         media_size=None,
         download_status="failed",
         download_attempts=0,

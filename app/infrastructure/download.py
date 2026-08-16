@@ -18,7 +18,9 @@ from app.infrastructure.ffmpeg import (
     extract_poster,
     extract_thumbnail,
     probe_capabilities,
+    probe_video_codec,
     remux_faststart,
+    transcode_hevc_to_h264,
 )
 from app.infrastructure.persistence.repository import ArchiveRepository
 from app.infrastructure.terabox import TeraBoxError, UploadReceipt
@@ -58,16 +60,73 @@ class MediaDownloader:
             self._capabilities = await probe_capabilities(self.settings)
         return self._capabilities
 
-    async def _optimize(self, target: Path) -> None:
-        """Remux for instant playback and cache a poster frame when enabled."""
+    async def _optimize(self, target: Path, record: MessageSnapshot | None = None) -> Path | None:
+        """Remux for instant playback, transcode HEVC, and cache a poster frame when enabled.
+
+        In TeraBox mode: faststart remux + HEVC→H.264 transcode + poster to local thumbnail cache.
+        Returns the path to the H.264 variant if transcoded, else None.
+        In local mode: faststart remux + poster next to video file.
+        """
         capabilities = await self._ffmpeg()
         if not capabilities.available:
-            return
+            return None
         if self.settings.media_faststart:
             await remux_faststart(self.settings, capabilities, target)
-        if self.settings.media_variants and target.suffix.casefold() in _VIDEO_SUFFIXES:
-            poster = target.with_name(f"{target.stem}{POSTER_SUFFIX}")
-            await extract_poster(self.settings, capabilities, target, poster)
+
+        is_terabox = self.uploader is not None
+        variant_path: Path | None = None
+
+        if target.suffix.casefold() in _VIDEO_SUFFIXES:
+            # HEVC to H.264 transcode in TeraBox mode
+            if (
+                is_terabox
+                and self.settings.terabox_transcode_hevc
+                and capabilities.can_transcode_hevc
+            ):
+                codec = await probe_video_codec(self.settings, capabilities, target)
+                if codec == "hevc":
+                    variant_path = target.with_name(f"{target.stem}.h264.mp4")
+                    await transcode_hevc_to_h264(self.settings, capabilities, target, variant_path)
+
+            # Poster generation
+            if is_terabox and self.settings.terabox_generate_posters:
+                if self.settings.thumbnail_cache_dir and record is not None:
+                    await self._generate_poster(record, target, capabilities)
+            elif self.settings.media_variants:
+                poster = target.with_name(f"{target.stem}{POSTER_SUFFIX}")
+                await extract_poster(self.settings, capabilities, target, poster)
+
+        return variant_path
+
+    async def _generate_poster(
+        self, record: MessageSnapshot, source: Path, capabilities: FfmpegCapabilities
+    ) -> None:
+        """Generate a WebP poster frame for a video in TeraBox mode."""
+        if not self.settings.thumbnail_cache_dir:
+            return
+        poster_dir = self.settings.thumbnail_cache_dir.expanduser().resolve() / str(
+            record.telegram_chat_id
+        )
+        try:
+            poster_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("Could not create poster dir %s: %s", poster_dir, exc)
+            return
+        poster_path = poster_dir / f"{record.id}.poster.webp"
+        if await asyncio.to_thread(poster_path.is_file):
+            return  # Already exists
+        try:
+            # Extract frame at 1s, scale to max 480px width, WebP quality 75
+            await extract_thumbnail(
+                self.settings,
+                capabilities,
+                source,
+                poster_path,
+                480,  # max dimension for poster
+                75,
+            )
+        except Exception as exc:
+            logger.warning("Poster generation failed for %s: %s", source, exc)
 
     async def download(
         self,
@@ -91,8 +150,13 @@ class MediaDownloader:
                     if not downloaded_path or not await asyncio.to_thread(temp_path.is_file):
                         raise OSError("Telegram returned no completed media file")
                     size = await asyncio.to_thread(self._finalize, temp_path, target)
+                    # Optimize (faststart, poster, HEVC transcode) BEFORE upload in TeraBox mode
+                    # so the optimized file gets uploaded
+                    variant_path = await self._optimize(target, record)
                     if self.uploader is not None:
-                        return await self._publish_to_uploader(record, target, progress)
+                        return await self._publish_to_uploader(
+                            record, target, progress, variant_path
+                        )
                     await self._optimize(target)
                     size = await asyncio.to_thread(self._current_size, target)
                     await self.repository.mark_download_completed(record.id, target, size)
@@ -151,6 +215,7 @@ class MediaDownloader:
         record: MessageSnapshot,
         target: Path,
         progress: DownloadProgressCallback | None,
+        variant_path: Path | None = None,
     ) -> DownloadResult:
         """Upload a just-finalized file; on failure keep the buffer file.
 
@@ -173,7 +238,22 @@ class MediaDownloader:
             receipt.size,
             receipt.md5,
         )
-        await self.repository.mark_download_completed(record.id, receipt.mount_path, receipt.size)
+        variant_mount_path: str | None = None
+        if variant_path is not None and self.settings.terabox_store_both:
+            try:
+                variant_receipt = await self.uploader.upload(variant_path, progress)
+                variant_mount_path = variant_receipt.mount_path
+                logger.info(
+                    "Uploaded H.264 variant %s to TeraBox (%s bytes, md5=%s)",
+                    variant_receipt.remote_path,
+                    variant_receipt.size,
+                    variant_receipt.md5,
+                )
+            except Exception as exc:
+                logger.warning("Failed to upload H.264 variant: %s", exc)
+        await self.repository.mark_download_completed(
+            record.id, receipt.mount_path, receipt.size, variant_mount_path
+        )
         # Generate local thumbnail for fast gallery loading in TeraBox mode
         if self.settings.thumbnail_cache_dir:
             await self._generate_thumbnail(record, target)
@@ -183,6 +263,11 @@ class MediaDownloader:
             # The record is already completed; a leftover buffer is republished
             # via rapid-upload dedupe and removed on the next pass.
             logger.warning("Could not remove uploaded buffer %s: %s", target, exc)
+        if variant_path is not None:
+            try:
+                await asyncio.to_thread(variant_path.unlink, True)
+            except OSError:
+                pass
         return DownloadResult(True, receipt.mount_path, receipt.size)
 
     async def _generate_thumbnail(self, record: MessageSnapshot, source: Path) -> None:

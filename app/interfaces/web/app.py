@@ -42,6 +42,7 @@ from app.infrastructure.terabox import (
     create_terabox_client,
 )
 from app.infrastructure.transcode import VariantManager
+from app.infrastructure.video_cache import VideoRangeCache
 from app.interfaces.web.auth import TelegramQrAuthManager
 from app.interfaces.web.commands import OperationCommands
 from app.interfaces.web.presentation import templates
@@ -219,6 +220,16 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
                 )
             except ConfigurationError as exc:
                 logger.error("TeraBox storage unavailable: %s", exc)
+
+        # Initialize video range cache for TeraBox mode seeking optimization
+        video_cache_dir = overridden.video_cache_dir
+        video_cache_max_size = overridden.video_cache_max_size_gb * 1024 * 1024 * 1024
+        video_cache_max_age = overridden.video_cache_max_age_days * 24 * 3600
+        app.state.video_cache = VideoRangeCache(
+            video_cache_dir, video_cache_max_size, video_cache_max_age
+        )
+        await app.state.video_cache.initialize()
+
         app.state.csrf_token = secrets.token_urlsafe(32)
         app.state.telegram_auth = TelegramQrAuthManager(overridden)
         app.state.web_session = web_session

@@ -15,7 +15,9 @@ class RecordingRepository:
     async def mark_download_start(self, _message_id: int, _path: Path) -> None:
         self.started += 1
 
-    async def mark_download_completed(self, _message_id: int, _path: Path, _size: int) -> None:
+    async def mark_download_completed(
+        self, _message_id: int, _path: Path, _size: int, _variant_mount_path: str | None = None
+    ) -> None:
         self.completed += 1
 
     async def mark_download_failed(self, _message_id: int, error: str) -> None:
@@ -174,7 +176,9 @@ async def test_download_records_completion_before_removing_buffer(tmp_path: Path
             super().__init__()
             self.buffer_present_at_completion: bool | None = None
 
-        async def mark_download_completed(self, _message_id, _path, _size) -> None:
+        async def mark_download_completed(
+            self, _message_id, _path, _size, _variant_mount_path=None
+        ) -> None:
             self.buffer_present_at_completion = target.is_file()
             await super().mark_download_completed(_message_id, _path, _size)
 

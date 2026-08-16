@@ -64,6 +64,7 @@ class MessageView:
     has_media: bool
     media_type: str | None
     media_path: str | None
+    media_variant_path: str | None
     media_size: int | None
     mime_type: str | None
     filename: str | None

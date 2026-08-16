@@ -740,3 +740,27 @@ def generate_thumbnails_command(
             await database.close()
 
     _run(command())
+
+
+@app.command("clear-video-cache")
+def clear_video_cache_command() -> None:
+    """Clear the local video byte-range cache (TeraBox mode)."""
+
+    async def command() -> None:
+        settings = _settings()
+        if not settings.video_cache_dir:
+            raise ConfigurationError("VIDEO_CACHE_DIR is not configured")
+        database = Database(settings.database_url)
+        from app.infrastructure.video_cache import VideoRangeCache
+
+        cache = VideoRangeCache(
+            settings.video_cache_dir,
+            settings.video_cache_max_size_gb * 1024 * 1024 * 1024,
+            settings.video_cache_max_age_days * 24 * 3600,
+        )
+        await cache.initialize()
+        await cache.clear()
+        console.print("[green]Video cache cleared.[/green]")
+        await database.close()
+
+    _run(command())

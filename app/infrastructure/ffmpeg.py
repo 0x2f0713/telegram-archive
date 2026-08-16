@@ -392,3 +392,61 @@ def _walk_top_boxes(handle: object, size: int) -> int:
             else:
                 cursor += box_size
     return size
+
+
+async def transcode_hevc_to_h264(
+    settings: Settings,
+    capabilities: FfmpegCapabilities,
+    source: Path,
+    target: Path,
+) -> bool:
+    """Transcode an HEVC video to H.264 with faststart.
+
+    Returns True on success, False on failure.
+    """
+    if not capabilities.available or not capabilities.can_transcode_hevc:
+        return False
+    temp = target.with_name(f"{target.name}.part")
+    try:
+        temp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    encoder = capabilities.preferred_h264_encoder()
+    if not encoder:
+        logger.warning("No H.264 encoder available for HEVC transcode")
+        return False
+    args: list[str] = []
+    if hw_decode_enabled(settings, capabilities):
+        args += ["-hwaccel", "rkmpp"]
+    args += [
+        "-y",
+        "-i",
+        str(source),
+        "-c:v",
+        encoder,
+        "-preset",
+        "medium",
+        "-crf",
+        "23",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        "-f",
+        "mp4",
+        str(temp),
+    ]
+    returncode, _, stderr = await _run(capabilities.ffmpeg_bin, args, settings)
+    if returncode != 0:
+        logger.warning("HEVC to H.264 transcode failed for %s: %s", source, stderr[-500:])
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    try:
+        os.replace(temp, target)
+    except OSError as exc:
+        logger.warning("HEVC transcode replace failed for %s: %s", target, exc)
+        return False
+    return True
