@@ -47,9 +47,7 @@ logger = logging.getLogger(__name__)
 
 async def _effective_settings(settings: Settings, database: Database) -> Settings:
     """Return settings with durable web overrides applied, or the originals."""
-    return (
-        await load_runtime_settings(settings, RuntimeSettingsRepository(database))
-    ).settings
+    return (await load_runtime_settings(settings, RuntimeSettingsRepository(database))).settings
 
 
 def _date(value: datetime | None) -> str:

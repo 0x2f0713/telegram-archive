@@ -16,6 +16,7 @@ from app.config import Settings
 from app.infrastructure.ffmpeg import (
     FfmpegCapabilities,
     extract_poster,
+    extract_thumbnail,
     probe_capabilities,
     remux_faststart,
 )
@@ -91,7 +92,7 @@ class MediaDownloader:
                         raise OSError("Telegram returned no completed media file")
                     size = await asyncio.to_thread(self._finalize, temp_path, target)
                     if self.uploader is not None:
-                        return await self._publish_to_uploader(record.id, target, progress)
+                        return await self._publish_to_uploader(record, target, progress)
                     await self._optimize(target)
                     size = await asyncio.to_thread(self._current_size, target)
                     await self.repository.mark_download_completed(record.id, target, size)
@@ -147,7 +148,7 @@ class MediaDownloader:
 
     async def _publish_to_uploader(
         self,
-        message_id: int,
+        record: MessageSnapshot,
         target: Path,
         progress: DownloadProgressCallback | None,
     ) -> DownloadResult:
@@ -160,11 +161,11 @@ class MediaDownloader:
         try:
             receipt = await self.uploader.upload(target, progress)
         except asyncio.CancelledError:
-            await self.repository.mark_download_failed(message_id, "Upload interrupted")
+            await self.repository.mark_download_failed(record.id, "Upload interrupted")
             raise
         except TeraBoxError as exc:
             error = f"TeraBox upload failed: {exc}"
-            await self.repository.mark_download_failed(message_id, error)
+            await self.repository.mark_download_failed(record.id, error)
             return DownloadResult(False, target, None, error)
         logger.info(
             "Uploaded %s to TeraBox (%s bytes, md5=%s)",
@@ -172,7 +173,10 @@ class MediaDownloader:
             receipt.size,
             receipt.md5,
         )
-        await self.repository.mark_download_completed(message_id, receipt.mount_path, receipt.size)
+        await self.repository.mark_download_completed(record.id, receipt.mount_path, receipt.size)
+        # Generate local thumbnail for fast gallery loading in TeraBox mode
+        if self.settings.thumbnail_cache_dir:
+            await self._generate_thumbnail(record, target)
         try:
             await asyncio.to_thread(target.unlink, True)
         except OSError as exc:
@@ -180,6 +184,36 @@ class MediaDownloader:
             # via rapid-upload dedupe and removed on the next pass.
             logger.warning("Could not remove uploaded buffer %s: %s", target, exc)
         return DownloadResult(True, receipt.mount_path, receipt.size)
+
+    async def _generate_thumbnail(self, record: MessageSnapshot, source: Path) -> None:
+        """Generate a WebP thumbnail for the downloaded media."""
+        if not self.settings.thumbnail_cache_dir:
+            return
+        capabilities = await self._ffmpeg()
+        if not capabilities.available:
+            return
+        thumb_dir = self.settings.thumbnail_cache_dir.expanduser().resolve() / str(
+            record.telegram_chat_id
+        )
+        try:
+            thumb_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("Could not create thumbnail dir %s: %s", thumb_dir, exc)
+            return
+        thumb_path = thumb_dir / f"{record.id}.webp"
+        if await asyncio.to_thread(thumb_path.is_file):
+            return  # Already exists
+        try:
+            await extract_thumbnail(
+                self.settings,
+                capabilities,
+                source,
+                thumb_path,
+                self.settings.thumbnail_max_dimension,
+                self.settings.thumbnail_quality,
+            )
+        except Exception as exc:
+            logger.warning("Thumbnail generation failed for %s: %s", source, exc)
 
     async def publish_buffered(
         self,
@@ -193,5 +227,9 @@ class MediaDownloader:
         """
         if self.uploader is None:
             return None
+        record = await self.repository.get_message_by_id(message_id)
+        if record is None:
+            logger.warning("Cannot publish buffered file: message %s not found", message_id)
+            return None
         await self.repository.mark_download_start(message_id, buffered_path)
-        return await self._publish_to_uploader(message_id, buffered_path, progress)
+        return await self._publish_to_uploader(record, buffered_path, progress)

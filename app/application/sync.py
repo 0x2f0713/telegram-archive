@@ -262,9 +262,7 @@ async def sync_history(
                                     chat_messages=processed,
                                     messages_processed=total_messages,
                                     downloads_completed=total_downloads,
-                                    detail=(
-                                        f"Telegram requested a {wait_seconds}s FloodWait"
-                                    ),
+                                    detail=(f"Telegram requested a {wait_seconds}s FloodWait"),
                                 )
                             )
                         if await wait_or_stop(stop_event, wait_seconds):

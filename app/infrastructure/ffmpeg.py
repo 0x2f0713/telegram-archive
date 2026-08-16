@@ -259,9 +259,7 @@ async def extract_poster(
         "image2",
         str(temp),
     ]
-    returncode, _, stderr = await _run(
-        capabilities.ffmpeg_bin, args, settings
-    )
+    returncode, _, stderr = await _run(capabilities.ffmpeg_bin, args, settings)
     if returncode != 0:
         logger.warning("poster extraction failed for %s: %s", source, stderr[-500:])
         try:
@@ -273,6 +271,64 @@ async def extract_poster(
         os.replace(temp, target)
     except OSError as exc:
         logger.warning("poster replace failed for %s: %s", target, exc)
+        return False
+    return True
+
+
+async def extract_thumbnail(
+    settings: Settings,
+    capabilities: FfmpegCapabilities,
+    source: Path,
+    target: Path,
+    max_dimension: int = 320,
+    quality: int = 75,
+) -> bool:
+    """Extract a WebP thumbnail from an image or video into ``target``.
+
+    For images: scales down preserving aspect ratio.
+    For videos: extracts a frame at 1 second (or first keyframe) and scales.
+
+    The thumbnail is written to a temporary file and atomically replaced.
+    """
+    if not capabilities.available:
+        return False
+    temp = target.with_name(f"{target.name}.part")
+    try:
+        temp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    args: list[str] = []
+    if hw_decode_enabled(settings, capabilities):
+        args += ["-hwaccel", "rkmpp"]
+    # For videos, seek to 1s; for images, -ss has no effect
+    args += [
+        "-y",
+        "-ss",
+        "1",
+        "-i",
+        str(source),
+        "-frames:v",
+        "1",
+        "-vf",
+        f"scale='if(gt(iw,ih),-2,{max_dimension})':'if(gt(iw,ih),{max_dimension},-2)'",
+        "-q:v",
+        str(quality),
+        "-f",
+        "webp",
+        str(temp),
+    ]
+    returncode, _, stderr = await _run(capabilities.ffmpeg_bin, args, settings)
+    if returncode != 0:
+        logger.warning("thumbnail extraction failed for %s: %s", source, stderr[-500:])
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    try:
+        os.replace(temp, target)
+    except OSError as exc:
+        logger.warning("thumbnail replace failed for %s: %s", target, exc)
         return False
     return True
 

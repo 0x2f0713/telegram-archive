@@ -24,9 +24,7 @@ def _safe_next_path(value: str | None) -> str:
 def _browser_authenticated(request: Request) -> bool:
     session: TelegramWebSession | None = getattr(request.app.state, "web_session", None)
     account_id = getattr(request.app.state, "account_user_id", None)
-    return bool(
-        session and session.valid(request.cookies.get(session.cookie_name), account_id)
-    )
+    return bool(session and session.valid(request.cookies.get(session.cookie_name), account_id))
 
 
 def _set_browser_cookie(request: Request, response: RedirectResponse, account_id: int) -> None:

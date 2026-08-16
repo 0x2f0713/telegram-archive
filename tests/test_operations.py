@@ -287,10 +287,7 @@ async def test_concurrent_progress_updates_are_coalesced_and_serialized(
     assert (await manager.get(job_id))["detail"] == "Burst 39"
 
     await asyncio.gather(
-        *(
-            manager._progress(job_id, force=True, detail=f"Forced {index}")
-            for index in range(20)
-        )
+        *(manager._progress(job_id, force=True, detail=f"Forced {index}") for index in range(20))
     )
     await manager._progress(job_id, force=True, detail="Final progress")
     durable = await repository.get(job_id)
@@ -401,9 +398,7 @@ async def test_retry_starts_new_operation_with_original_parameters(tmp_path: Pat
     assert any(
         f"Retry started as operation #{retried_id}" in log["message"] for log in original_logs
     )
-    assert any(
-        f"Retrying operation #{original_id}" in log["message"] for log in retry_logs
-    )
+    assert any(f"Retrying operation #{original_id}" in log["message"] for log in retry_logs)
     await manager.shutdown()
     await database.close()
 

@@ -159,6 +159,14 @@ class Settings(BaseSettings):
     #: JPEG poster thumbnails in galleries and players.
     media_variants: bool = True
 
+    #: Local directory for cached WebP thumbnails (used in TeraBox mode to
+    #: serve gallery thumbnails without hitting the FUSE mount).
+    thumbnail_cache_dir: Path = Path("data/thumbnails")
+    #: Maximum pixel dimension (width or height) for generated thumbnails.
+    thumbnail_max_dimension: int = Field(default=320, ge=64, le=1280)
+    #: WebP quality for thumbnails (1-100).
+    thumbnail_quality: int = Field(default=75, ge=10, le=100)
+
     #: Hardware decode mode for ffmpeg child processes. ``auto``/``rkmpp``
     #: enables MPP hardware decode when the h264_rkmpp encoder exists; ``none``
     #: forces software decode (hardware encoding is unaffected). Set to

@@ -444,9 +444,7 @@ async def test_variant_manager_remote_transcode_falls_back_locally(
         return _FakeProc(returncode=0, stdout=[b"out_time_us=1000000\n"])
 
     monkeypatch.setattr("app.infrastructure.transcode.asyncio.create_subprocess_exec", fake_exec)
-    returncode, _ = await manager._run_transcode(
-        source, temp, ["-c:v", "h264_rkmpp"], {}
-    )
+    returncode, _ = await manager._run_transcode(source, temp, ["-c:v", "h264_rkmpp"], {})
 
     assert binaries.count("ssh") == 1
     assert binaries.count("ffmpeg") == 1
@@ -710,7 +708,8 @@ async def test_gallery_and_player_templates_guard_variant_artifacts(
     assert 'poster="/media/' in conversation.text
     assert 'poster="/media/' in detail.text
     assert disabled_gallery.status_code == 200
-    assert "media-grid-poster" not in disabled_gallery.text
+    # In TeraBox mode, video thumbnails are generated locally even when media_variants is disabled
+    assert "media-grid-poster" in disabled_gallery.text
     assert "data-variant-url" not in disabled_gallery.text
     assert "poster=" not in disabled_conversation.text
     assert "poster=" not in disabled_detail.text

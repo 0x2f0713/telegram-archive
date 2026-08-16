@@ -30,6 +30,7 @@ from app.domain.content import (
     normalize_content_types,
 )
 from app.infrastructure.download import MediaDownloader
+from app.infrastructure.ffmpeg import extract_thumbnail, probe_capabilities
 from app.infrastructure.persistence.database import Database
 from app.infrastructure.persistence.repository import ArchiveRepository
 from app.infrastructure.persistence.selection import ChatSelectionRepository
@@ -111,8 +112,7 @@ async def _terabox_doctor_checks(settings: Settings) -> tuple[list[tuple[str, st
             (
                 "TeraBox",
                 "PASS",
-                f"Authenticated; remote dir {client.remote_root}; "
-                f"{used} / {total} bytes used",
+                f"Authenticated; remote dir {client.remote_root}; {used} / {total} bytes used",
             )
         )
     except Exception as exc:
@@ -626,5 +626,117 @@ def doctor_command() -> None:
         console.print(table)
         if failed:
             raise typer.Exit(code=1)
+
+    _run(command())
+
+
+@app.command("generate-thumbnails")
+def generate_thumbnails_command(
+    chat: int | None = typer.Option(
+        None, "--chat", help="Only generate thumbnails for this chat ID."
+    ),
+    force: bool = typer.Option(False, "--force", help="Regenerate existing thumbnails."),
+    limit: int | None = typer.Option(
+        None, "--limit", min=1, help="Maximum thumbnails to generate."
+    ),
+) -> None:
+    """Generate local WebP thumbnails for archived media (TeraBox mode)."""
+
+    async def command() -> None:
+        settings = _settings()
+        if not settings.thumbnail_cache_dir:
+            raise ConfigurationError("THUMBNAIL_CACHE_DIR is not configured")
+        database = Database(settings.database_url)
+        try:
+            await database.initialize()
+            # Query completed media messages
+            from sqlalchemy import select
+
+            from app.domain import DownloadState
+            from app.infrastructure.persistence.models import Message
+
+            conditions = [
+                Message.download_status == DownloadState.COMPLETED.value,
+                Message.media_path.is_not(None),
+            ]
+            if chat is not None:
+                conditions.append(Message.telegram_chat_id == chat)
+            statement = select(Message).where(*conditions).order_by(Message.id)
+            if limit is not None:
+                statement = statement.limit(limit)
+
+            async with database.sessions() as session:
+                result = await session.execute(statement)
+                messages = result.scalars().all()
+
+            if not messages:
+                console.print("[yellow]No completed media messages found.[/yellow]")
+                return
+
+            capabilities = await probe_capabilities(settings)
+            if not capabilities.available:
+                raise ConfigurationError("ffmpeg/ffprobe not available; cannot generate thumbnails")
+
+            thumb_cache_root = settings.thumbnail_cache_dir.expanduser().resolve()
+            thumb_cache_root.mkdir(parents=True, exist_ok=True)
+
+            generated = 0
+            skipped = 0
+            failed = 0
+
+            with console.status("[bold green]Generating thumbnails...") as status:
+                for msg in messages:
+                    thumb_dir = thumb_cache_root / str(msg.telegram_chat_id)
+                    thumb_dir.mkdir(parents=True, exist_ok=True)
+                    thumb_path = thumb_dir / f"{msg.id}.webp"
+
+                    if thumb_path.is_file() and not force:
+                        skipped += 1
+                        continue
+
+                    # Resolve source media path
+                    roots = await asyncio.to_thread(settings.media_storage_roots)
+                    from app.interfaces.web.routes import _resolved_media_paths
+
+                    _, media_path = await asyncio.to_thread(
+                        _resolved_media_paths, roots, msg.media_path
+                    )
+                    if not await asyncio.to_thread(media_path.is_file):
+                        logger.warning(
+                            "Source media missing for message %s: %s", msg.id, media_path
+                        )
+                        failed += 1
+                        continue
+
+                    try:
+                        ok = await extract_thumbnail(
+                            settings,
+                            capabilities,
+                            media_path,
+                            thumb_path,
+                            settings.thumbnail_max_dimension,
+                            settings.thumbnail_quality,
+                        )
+                        if ok:
+                            generated += 1
+                            status.update(
+                                f"[bold green]Generated {generated}, skipped {skipped}, failed {failed}"
+                            )
+                        else:
+                            failed += 1
+                            status.update(
+                                f"[bold green]Generated {generated}, skipped {skipped}, failed {failed}"
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "Thumbnail generation failed for message %s: %s", msg.id, exc
+                        )
+                        failed += 1
+
+            console.print(
+                f"[green]Done:[/green] {generated} generated, {skipped} skipped, {failed} failed."
+            )
+        finally:
+            await database.close()
 
     _run(command())

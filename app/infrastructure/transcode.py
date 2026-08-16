@@ -233,14 +233,10 @@ class VariantManager:
     def _remote_command(self, remote_host: str, args: list[str]) -> list[str]:
         host_dir = self.settings.host_download_dir.strip()
         if not host_dir:
-            raise RuntimeError(
-                "HOST_DOWNLOAD_DIR is required when FFMPEG_REMOTE_HOST is set"
-            )
+            raise RuntimeError("HOST_DOWNLOAD_DIR is required when FFMPEG_REMOTE_HOST is set")
         container_dir = str(self.settings.download_dir)
         translated = [
-            host_dir + arg[len(container_dir) :]
-            if arg.startswith(container_dir)
-            else arg
+            host_dir + arg[len(container_dir) :] if arg.startswith(container_dir) else arg
             for arg in args
         ]
         if "-hwaccel" not in translated:
@@ -255,7 +251,10 @@ class VariantManager:
         if self.settings.ffmpeg_remote_identity.strip():
             command += ["-i", self.settings.ffmpeg_remote_identity.strip()]
         if self.settings.ffmpeg_remote_known_hosts.strip():
-            command += ["-o", f"UserKnownHostsFile={self.settings.ffmpeg_remote_known_hosts.strip()}"]
+            command += [
+                "-o",
+                f"UserKnownHostsFile={self.settings.ffmpeg_remote_known_hosts.strip()}",
+            ]
         return [
             *command,
             remote_host,

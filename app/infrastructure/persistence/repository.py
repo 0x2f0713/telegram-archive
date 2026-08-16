@@ -282,6 +282,12 @@ class ArchiveRepository:
             record = result.scalar_one_or_none()
             return _snapshot(record) if record else None
 
+    async def get_message_by_id(self, message_id: int) -> MessageSnapshot | None:
+        async with self.database.sessions() as session:
+            result = await session.execute(select(Message).where(Message.id == message_id))
+            record = result.scalar_one_or_none()
+            return _snapshot(record) if record else None
+
     async def mark_download_start(self, message_id: int, media_path: Path) -> None:
         async with self.database.transaction() as session:
             await session.execute(

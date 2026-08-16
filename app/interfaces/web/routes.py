@@ -939,6 +939,49 @@ def create_router(settings: Settings) -> APIRouter:
             content_disposition_type="inline",
         )
 
+    @router.get("/media/{message_id}/thumb")
+    async def media_thumbnail(request: Request, message_id: int) -> FileResponse:
+        """Serve a local WebP thumbnail for fast gallery loading.
+
+        In TeraBox mode, thumbnails are generated at download time and cached
+        locally. If the thumbnail is missing, fall back to the full media file
+        from the FUSE mount.
+        """
+        repository: DashboardRepository = request.app.state.dashboard
+        message = await repository.message(message_id)
+        if message is None or message.download_status != "completed":
+            raise HTTPException(status_code=404, detail="Completed media not found")
+
+        # Check local thumbnail cache first
+        settings = request.app.state.settings
+        if settings.thumbnail_cache_dir:
+            thumb_path = (
+                settings.thumbnail_cache_dir.expanduser().resolve()
+                / str(message.telegram_chat_id)
+                / f"{message_id}.webp"
+            )
+            if await asyncio.to_thread(thumb_path.is_file):
+                return FileResponse(
+                    thumb_path,
+                    media_type="image/webp",
+                    content_disposition_type="inline",
+                    headers={
+                        "Cache-Control": "public, max-age=31536000, immutable",
+                        "ETag": f'W/"{thumb_path.stat().st_mtime_ns}-{thumb_path.stat().st_size}"',
+                    },
+                )
+
+        # Fallback: serve from FUSE mount (full image)
+        media_path, mime_type = await _completed_media(request, message_id)
+        return FileResponse(
+            media_path,
+            media_type=mime_type or "application/octet-stream",
+            filename=media_path.name,
+            content_disposition_type=(
+                "inline" if _preview_kind(mime_type) != "file" else "attachment"
+            ),
+        )
+
     @router.get("/healthz")
     async def health(request: Request) -> dict[str, str]:
         await request.app.state.database.healthcheck()

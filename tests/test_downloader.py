@@ -47,7 +47,7 @@ async def test_interrupted_download_leaves_part_and_never_final(tmp_path: Path) 
     settings = Settings(_env_file=None, download_retries=1)
     downloader = MediaDownloader(settings, repository)  # type: ignore[arg-type]
     target = tmp_path / "archive" / "42_report.pdf"
-    record = type("Record", (), {"id": 1})()
+    record = type("Record", (), {"id": 1, "telegram_chat_id": 12345})()
 
     result = await downloader.download(record, InterruptedMessage(), target)  # type: ignore[arg-type]
 
@@ -63,7 +63,7 @@ async def test_successful_download_is_atomically_renamed(tmp_path: Path) -> None
     settings = Settings(_env_file=None, download_retries=1)
     downloader = MediaDownloader(settings, repository)  # type: ignore[arg-type]
     target = tmp_path / "42_report.pdf"
-    record = type("Record", (), {"id": 1})()
+    record = type("Record", (), {"id": 1, "telegram_chat_id": 12345})()
 
     result = await downloader.download(record, SuccessfulMessage(), target)  # type: ignore[arg-type]
 
@@ -83,7 +83,7 @@ async def test_download_forwards_per_file_progress(tmp_path: Path) -> None:
         updates.append((current, total))
 
     result = await downloader.download(
-        type("Record", (), {"id": 1})(),
+        type("Record", (), {"id": 1, "telegram_chat_id": 12345})(),
         ProgressMessage(),
         target,
         collect,
@@ -133,7 +133,7 @@ async def test_download_uploads_to_terabox_and_removes_local_copy(tmp_path: Path
     uploader = FakeUploader(settings.terabox_mount_dir)
     downloader = MediaDownloader(settings, repository, uploader)  # type: ignore[arg-type]
     target = settings.download_dir / "42_report.pdf"
-    record = type("Record", (), {"id": 1})()
+    record = type("Record", (), {"id": 1, "telegram_chat_id": 12345})()
 
     result = await downloader.download(record, SuccessfulMessage(), target)  # type: ignore[arg-type]
 
@@ -152,7 +152,7 @@ async def test_download_keeps_local_copy_when_upload_fails(tmp_path: Path) -> No
     uploader = FakeUploader(settings.terabox_mount_dir, error="boom")
     downloader = MediaDownloader(settings, repository, uploader)  # type: ignore[arg-type]
     target = settings.download_dir / "42_report.pdf"
-    record = type("Record", (), {"id": 1})()
+    record = type("Record", (), {"id": 1, "telegram_chat_id": 12345})()
 
     result = await downloader.download(record, SuccessfulMessage(), target)  # type: ignore[arg-type]
 
@@ -179,12 +179,10 @@ async def test_download_records_completion_before_removing_buffer(tmp_path: Path
             await super().mark_download_completed(_message_id, _path, _size)
 
     repository = OrderRepository()
-    downloader = MediaDownloader(
-        settings, repository, FakeUploader(settings.terabox_mount_dir)
-    )  # type: ignore[arg-type]
+    downloader = MediaDownloader(settings, repository, FakeUploader(settings.terabox_mount_dir))  # type: ignore[arg-type]
 
     result = await downloader.download(
-        type("Record", (), {"id": 1})(), SuccessfulMessage(), target
+        type("Record", (), {"id": 1, "telegram_chat_id": 12345})(), SuccessfulMessage(), target
     )  # type: ignore[arg-type]
 
     assert result.completed
