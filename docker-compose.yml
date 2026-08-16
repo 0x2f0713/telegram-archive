@@ -22,6 +22,12 @@ x-runtime-user: &runtime-user
   # Rockchip MPP device nodes are owned by host groups video(44)/render(109).
   group_add: ["44", "109"]
 
+# TeraBox storage mode: the host-side unidisk FUSE mount is exposed read-only
+# at /mnt/terabox so archived media can be streamed back from the cloud.
+# Downloads keep using the hard-drive DOWNLOAD_DIR as a temporary upload
+# buffer. The host mount must be up (terabox-drive/mount.sh -o allow_other)
+# and readable by ARCHIVER_UID. In local mode this bind is harmless and the
+# TERABOX_* variables are ignored.
 x-all-volumes: &all-volumes
   - ${ARCHIVER_DATA_DIR:-./data}:/app/data
   - ${ARCHIVER_DOWNLOADS_DIR:-./downloads}:/app/downloads
@@ -29,6 +35,8 @@ x-all-volumes: &all-volumes
   - ${FFPROBE_BIN:-/usr/bin/ffprobe}:/usr/local/bin/ffprobe:ro
   - ${FFMPEG_LIB_DIR:-./.ffmpeg-libs}:/opt/host-libs:ro
   - ${SSH_DIR:-/home/namhh/.ssh}:/app/.ssh:ro
+  - ${TERABOX_MOUNT_DIR:-/mnt/data/workspace/terabox-drive/mnt/terabox}:/mnt/terabox:ro
+  - ${TERABOX_PROFILE:-/mnt/data/workspace/terabox-drive/terabox.profile.json}:/app/terabox.profile.json:ro
 
 services:
   telegram-archiver:
@@ -41,6 +49,10 @@ services:
       TG_SESSION_NAME: /app/data/telegram_session
       DATABASE_URL: sqlite:////app/data/archive.db
       DOWNLOAD_DIR: /app/downloads
+      # STORAGE_MODE, TERABOX_NDUS, TERABOX_REMOTE_DIR,... arrive via .env;
+      # only the mount-point paths need a container-side translation.
+      TERABOX_MOUNT_DIR: /mnt/terabox
+      TERABOX_PROFILE: /app/terabox.profile.json
       FFMPEG_BIN: /usr/local/bin/ffmpeg
       FFPROBE_BIN: /usr/local/bin/ffprobe
       FFMPEG_LD_LIBRARY_PATH: /opt/host-libs
@@ -67,6 +79,8 @@ services:
       TG_SESSION_NAME: /app/data/telegram_session
       DATABASE_URL: sqlite:////app/data/archive.db
       DOWNLOAD_DIR: /app/downloads
+      TERABOX_MOUNT_DIR: /mnt/terabox
+      TERABOX_PROFILE: /app/terabox.profile.json
       WEB_HOST: 0.0.0.0
       WEB_PORT: 8686
       FFMPEG_BIN: /usr/local/bin/ffmpeg

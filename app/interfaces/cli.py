@@ -45,6 +45,7 @@ from app.infrastructure.telegram.client import (
     resolve_accessible_chats,
 )
 from app.infrastructure.telegram.translation import content_types_of, message_data
+from app.infrastructure.terabox import TeraBoxUploader, create_terabox_client
 from app.utils.logging import configure_logging, format_bytes
 
 console = Console()
@@ -76,12 +77,61 @@ def _chat_selection_service(
 
 async def _effective_settings(settings: Settings, database: Database) -> Settings:
     """Return settings with durable web overrides applied, or the originals."""
+
     effective = (
         await load_runtime_settings(settings, RuntimeSettingsRepository(database))
     ).settings
+    effective = effective.with_terabox_policy()
     if effective is not settings:
         configure_logging(effective.log_level)
     return effective
+
+
+def _terabox_uploader(settings: Settings) -> TeraBoxUploader | None:
+    """Build the remote-storage adapter when TeraBox mode is enabled."""
+
+    if not settings.terabox_enabled:
+        return None
+    return TeraBoxUploader(settings, create_terabox_client(settings))
+
+
+async def _terabox_doctor_checks(settings: Settings) -> tuple[list[tuple[str, str, str]], bool]:
+    """Validate ndus auth, remote archive folder, and the read-only mount."""
+
+    checks: list[tuple[str, str, str]] = []
+    failed = False
+    client = None
+    try:
+        client = create_terabox_client(settings)
+        await client.login_check()
+        await client.ensure_remote_dir(settings.terabox_remote_root)
+        total, used = await client.quota()
+        checks.append(
+            (
+                "TeraBox",
+                "PASS",
+                f"Authenticated; remote dir {settings.terabox_remote_root}; "
+                f"{used} / {total} bytes used",
+            )
+        )
+    except Exception as exc:
+        failed = True
+        checks.append(("TeraBox", "FAIL", f"{type(exc).__name__}: {exc}"))
+    finally:
+        if client is not None:
+            await client.aclose()
+    if settings.terabox_mount_dir.expanduser().is_dir():
+        checks.append(("TeraBox mount", "PASS", str(settings.terabox_mount_dir)))
+    else:
+        failed = True
+        checks.append(
+            (
+                "TeraBox mount",
+                "FAIL",
+                f"{settings.terabox_mount_dir} is missing; start the unidisk mount first",
+            )
+        )
+    return checks, failed
 
 
 async def _effective_web_settings(settings: Settings) -> Settings:
@@ -134,7 +184,7 @@ async def _archive_stack(
     await database.initialize()
     repository = ArchiveRepository(database)
     effective = await _effective_settings(settings, database)
-    downloader = MediaDownloader(effective, repository)
+    downloader = MediaDownloader(effective, repository, _terabox_uploader(effective))
     return (
         database,
         repository,
@@ -521,6 +571,11 @@ def doctor_command() -> None:
         except OSError as exc:
             failed = True
             checks.append(("Downloads", "FAIL", f"{type(exc).__name__}: {exc}"))
+
+        if settings.terabox_enabled:
+            terabox_checks, terabox_failed = await _terabox_doctor_checks(settings)
+            checks.extend(terabox_checks)
+            failed = failed or terabox_failed
 
         if settings.tg_api_id and settings.tg_api_hash:
             client = None

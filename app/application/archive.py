@@ -76,6 +76,13 @@ class ArchiveDownloader(Protocol):
         progress: Callable[[int, int], None] | None = None,
     ) -> DownloadResult: ...
 
+    async def publish_buffered(
+        self,
+        message_id: int,
+        buffered_path: Path,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> DownloadResult | None: ...
+
 
 class ArchiveService:
     def __init__(
@@ -131,7 +138,27 @@ class ArchiveService:
             recorded_path = Path(record.media_path) if record.media_path else None
             recorded_exists = bool(recorded_path and await asyncio.to_thread(recorded_path.is_file))
             completed_path = recorded_path if recorded_exists else None
-            if not completed_path and await asyncio.to_thread(target.is_file):
+
+            if self.settings.terabox_enabled:
+                # A buffer file in DOWNLOAD_DIR means the bytes are local but
+                # possibly never uploaded (crash between download and upload,
+                # or a failed unlink after a completed upload). Publish it;
+                # the rapid-upload dedupe makes re-publishing effectively free,
+                # and publish_buffered removes the copy afterwards.
+                if await asyncio.to_thread(target.is_file):
+                    upload_progress = None
+                    if self.download_progress:
+
+                        def upload_progress(current: int, total: int) -> None:
+                            self.download_progress(target.name, current, total)
+
+                    publish_result = await self.downloader.publish_buffered(
+                        record.id, target, upload_progress
+                    )
+                    if publish_result is not None and publish_result.completed:
+                        return ProcessResult(created, True, False)
+                    return ProcessResult(created, False, False)
+            elif not completed_path and await asyncio.to_thread(target.is_file):
                 completed_path = target
             if completed_path:
                 size = (await asyncio.to_thread(completed_path.stat)).st_size
@@ -296,9 +323,7 @@ class ArchiveService:
                                         total=total,
                                         attempted=attempted,
                                         completed=completed,
-                                        detail=(
-                                            f"Telegram requested a {wait_seconds}s FloodWait"
-                                        ),
+                                        detail=(f"Telegram requested a {wait_seconds}s FloodWait"),
                                         chat_id=candidate.telegram_chat_id,
                                         chat_title=chat_title,
                                     )

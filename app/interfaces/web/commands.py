@@ -46,6 +46,7 @@ from app.infrastructure.telegram.client import (
     resolve_accessible_chats,
 )
 from app.infrastructure.telegram.translation import content_types_of, message_data
+from app.infrastructure.terabox import TeraBoxClient, TeraBoxUploader, create_terabox_client
 from app.infrastructure.transcode import POSTER_SUFFIX, is_faststart
 from app.utils.logging import format_bytes
 
@@ -91,6 +92,18 @@ class OperationCommands:
             resolve_accessible_chats,
         )
 
+    def _terabox_client(self) -> TeraBoxClient:
+        """Raw TeraBox client for health checks (doctor, quota)."""
+
+        return create_terabox_client(self.settings)
+
+    def _terabox_uploader(self) -> TeraBoxUploader | None:
+        """Build the remote-storage adapter when TeraBox mode is enabled."""
+
+        if not self.settings.terabox_enabled:
+            return None
+        return TeraBoxUploader(self.settings, create_terabox_client(self.settings))
+
     @staticmethod
     def _content_types(parameters: Mapping[str, Any]) -> frozenset[ContentType] | None:
         raw_values = parameters.get("content_types")
@@ -113,7 +126,7 @@ class OperationCommands:
         """Compose workers against the web process's single SQLite engine."""
 
         repository = ArchiveRepository(self.database)
-        downloader = MediaDownloader(self.settings, repository)
+        downloader = MediaDownloader(self.settings, repository, self._terabox_uploader())
         return (
             repository,
             ArchiveService(
@@ -483,7 +496,7 @@ class OperationCommands:
             await client.disconnect()
 
     async def doctor(self, context: OperationContext) -> None:
-        checks_total = 4
+        checks_total = 5 if self.settings.terabox_enabled else 4
         failed = False
         await context.progress(
             force=True,
@@ -530,6 +543,36 @@ class OperationCommands:
         if context.stop_event.is_set():
             return
 
+        current_check = 3
+        if self.settings.terabox_enabled:
+            current_check += 1
+            terabox_client = self._terabox_client()
+            try:
+                await terabox_client.login_check()
+                await terabox_client.ensure_remote_dir(self.settings.terabox_remote_root)
+                total, used = await terabox_client.quota()
+                await context.log(f"PASS · TeraBox authenticated; {used} / {total} bytes used")
+            except Exception as exc:
+                failed = True
+                await context.log(f"FAIL · TeraBox: {type(exc).__name__}: {exc}", "ERROR")
+            finally:
+                await terabox_client.aclose()
+            mount_dir = self.settings.terabox_mount_dir.expanduser()
+            if await asyncio.to_thread(mount_dir.is_dir):
+                await context.log(f"PASS · TeraBox mount is present at {mount_dir}")
+            else:
+                failed = True
+                await context.log(
+                    f"FAIL · TeraBox mount is missing at {mount_dir}; start unidisk first",
+                    "ERROR",
+                )
+            await context.progress(
+                progress_current=current_check,
+                detail="Validated TeraBox storage",
+            )
+            if context.stop_event.is_set():
+                return
+
         client = self.client_factory(self.settings)
         repository, _archive = self._archive_stack()
         try:
@@ -550,7 +593,7 @@ class OperationCommands:
             await client.disconnect()
         await context.progress(
             force=True,
-            progress_current=4,
+            progress_current=current_check + 1,
             detail="Doctor checks finished",
         )
         if failed:
@@ -558,6 +601,11 @@ class OperationCommands:
 
     async def optimize_media(self, context: OperationContext) -> None:
         """Make completed videos play instantly: faststart remux and posters."""
+        if self.settings.terabox_enabled:
+            raise OperationExecutionError(
+                "Media optimization is disabled in TeraBox storage mode: the remote "
+                "drive keeps pristine originals and cannot be remuxed in place"
+            )
         repository = ArchiveRepository(self.database)
         capabilities = await probe_capabilities(self.settings)
         if not capabilities.available:

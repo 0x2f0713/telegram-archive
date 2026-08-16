@@ -184,22 +184,28 @@ def _safe_csv_value(value: object | None) -> str:
     return text
 
 
-def _resolved_media_paths(download_dir: Path, media_path: str) -> tuple[Path, Path]:
-    return download_dir.expanduser().resolve(), Path(media_path).expanduser().resolve()
+def _resolved_media_paths(roots: tuple[Path, ...], media_path: str) -> tuple[Path, Path]:
+    resolved = Path(media_path).expanduser().resolve()
+    for root in roots:
+        if root == resolved or root in resolved.parents:
+            return root, resolved
+    return roots[0], resolved
 
 
 async def _completed_media(request: Request, message_id: int) -> tuple[Path, str | None]:
     """Resolve the archived file for a completed media record.
 
-    Applies the same download-directory containment check used by the media
-    route and returns ``(media_path, mime_type)`` or raises HTTP 404/403.
+    Media may live in the download directory (local mode, or the TeraBox
+    upload buffer) or under the read-only unidisk FUSE mount (TeraBox mode).
+    Returns ``(media_path, mime_type)`` or raises HTTP 404/403.
     """
     repository: DashboardRepository = request.app.state.dashboard
     message = await repository.message(message_id)
     if message is None or message.download_status != "completed" or not message.media_path:
         raise HTTPException(status_code=404, detail="Completed media not found")
+    roots = await asyncio.to_thread(request.app.state.settings.media_storage_roots)
     download_root, media_path = await asyncio.to_thread(
-        _resolved_media_paths, request.app.state.settings.download_dir, message.media_path
+        _resolved_media_paths, roots, message.media_path
     )
     if download_root != media_path and download_root not in media_path.parents:
         raise HTTPException(status_code=403, detail="Media path is outside DOWNLOAD_DIR")
@@ -240,7 +246,7 @@ async def _system_context(
     resolution = await load_runtime_settings(
         request.app.state.base_settings, request.app.state.runtime_settings
     )
-    effective: Settings = resolution.settings
+    effective: Settings = resolution.settings.with_terabox_policy()
     repository: DashboardRepository = request.app.state.dashboard
     selection_repository: ChatSelectionRepository = request.app.state.chat_selections
     session_path = effective.tg_session_name.expanduser()
@@ -248,18 +254,33 @@ async def _system_context(
         session_path = session_path.with_suffix(".session")
     completed_paths = await repository.completed_media_paths()
     selected_ids = await selection_repository.effective_known_ids(effective.configured_chat_ids)
-    storage = await asyncio.to_thread(inspect_storage, effective, completed_paths)
+    remote_quota: tuple[int, int] | None = None
+    if effective.terabox_enabled:
+        terabox_client = getattr(request.app.state, "terabox_client", None)
+        if terabox_client is not None:
+            try:
+                remote_quota = await terabox_client.cached_quota()
+            except Exception:
+                logger.exception("Could not read TeraBox quota")
+    storage = await asyncio.to_thread(inspect_storage, effective, completed_paths, remote_quota)
     form_settings = merge_runtime_form_values(effective, submitted or {})
+    safe_settings: dict[str, object] = {
+        "Database": effective.database_url,
+        "Download directory": str(effective.download_dir),
+        "Selected chats": len(selected_ids),
+    }
+    if effective.terabox_enabled:
+        safe_settings["Storage mode"] = "TeraBox (hard drive buffers uploads)"
+        safe_settings["TeraBox remote dir"] = effective.terabox_remote_root
+        if remote_quota is not None:
+            total, used = remote_quota
+            safe_settings["TeraBox space"] = f"{used} / {total} bytes used"
     context = navigation_context(request, "system")
     context.update(
         {
             "form_settings": form_settings,
             "overridden_keys": set(resolution.valid_overrides),
-            "safe_settings": {
-                "Database": effective.database_url,
-                "Download directory": str(effective.download_dir),
-                "Selected chats": len(selected_ids),
-            },
+            "safe_settings": safe_settings,
             "session_exists": await asyncio.to_thread(session_path.is_file),
             "web_auth_enabled": bool(
                 effective.web_session_secret and effective.web_session_secret.get_secret_value()
@@ -514,6 +535,7 @@ def create_router(settings: Settings) -> APIRouter:
         result = await service.delete(
             telegram_chat_id,
             request.app.state.settings.download_dir,
+            remove_remote=getattr(request.app.state, "media_remote_deleter", None),
         )
         if result is None:
             return RedirectResponse(

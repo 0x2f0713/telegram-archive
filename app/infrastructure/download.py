@@ -7,6 +7,7 @@ import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol
 
 from telethon.errors import FloodWaitError, RPCError
 
@@ -19,6 +20,7 @@ from app.infrastructure.ffmpeg import (
     remux_faststart,
 )
 from app.infrastructure.persistence.repository import ArchiveRepository
+from app.infrastructure.terabox import TeraBoxError, UploadReceipt
 from app.infrastructure.transcode import POSTER_SUFFIX
 
 logger = logging.getLogger(__name__)
@@ -27,12 +29,26 @@ DownloadProgressCallback = Callable[[int, int], None]
 _VIDEO_SUFFIXES = frozenset({".mp4", ".mkv", ".mov", ".m4v", ".webm", ".avi"})
 
 
+class MediaUploader(Protocol):
+    """Publishes a finalized buffer file to the remote archive storage."""
+
+    async def upload(
+        self, target: Path, progress: DownloadProgressCallback | None = None
+    ) -> UploadReceipt: ...
+
+
 class MediaDownloader:
     """Download one file at a time under a configurable global semaphore."""
 
-    def __init__(self, settings: Settings, repository: ArchiveRepository) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        repository: ArchiveRepository,
+        uploader: MediaUploader | None = None,
+    ) -> None:
         self.settings = settings
         self.repository = repository
+        self.uploader = uploader
         self._semaphore = asyncio.Semaphore(settings.download_concurrency)
         self._capabilities: FfmpegCapabilities | None = None
 
@@ -74,6 +90,8 @@ class MediaDownloader:
                     if not downloaded_path or not await asyncio.to_thread(temp_path.is_file):
                         raise OSError("Telegram returned no completed media file")
                     size = await asyncio.to_thread(self._finalize, temp_path, target)
+                    if self.uploader is not None:
+                        return await self._publish_to_uploader(record.id, target, progress)
                     await self._optimize(target)
                     size = await asyncio.to_thread(self._current_size, target)
                     await self.repository.mark_download_completed(record.id, target, size)
@@ -126,3 +144,49 @@ class MediaDownloader:
     @staticmethod
     def _current_size(target: Path) -> int:
         return target.stat().st_size
+
+    async def _publish_to_uploader(
+        self,
+        message_id: int,
+        target: Path,
+        progress: DownloadProgressCallback | None,
+    ) -> DownloadResult:
+        """Upload a just-finalized file; on failure keep the buffer file.
+
+        The file stays in DOWNLOAD_DIR so retry-failed re-uploads it without
+        re-downloading from Telegram.
+        """
+        assert self.uploader is not None
+        try:
+            receipt = await self.uploader.upload(target, progress)
+        except asyncio.CancelledError:
+            await self.repository.mark_download_failed(message_id, "Upload interrupted")
+            raise
+        except TeraBoxError as exc:
+            error = f"TeraBox upload failed: {exc}"
+            await self.repository.mark_download_failed(message_id, error)
+            return DownloadResult(False, target, None, error)
+        logger.info(
+            "Uploaded %s to TeraBox (%s bytes, md5=%s)",
+            receipt.remote_path,
+            receipt.size,
+            receipt.md5,
+        )
+        await asyncio.to_thread(target.unlink, True)
+        await self.repository.mark_download_completed(message_id, receipt.mount_path, receipt.size)
+        return DownloadResult(True, receipt.mount_path, receipt.size)
+
+    async def publish_buffered(
+        self,
+        message_id: int,
+        buffered_path: Path,
+        progress: DownloadProgressCallback | None = None,
+    ) -> DownloadResult | None:
+        """Publish an existing DOWNLOAD_DIR file to remote storage.
+
+        Returns None when no uploader is configured (local storage mode).
+        """
+        if self.uploader is None:
+            return None
+        await self.repository.mark_download_start(message_id, buffered_path)
+        return await self._publish_to_uploader(message_id, buffered_path, progress)

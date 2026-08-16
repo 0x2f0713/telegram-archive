@@ -37,6 +37,10 @@ from app.infrastructure.telegram.client import (
     resolve_accessible_chats,
 )
 from app.infrastructure.telegram.session_account import read_session_account_id
+from app.infrastructure.terabox import (
+    TeraBoxMediaDeleter,
+    create_terabox_client,
+)
 from app.infrastructure.transcode import VariantManager
 from app.interfaces.web.auth import TelegramQrAuthManager
 from app.interfaces.web.commands import OperationCommands
@@ -174,7 +178,7 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
         await database.initialize()
         runtime_settings = RuntimeSettingsRepository(database)
         resolution = await load_runtime_settings(settings, runtime_settings)
-        overridden = resolution.settings
+        overridden = resolution.settings.with_terabox_policy()
         configure_logging(overridden.log_level)
         logger.info("SQLite connection pool active: %s", database.engine.sync_engine.pool.status())
         app.state.base_settings = settings
@@ -205,6 +209,16 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
             enabled=overridden.media_variants,
             ports=app.state.variant_manager,
         )
+        app.state.terabox_client = None
+        app.state.media_remote_deleter = None
+        if overridden.terabox_enabled:
+            try:
+                app.state.terabox_client = create_terabox_client(overridden)
+                app.state.media_remote_deleter = TeraBoxMediaDeleter(
+                    overridden, app.state.terabox_client
+                )
+            except ConfigurationError as exc:
+                logger.error("TeraBox storage unavailable: %s", exc)
         app.state.csrf_token = secrets.token_urlsafe(32)
         app.state.telegram_auth = TelegramQrAuthManager(overridden)
         app.state.web_session = web_session
@@ -224,6 +238,8 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
             await app.state.operations.shutdown()
             await app.state.variant_manager.shutdown()
             await app.state.telegram_auth.close()
+            if app.state.terabox_client is not None:
+                await app.state.terabox_client.aclose()
             await database.close()
 
     application = FastAPI(

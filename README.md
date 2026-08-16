@@ -205,7 +205,65 @@ python -m app stats
 python -m app doctor
 ```
 
-`stats` reports selected chats, archived messages, downloaded files/bytes, skipped and failed media, and the newest archived message per known chat. `doctor` checks required environment values, SQLite access, download-directory writes, session authorization, and access to every selected chat. It never prints the API hash or session content.
+`stats` reports selected chats, archived messages, downloaded files/bytes, skipped and failed media, and the newest archived message per known chat. `doctor` checks required environment values, SQLite access, download-directory writes, session authorization, and access to every selected chat. In TeraBox mode it also verifies the TeraBox login, the remote archive folder, and the unidisk mount. It never prints the API hash, session content, or the ndus cookie.
+
+## Storage modes: hard drive or TeraBox
+
+`STORAGE_MODE` selects where archived media lives. Everything else — database, chat selection, web dashboard, sync/listen/retry commands — is identical in both modes.
+
+### `local` (default)
+
+Unchanged behavior: media stays in `DOWNLOAD_DIR` on the hard drive. Faststart remuxes and HEVC→H.264 variants are honored.
+
+### `terabox`
+
+Archives media to a TeraBox drive while the hard drive acts as a temporary
+download buffer and a read cache:
+
+1. Each download still writes to `DOWNLOAD_DIR` through the crash-safe
+   `.part` flow.
+2. After the atomic rename, the file is uploaded to TeraBox using the Web
+   upload protocol (server-side dedupe via `rapidupload` first, then
+   chunked `superfile2` upload and commit), and the upload is verified
+   against the server's size/MD5.
+3. The verified local copy is then removed; the archive row points at the
+   read-only unidisk FUSE mount (`TERABOX_MOUNT_DIR`), whose block cache
+   sits on the hard drive, so playback and thumbnails read back through the
+   cache without re-downloading from Telegram.
+
+Consequences of remote storage:
+
+- **Pristine originals only.** `MEDIA_FASTSTART` and `MEDIA_VARIANTS` are
+  forced off in this mode; the cloud keeps unmodified source files and the
+  `optimize-media` operation is disabled.
+- **Repair semantics.** A file left in `DOWNLOAD_DIR` without a completed
+  status is treated as downloaded-but-not-uploaded and is uploaded on the
+  next sync/retry, without re-downloading from Telegram.
+- **Credentials.** `TERABOX_NDUS` (or the `ndus` key of
+  `TERABOX_PROFILE`, a unidisk `terabox.profile.json`) authenticates the
+  upload API. Refresh the cookie when doctor reports a login failure.
+
+Minimal `.env` additions for TeraBox mode:
+
+```dotenv
+STORAGE_MODE=terabox
+TERABOX_NDUS=your_ndus_cookie
+# or: TERABOX_PROFILE=/mnt/data/workspace/terabox-drive/terabox.profile.json
+TERABOX_MOUNT_DIR=/mnt/data/workspace/terabox-drive/mnt/terabox
+TERABOX_REMOTE_DIR=/Telegram Archive
+```
+
+Mount requirements for reading archived media back:
+
+- Start the unidisk FUSE mount before launching the app: run
+  `mount.sh` in the `terabox-drive` repo (or ensure your service brings up
+  `/mnt/data/workspace/terabox-drive/mnt/terabox`).
+- Ensure the mount is readable by the app's user. For bind mounting into
+  Docker, pass `allow_other` at FUSE mount time and keep `ARCHIVER_UID`
+  matching the mount owner.
+- With Docker Compose the host mount path is exposed read-only at
+  `/mnt/terabox` automatically; the container overrides
+  `TERABOX_MOUNT_DIR`/`TERABOX_PROFILE` to that path.
 
 ## Web dashboard and Telegram account connection
 

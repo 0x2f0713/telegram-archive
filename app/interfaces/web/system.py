@@ -27,14 +27,31 @@ class StorageHealth:
         return (self.disk_total_bytes - self.disk_free_bytes) / self.disk_total_bytes * 100
 
 
-def inspect_storage(settings: Settings, completed_paths: tuple[str, ...]) -> StorageHealth:
-    """Inspect only configured archive paths and return redaction-safe totals."""
+def inspect_storage(
+    settings: Settings,
+    completed_paths: tuple[str, ...],
+    remote_quota: tuple[int, int] | None = None,
+) -> StorageHealth:
+    """Inspect only configured archive paths and return redaction-safe totals.
 
-    download_root = settings.download_dir.expanduser().resolve()
-    disk_probe = download_root
-    while not disk_probe.exists() and disk_probe != disk_probe.parent:
-        disk_probe = disk_probe.parent
-    disk = shutil.disk_usage(disk_probe)
+    With a ``remote_quota`` (TeraBox ``total, used`` bytes) the free-space
+    figures describe the cloud volume instead of the local disk. Missing-file
+    detection checks every media storage root, so remote-only files served
+    through the unidisk mount are not flagged.
+    """
+
+    roots = settings.media_storage_roots()
+    download_root = roots[0]
+
+    if remote_quota is not None:
+        disk_total_bytes, disk_used_bytes = remote_quota
+        disk_free_bytes = max(0, disk_total_bytes - disk_used_bytes)
+    else:
+        disk_probe = download_root
+        while not disk_probe.exists() and disk_probe != disk_probe.parent:
+            disk_probe = disk_probe.parent
+        disk = shutil.disk_usage(disk_probe)
+        disk_total_bytes, disk_free_bytes = disk.total, disk.free
 
     database_name = make_url(settings.database_url).database
     database_path = Path(database_name).expanduser().resolve() if database_name else None
@@ -56,15 +73,16 @@ def inspect_storage(settings: Settings, completed_paths: tuple[str, ...]) -> Sto
     missing = 0
     for raw_path in completed_paths:
         media_path = Path(raw_path).expanduser().resolve()
-        if download_root != media_path and download_root not in media_path.parents:
+        contained = any(root == media_path or root in media_path.parents for root in roots)
+        if not contained:
             missing += 1
         elif not media_path.is_file():
             missing += 1
 
     return StorageHealth(
         database_bytes=database_bytes,
-        disk_total_bytes=disk.total,
-        disk_free_bytes=disk.free,
+        disk_total_bytes=disk_total_bytes,
+        disk_free_bytes=disk_free_bytes,
         partial_files=partial_files,
         partial_bytes=partial_bytes,
         missing_completed_files=missing,

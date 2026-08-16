@@ -3,6 +3,7 @@ from pathlib import Path
 
 from app.config import Settings
 from app.infrastructure.download import MediaDownloader
+from app.infrastructure.terabox import TeraBoxError, UploadReceipt
 
 
 class RecordingRepository:
@@ -90,3 +91,82 @@ async def test_download_forwards_per_file_progress(tmp_path: Path) -> None:
 
     assert result.completed
     assert updates == [(2, 8), (8, 8)]
+
+
+class FakeUploader:
+    def __init__(self, mount_dir: Path, *, error: str | None = None) -> None:
+        self.mount_dir = mount_dir
+        self.error = error
+        self.uploaded: list[Path] = []
+
+    async def upload(self, target: Path, progress=None) -> UploadReceipt:
+        if self.error:
+            raise TeraBoxError(self.error)
+        size = await asyncio.to_thread(lambda: target.stat().st_size)
+        self.uploaded.append(target)
+        mount_path = self.mount_dir / target.name
+        return UploadReceipt(
+            remote_path=f"/Telegram Archive/{target.name}",
+            mount_path=mount_path,
+            size=size,
+            md5="d" * 32,
+        )
+
+
+def _terabox_settings(tmp_path: Path) -> Settings:
+    return Settings(
+        _env_file=None,
+        download_retries=1,
+        storage_mode="terabox",
+        terabox_ndus="t",
+        terabox_profile=None,
+        download_dir=tmp_path / "downloads",
+        terabox_mount_dir=tmp_path / "mnt",
+        terabox_remote_dir="/Telegram Archive",
+    )
+
+
+async def test_download_uploads_to_terabox_and_removes_local_copy(tmp_path: Path) -> None:
+    repository = RecordingRepository()
+    settings = _terabox_settings(tmp_path)
+    settings.download_dir.mkdir(parents=True, exist_ok=True)
+    uploader = FakeUploader(settings.terabox_mount_dir)
+    downloader = MediaDownloader(settings, repository, uploader)  # type: ignore[arg-type]
+    target = settings.download_dir / "42_report.pdf"
+    record = type("Record", (), {"id": 1})()
+
+    result = await downloader.download(record, SuccessfulMessage(), target)  # type: ignore[arg-type]
+
+    assert result.completed
+    assert uploader.uploaded == [target]
+    # Local buffer removed after a verified upload.
+    assert not target.exists()
+    assert result.path == settings.terabox_mount_dir / "42_report.pdf"
+    assert repository.completed == 1
+
+
+async def test_download_keeps_local_copy_when_upload_fails(tmp_path: Path) -> None:
+    repository = RecordingRepository()
+    settings = _terabox_settings(tmp_path)
+    settings.download_dir.mkdir(parents=True, exist_ok=True)
+    uploader = FakeUploader(settings.terabox_mount_dir, error="boom")
+    downloader = MediaDownloader(settings, repository, uploader)  # type: ignore[arg-type]
+    target = settings.download_dir / "42_report.pdf"
+    record = type("Record", (), {"id": 1})()
+
+    result = await downloader.download(record, SuccessfulMessage(), target)  # type: ignore[arg-type]
+
+    assert not result.completed
+    assert "boom" in (result.error or "")
+    # Buffer survives so retry can re-upload without re-downloading.
+    assert target.is_file()
+    assert repository.completed == 0
+    assert repository.failed is not None
+
+
+async def test_publish_buffered_returns_none_in_local_mode(tmp_path: Path) -> None:
+    repository = RecordingRepository()
+    settings = Settings(_env_file=None, download_retries=1)
+    downloader = MediaDownloader(settings, repository)  # type: ignore[arg-type]
+
+    assert await downloader.publish_buffered(1, tmp_path / "file.bin") is None
