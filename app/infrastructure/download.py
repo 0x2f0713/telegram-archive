@@ -172,8 +172,13 @@ class MediaDownloader:
             receipt.size,
             receipt.md5,
         )
-        await asyncio.to_thread(target.unlink, True)
         await self.repository.mark_download_completed(message_id, receipt.mount_path, receipt.size)
+        try:
+            await asyncio.to_thread(target.unlink, True)
+        except OSError as exc:
+            # The record is already completed; a leftover buffer is republished
+            # via rapid-upload dedupe and removed on the next pass.
+            logger.warning("Could not remove uploaded buffer %s: %s", target, exc)
         return DownloadResult(True, receipt.mount_path, receipt.size)
 
     async def publish_buffered(

@@ -164,6 +164,34 @@ async def test_download_keeps_local_copy_when_upload_fails(tmp_path: Path) -> No
     assert repository.failed is not None
 
 
+async def test_download_records_completion_before_removing_buffer(tmp_path: Path) -> None:
+    settings = _terabox_settings(tmp_path)
+    settings.download_dir.mkdir(parents=True, exist_ok=True)
+    target = settings.download_dir / "42_report.pdf"
+
+    class OrderRepository(RecordingRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.buffer_present_at_completion: bool | None = None
+
+        async def mark_download_completed(self, _message_id, _path, _size) -> None:
+            self.buffer_present_at_completion = target.is_file()
+            await super().mark_download_completed(_message_id, _path, _size)
+
+    repository = OrderRepository()
+    downloader = MediaDownloader(
+        settings, repository, FakeUploader(settings.terabox_mount_dir)
+    )  # type: ignore[arg-type]
+
+    result = await downloader.download(
+        type("Record", (), {"id": 1})(), SuccessfulMessage(), target
+    )  # type: ignore[arg-type]
+
+    assert result.completed
+    assert repository.buffer_present_at_completion is True
+    assert not target.exists()
+
+
 async def test_publish_buffered_returns_none_in_local_mode(tmp_path: Path) -> None:
     repository = RecordingRepository()
     settings = Settings(_env_file=None, download_retries=1)
