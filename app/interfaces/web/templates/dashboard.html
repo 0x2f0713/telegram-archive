@@ -50,6 +50,13 @@
     <dd>{{ "{:,}".format(overview.stats.failed_downloads) }}</dd>
     <span>{% if overview.stats.failed_downloads %}needs recovery{% else %}nothing to retry{% endif %}</span>
   </div>
+  {% if terabox_quota %}
+  <div class="metric-terabox">
+    <dt>TeraBox</dt>
+    <dd>{{ terabox_quota[1]|bytes }} / {{ terabox_quota[0]|bytes }}</dd>
+    <span>{{ "%.1f"|format(terabox_quota[1] / terabox_quota[0] * 100) }}% used</span>
+  </div>
+  {% endif %}
 </dl>
 
 <div class="overview-operator-grid">

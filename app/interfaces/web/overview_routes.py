@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 from fastapi import APIRouter, Request
@@ -9,6 +10,8 @@ from fastapi.responses import HTMLResponse
 
 from app.application.dashboard import DashboardService
 from app.interfaces.web.presentation import navigation_context, templates
+
+logger = logging.getLogger(__name__)
 
 
 def _chart_points(values: tuple[int, ...], width: int = 1000, height: int = 220) -> str:
@@ -66,6 +69,14 @@ def create_overview_router() -> APIRouter:
                 "/operations",
                 "Open operations",
             )
+        terabox_quota = None
+        if request.app.state.settings.terabox_enabled:
+            terabox_client = getattr(request.app.state, "terabox_client", None)
+            if terabox_client is not None:
+                try:
+                    terabox_quota = await terabox_client.cached_quota()
+                except Exception:
+                    logger.exception("Could not read TeraBox quota for overview")
         context = navigation_context(request, "overview")
         context.update(
             {
@@ -81,6 +92,7 @@ def create_overview_router() -> APIRouter:
                 + status_lookup.get("downloading", 0),
                 "media_total": sum(count for _, count in overview.media_counts),
                 "next_action": next_action,
+                "terabox_quota": terabox_quota,
             }
         )
         return templates.TemplateResponse(request, "dashboard.html", context)

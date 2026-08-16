@@ -192,7 +192,19 @@ class OperationCommands:
             )
             states[filename] = (current, now, speed)
             percent = round(current / total * 100, 1) if total else None
-            status = "completed" if total and current >= total else "downloading"
+
+            # Determine phase: downloading -> uploading -> completed
+            existing = tasks.get(filename)
+            if existing and existing["status"] == "completed" and current < total:
+                # Task was completed but we're getting more progress -> upload phase
+                status = "uploading"
+                # Reset speed calculation base for upload
+                states[filename] = (current, now, 0.0)
+            elif total and current >= total:
+                status = "completed"
+            else:
+                status = "downloading"
+
             tasks[filename] = {
                 "filename": filename,
                 "current": current,
@@ -207,25 +219,41 @@ class OperationCommands:
                 oldest = next(iter(tasks))
                 if tasks[oldest]["status"] == "downloading":
                     break
+                if tasks[oldest]["status"] == "uploading":
+                    break
                 tasks.pop(oldest)
                 states.pop(oldest, None)
                 last_report.pop(oldest, None)
-            active = [task for task in tasks.values() if task["status"] == "downloading"]
-            aggregate_speed = round(sum(task["speed"] for task in active))
-            if len(active) > 1:
-                detail = f"Downloading {len(active)} files · {format_bytes(aggregate_speed)}/s total"
+            downloading = [task for task in tasks.values() if task["status"] == "downloading"]
+            uploading = [task for task in tasks.values() if task["status"] == "uploading"]
+            aggregate_download = round(sum(task["speed"] for task in downloading))
+            aggregate_upload = round(sum(task["speed"] for task in uploading))
+            aggregate_speed = aggregate_download + aggregate_upload
+            if downloading and uploading:
+                detail = (
+                    f"Downloading {len(downloading)} · Uploading {len(uploading)} · "
+                    f"{format_bytes(aggregate_speed)}/s total"
+                )
+            elif downloading:
+                detail = f"Downloading {len(downloading)} files · {format_bytes(aggregate_download)}/s total"
+            elif uploading:
+                detail = (
+                    f"Uploading {len(uploading)} files · {format_bytes(aggregate_upload)}/s total"
+                )
             else:
                 detail = (
                     f"Downloading {filename} ({percent or 0:.1f}%, {format_bytes(round(speed))}/s)"
                 )
             pending_update = {
-                "phase": "downloading",
+                "phase": "downloading" if downloading else ("uploading" if uploading else "idle"),
                 "detail": detail,
                 "download_filename": filename,
                 "download_current": current,
                 "download_total": total,
                 "download_percent": percent,
-                "download_speed": aggregate_speed,
+                "download_speed": aggregate_download,
+                "upload_speed": aggregate_upload,
+                "transfer_speed": aggregate_speed,
                 "download_tasks": list(tasks.values()),
             }
             pending_force = pending_force or current >= total

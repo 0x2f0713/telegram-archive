@@ -44,11 +44,11 @@ function setupOperationMonitor() {
     const active = entries.filter((task) => task.status !== "completed").length;
     if (downloadSummary) {
       const totalSpeed = entries.reduce(
-        (sum, task) => (task.status !== "completed" ? sum + (Number(task.speed) || 0) : sum),
+        (sum, task) => sum + (Number(task.speed) || 0),
         0,
       );
       downloadSummary.textContent = `${active} active · ${entries.length} shown`
-        + (active && totalSpeed ? ` · ${humanBytes(totalSpeed)}/s` : "");
+        + (active && totalSpeed ? ` · ${humanBytes(totalSpeed)}/s total` : "");
     }
     if (!entries.length) {
       const empty = document.createElement("p");
@@ -73,10 +73,12 @@ function setupOperationMonitor() {
       const bar = document.createElement("progress");
       bar.value = current;
       bar.max = total || 1;
-      bar.setAttribute("aria-label", `Download progress for ${task.filename || "media"}`);
+      bar.setAttribute("aria-label", `Progress for ${task.filename || "media"}`);
       bar.textContent = `${percent.toFixed(1)}%`;
+      if (task.status === "uploading") bar.classList.add("uploading");
       const stats = document.createElement("small");
-      stats.textContent = `${humanBytes(current)} / ${humanBytes(total)} · ${humanBytes(task.speed || 0)}/s · ${task.status || "downloading"}`;
+      const statusText = task.status === "uploading" ? "uploading" : (task.status || "downloading");
+      stats.textContent = `${humanBytes(current)} / ${humanBytes(total)} · ${humanBytes(task.speed || 0)}/s · ${statusText}`;
       row.append(head, bar, stats);
       downloadList.append(row);
     });
