@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}Connect Telegram | Telegram Archiver{% endblock %}
+{% block content %}
+<section class="account-hero" data-telegram-auth data-auth-status="{{ auth_status }}" data-status-url="/api/v1/auth/telegram">
+  <div class="account-copy">
+    <p class="eyebrow">Account connection</p>
+    {% if auth_status == "connected" and browser_authenticated %}
+      <h1>Your archive is connected.</h1>
+      <p class="hero-lede">This browser is signed in through <strong>{{ auth.identity }}</strong>. Telegram decides which chats this account can access; the archive never bypasses those permissions.</p>
+      <div class="hero-actions">
+        <a class="button primary" href="/chats">Review chat coverage</a>
+        <a class="button secondary" href="/operations">Open operations</a>
+        <form method="post" action="/auth/telegram/logout">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="button secondary" type="submit">Sign out</button>
+        </form>
+      </div>
+    {% elif auth_status == "connected" %}
+      <h1>Continue with Telegram.</h1>
+      <p class="hero-lede">This archive is connected to <strong>{{ auth.identity }}</strong>. Continue to create a signed browser session. No dashboard username or password is required.</p>
+      <form class="hero-actions" method="post" action="/auth/telegram/continue">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="next" value="{{ next_path }}">
+        <button class="button primary" type="submit">Continue to archive</button>
+      </form>
+    {% elif auth_status == "pending" %}
+      <h1>Scan once. Keep control.</h1>
+      <p class="hero-lede">Open Telegram on your phone, go to <strong>Settings → Devices → Link Desktop Device</strong>, then scan the short-lived code.</p>
+    {% elif auth_status == "two_factor" %}
+      <h1>Finish 2FA in the terminal.</h1>
+      <p class="hero-lede">This account has an additional Telegram password. The dashboard deliberately does not collect it. Complete authorization with the secure interactive login command.</p>
+      <div class="hero-actions">
+        <button class="button primary" type="button" data-copy-value="python -m app login">Copy login command</button>
+        <a class="button secondary" href="/system">Open system checks</a>
+      </div>
+    {% elif auth_status == "unavailable" %}
+      <h1>Add API credentials first.</h1>
+      <p class="hero-lede">Telegram needs an API ID and API hash before it can create a QR authorization request. Keep both values in the local <code>.env</code> file.</p>
+      <div class="hero-actions">
+        <a class="button primary" href="https://my.telegram.org" rel="noreferrer">Open Telegram API tools</a>
+        <a class="button secondary" href="/operations">Run doctor</a>
+      </div>
+    {% else %}
+      <h1>Connect your Telegram account.</h1>
+      <p class="hero-lede">First connection creates the local archive profile. Use an existing Telegram account you control; account creation remains in Telegram’s official apps.</p>
+      <form class="hero-actions" method="post" action="/auth/telegram/start">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="next" value="{{ next_path }}">
+        <button class="button primary" type="submit">Create secure QR code</button>
+        <button class="button secondary" type="button" data-copy-value="python -m app login">Use terminal login</button>
+      </form>
+    {% endif %}
+    {% if auth_error %}
+      <p class="notice account-error" role="alert">{{ auth_error }}</p>
+    {% endif %}
+  </div>
+
+  <aside class="account-device" aria-live="polite">
+    <div class="device-chrome">
+      <span>Telegram connection</span>
+      <span class="account-status status-{{ auth_status }}"><i aria-hidden="true"></i>{{ auth_status|replace('_', ' ') }}</span>
+    </div>
+    <div class="device-body">
+      {% if auth_status == "pending" %}
+        <div class="qr-frame">
+          <img src="/auth/telegram/qr.svg" width="320" height="320" alt="Telegram login QR code">
+        </div>
+        <strong>Waiting for approval</strong>
+        <p data-auth-detail>{{ auth.detail }}</p>
+        <time data-auth-expiry datetime="{{ auth.expires_at.isoformat() if auth.expires_at else '' }}">Code expires shortly</time>
+      {% elif auth_status == "connected" %}
+        <div class="connected-mark" aria-hidden="true"><span></span></div>
+        <strong>{{ auth.identity }}</strong>
+        <p data-auth-detail>{{ auth.detail }}</p>
+      {% else %}
+        <div class="account-glyph" aria-hidden="true"><span></span><span></span><span></span></div>
+        <strong>{% if auth_status == "two_factor" %}Protected by 2FA{% elif auth_status == "unavailable" %}Configuration needed{% elif auth_status == "expired" %}Code expired{% elif auth_status == "failed" %}Connection paused{% else %}Ready when you are{% endif %}</strong>
+        <p data-auth-detail>{{ auth.detail }}</p>
+        {% if auth_status in ("expired", "failed") %}
+          <form method="post" action="/auth/telegram/start">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="next" value="{{ next_path }}">
+            <button class="button secondary" type="submit">Create a new code</button>
+          </form>
+        {% endif %}
+      {% endif %}
+    </div>
+  </aside>
+</section>
+
+<section class="account-principles" aria-labelledby="principles-title">
+  <div class="chapter-heading">
+    <div><p class="eyebrow">Trust boundary</p><h2 id="principles-title">Telegram stays in charge of identity.</h2></div>
+    <p>The archive stores one sensitive Telethon session locally. It never accepts exported or uploaded session files.</p>
+  </div>
+  <div class="principle-grid">
+    <article><h3>Official approval</h3><p>The QR request is generated through Telegram’s MTProto API and approved inside an already authorized Telegram app.</p></article>
+    <article><h3>Local persistence</h3><p>The resulting <code>.session</code> file remains in <code>data/</code>, outside the browser and excluded from Git.</p></article>
+    <article><h3>Existing access only</h3><p>Discovery and archiving are limited to dialogs Telegram already exposes to the connected account.</p></article>
+  </div>
+</section>
+{% endblock %}

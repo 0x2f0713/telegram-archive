@@ -3,21 +3,25 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
-from datetime import UTC, datetime
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import pytest
 
+from app.application.chat_selection import ChatDiscovery
+from app.application.operations import OperationContext, OperationManager
 from app.config import ConfigurationError, Settings
-from app.database.repository import ArchiveRepository
-from app.database.selection import ChatSelection, ChatSelectionRepository
-from app.database.session import Database
-from app.services.chat_selection import ChatDiscovery
-from app.services.operations import OperationContext, OperationManager
-from app.web.application import create_web_app
-from app.web.telegram_auth import TelegramAuthSnapshot, TelegramAuthStatus
-from tests.helpers import make_chat, make_message
+from app.infrastructure.persistence.database import Database
+from app.infrastructure.persistence.operations import OperationRepository
+from app.infrastructure.persistence.repository import ArchiveRepository
+from app.infrastructure.persistence.selection import ChatSelection, ChatSelectionRepository
+from app.infrastructure.persistence.settings import RuntimeSettingsRepository
+from app.interfaces.web.app import create_web_app
+from app.interfaces.web.auth import TelegramAuthSnapshot, TelegramAuthStatus
+from app.interfaces.web.session import TelegramWebSession
+from tests.helpers import make_chat, make_message, make_no_media_message
 
 
 def _settings(tmp_path: Path, **overrides: object) -> Settings:
@@ -63,15 +67,25 @@ async def test_web_pages_api_and_media_delivery(tmp_path: Path) -> None:
         transport = httpx.ASGITransport(app=application)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             dashboard = await client.get("/")
+            archived_chats = await client.get("/archive/chats")
             messages = await client.get("/messages", params={"q": "quarterly"})
             detail = await client.get(f"/messages/{message_id}")
             media = await client.get(f"/media/{message_id}")
+            dashboard_script = await client.get("/static/assets/dashboard.js")
             stats = await client.get("/api/v1/stats")
             api_messages = await client.get("/api/v1/messages", params={"q": "Alice"})
 
     assert dashboard.status_code == 200
-    assert "Keep every message" in dashboard.text
+    assert "Archive overview" in dashboard.text
+    assert "Recommended next action" in dashboard.text
+    assert "Archived chats" in dashboard.text
+    assert 'href="/archive/chats"' in dashboard.text
+    assert "data-quick-chat-dialog" not in dashboard.text
     assert dashboard.headers["content-security-policy"].startswith("default-src 'self'")
+    assert archived_chats.status_code == 200
+    assert "All archived chats" in archived_chats.text
+    assert "Release &lt;Room&gt;" in archived_chats.text
+    assert f'href="/chats/{-1001234567890}"' in archived_chats.text
     assert messages.status_code == 200
     assert "Quarterly &lt;script&gt;" in messages.text
     assert "<script>alert(1)</script>" not in messages.text
@@ -79,8 +93,400 @@ async def test_web_pages_api_and_media_delivery(tmp_path: Path) -> None:
     assert media.status_code == 200
     assert media.content == b"safe archive bytes"
     assert media.headers["content-disposition"].startswith("attachment")
+    assert dashboard_script.headers["cache-control"] == "private, no-cache"
     assert stats.json()["stats"]["total_messages"] == 1
     assert api_messages.json()["total"] == 1
+
+
+async def test_archived_chat_page_pins_active_empty_chat_before_recent_archives(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    await _seed(settings)
+    active_chat_id = -1001234567892
+    database = Database(settings.database_url)
+    await database.initialize()
+    await ArchiveRepository(database).upsert_chat(
+        make_chat(
+            telegram_chat_id=active_chat_id,
+            title="Live Empty Room",
+            username="live_empty",
+        )
+    )
+    await database.close()
+    application = create_web_app(settings)
+    ready = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_sync(context: OperationContext) -> None:
+        await context.progress(
+            force=True,
+            phase="syncing",
+            detail="Processing Live Empty Room",
+            chat_id=active_chat_id,
+            chat_title="Live Empty Room",
+        )
+        ready.set()
+        await release.wait()
+
+    async with application.router.lifespan_context(application):
+        application.state.operations = OperationManager(
+            settings,
+            OperationRepository(application.state.database),
+            executors={"sync": fake_sync},
+        )
+        await application.state.operations.startup()
+        await application.state.operations.start_job("sync")
+        await asyncio.wait_for(ready.wait(), timeout=1)
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/archive/chats")
+            search = await client.get("/archive/chats", params={"q": "live_empty"})
+        release.set()
+
+    assert response.status_code == 200
+    assert response.text.index("Live Empty Room") < response.text.index("Release &lt;Room&gt;")
+    assert "Archiving now" in response.text
+    assert "syncing" in response.text
+    assert f'href="/chats/{active_chat_id}"' in response.text
+    assert search.status_code == 200
+    assert "Live Empty Room" in search.text
+    assert "Release &lt;Room&gt;" not in search.text
+
+
+async def test_archived_chat_delete_requires_confirmation_and_removes_local_archive(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    message_id, media_path = await _seed(settings)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            page = await client.get("/archive/chats")
+            csrf_token = application.state.csrf_token
+            no_csrf = await client.post(
+                f"/archive/chats/{-1001234567890}/delete",
+                data={"confirmation": "DELETE"},
+            )
+            invalid = await client.post(
+                f"/archive/chats/{-1001234567890}/delete",
+                data={
+                    "csrf_token": csrf_token,
+                    "confirmation": "delete",
+                    "q": "Release",
+                    "page": "1",
+                },
+            )
+            before_delete = await client.get(f"/messages/{message_id}")
+            deleted = await client.post(
+                f"/archive/chats/{-1001234567890}/delete",
+                data={
+                    "csrf_token": csrf_token,
+                    "confirmation": "DELETE",
+                    "q": "Release",
+                    "page": "1",
+                },
+            )
+            feedback = await client.get(deleted.headers["location"])
+            detail = await client.get(f"/messages/{message_id}")
+            media = await client.get(f"/media/{message_id}")
+            conversation = await client.get(f"/chats/{-1001234567890}")
+
+    assert page.status_code == 200
+    assert "Delete archive" in page.text
+    assert "data-archive-delete-dialog" in page.text
+    assert 'data-chat-title="Release &lt;Room&gt;"' in page.text
+    assert no_csrf.status_code == 403
+    assert invalid.status_code == 303
+    assert "delete_error=confirmation" in invalid.headers["location"]
+    assert before_delete.status_code == 200
+    assert deleted.status_code == 303
+    assert "deleted=true" in deleted.headers["location"]
+    assert "deleted_messages=1" in deleted.headers["location"]
+    assert feedback.status_code == 200
+    assert "Archive deleted." in feedback.text
+    assert "Release &lt;Room&gt;" not in feedback.text
+    assert detail.status_code == 404
+    assert media.status_code == 404
+    assert conversation.status_code == 200
+    assert "No messages archived for this chat" in conversation.text
+    assert not media_path.exists()
+
+
+async def test_archived_chat_delete_is_blocked_while_that_chat_is_active(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    message_id, media_path = await _seed(settings)
+    application = create_web_app(settings)
+    ready = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_sync(context: OperationContext) -> None:
+        await context.progress(
+            force=True,
+            phase="syncing",
+            detail="Processing protected chat",
+            chat_id=-1001234567890,
+            chat_title="Release Room",
+        )
+        ready.set()
+        await release.wait()
+
+    async with application.router.lifespan_context(application):
+        application.state.operations = OperationManager(
+            settings,
+            OperationRepository(application.state.database),
+            executors={"sync": fake_sync},
+        )
+        await application.state.operations.startup()
+        await application.state.operations.start_job("sync")
+        await asyncio.wait_for(ready.wait(), timeout=1)
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            page = await client.get("/archive/chats")
+            response = await client.post(
+                f"/archive/chats/{-1001234567890}/delete",
+                data={
+                    "csrf_token": application.state.csrf_token,
+                    "confirmation": "DELETE",
+                },
+            )
+            retained = await client.get(f"/messages/{message_id}")
+        release.set()
+
+    assert page.status_code == 200
+    assert "Finish the active archive operation before deleting this chat" in page.text
+    assert "disabled" in page.text
+    assert response.status_code == 303
+    assert "delete_error=active" in response.headers["location"]
+    assert retained.status_code == 200
+    assert media_path.is_file()
+
+
+def _seed_session_account(tmp_path: Path, account_id: int) -> Path:
+    session_path = tmp_path / "telegram_session.session"
+    connection = sqlite3.connect(session_path)
+    connection.execute(
+        "CREATE TABLE entities (id integer primary key, hash integer not null, "
+        "username text, phone integer, name text, date integer)"
+    )
+    connection.execute(
+        "INSERT INTO entities VALUES (0, ?, NULL, NULL, NULL, 1786334406)",
+        (account_id,),
+    )
+    connection.commit()
+    connection.close()
+    return session_path
+
+
+async def _seed_conversation(settings: Settings, account_id: int) -> int:
+    database = Database(settings.database_url)
+    await database.initialize()
+    archive = ArchiveRepository(database)
+    chat = make_chat(title="Conversation <Room>")
+    await archive.upsert_chat(chat)
+    base = datetime(2026, 8, 8, 10, 0, tzinfo=UTC)
+    for index, sender in enumerate((100, account_id, 100, account_id)):
+        telegram_message_id = 1000 + index
+        await archive.upsert_message(
+            make_no_media_message(
+                telegram_message_id=telegram_message_id,
+                sender_id=sender,
+                sender_name="Alice & Bob" if sender == 100 else "me",
+                text=f"message <b>{telegram_message_id}</b>",
+                message_date=base + timedelta(hours=index),
+                reply_to_message_id=1000 if index == 3 else None,
+            )
+        )
+    await database.close()
+    return chat.telegram_chat_id
+
+
+async def test_conversation_thread_renders_bubbles_with_outgoing_alignment(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    account_id = 909580109
+    _seed_session_account(tmp_path, account_id)
+    chat_id = await _seed_conversation(settings, account_id)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(f"/chats/{chat_id}")
+
+    assert response.status_code == 200
+    text = response.text
+    assert "Conversation &lt;Room&gt;" in text
+    assert "message &lt;b&gt;1000&lt;/b&gt;" in text
+    assert "<b>1000</b>" not in text
+    assert "message &lt;b&gt;1002&lt;/b&gt;" in text
+    assert "Alice &amp; Bob" in text
+    assert text.count("bubble-out") == 2
+    assert text.count("bubble-in") == 2
+    assert "Reply to message #1000" in text
+    assert '<a href="/archive/chats">Archived chats</a>' in text
+    assert 'class="archive-chat-link" href="/archive/chats" aria-current="page"' in text
+    assert 'class="thread-divider"' in text
+    assert 'style="' not in text
+    assert "sender-hue-" in text
+
+
+async def test_conversation_video_bubble_reserves_preview_width(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize()
+    archive = ArchiveRepository(database)
+    chat = make_chat(title="Video Room")
+    await archive.upsert_chat(chat)
+    record, _ = await archive.upsert_message(
+        make_message(
+            text=None,
+            media_type="video",
+            mime_type="video/mp4",
+            original_filename="clip.mp4",
+            extension=".mp4",
+        )
+    )
+    media_path = settings.download_dir / "video" / "clip.mp4"
+    media_path.parent.mkdir(parents=True, exist_ok=True)
+    media_path.write_bytes(b"archived video")
+    await archive.mark_download_completed(record.id, media_path, media_path.stat().st_size)
+    await database.close()
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(f"/chats/{chat.telegram_chat_id}")
+
+    assert response.status_code == 200
+    assert "thread-bubble-video" in response.text
+    assert '<video class="bubble-media"' in response.text
+
+
+async def test_chat_media_gallery_is_scoped_filterable_and_linked_from_messages(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize()
+    archive = ArchiveRepository(database)
+    chat = make_chat(title="Gallery <Room>")
+    other_chat = make_chat(telegram_chat_id=-1001234567891, title="Other Room")
+    await archive.upsert_chats((chat, other_chat))
+
+    async def complete_media(
+        message_id: int,
+        mime_type: str,
+        filename: str,
+        *,
+        chat_id: int = chat.telegram_chat_id,
+    ) -> int:
+        record, _ = await archive.upsert_message(
+            make_message(
+                telegram_chat_id=chat_id,
+                telegram_message_id=message_id,
+                text="caption <script>alert(1)</script>",
+                media_type="video" if mime_type.startswith("video/") else "photo",
+                mime_type=mime_type,
+                original_filename=filename,
+                extension=Path(filename).suffix,
+            )
+        )
+        media_path = settings.download_dir / str(chat_id) / filename
+        media_path.parent.mkdir(parents=True, exist_ok=True)
+        media_path.write_bytes(b"archived media")
+        await archive.mark_download_completed(record.id, media_path, media_path.stat().st_size)
+        return record.id
+
+    photo_id = await complete_media(51, "image/jpeg", "photo.jpg")
+    video_id = await complete_media(52, "video/mp4", "video.mp4")
+    other_id = await complete_media(
+        53,
+        "image/png",
+        "other.png",
+        chat_id=other_chat.telegram_chat_id,
+    )
+    await database.close()
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            conversation = await client.get(f"/chats/{chat.telegram_chat_id}")
+            gallery = await client.get(f"/chats/{chat.telegram_chat_id}/media")
+            videos = await client.get(
+                f"/chats/{chat.telegram_chat_id}/media",
+                params={"kind": "videos"},
+            )
+
+    assert conversation.status_code == 200
+    assert f'href="/chats/{chat.telegram_chat_id}/media"' in conversation.text
+    assert gallery.status_code == 200
+    assert "Gallery &lt;Room&gt;" in gallery.text
+    assert f'data-media-src="/media/{photo_id}"' in gallery.text
+    assert f'data-media-src="/media/{video_id}"' in gallery.text
+    assert 'data-media-size="14"' in gallery.text
+    assert f"/media/{other_id}" not in gallery.text
+    assert "<script>alert(1)</script>" not in gallery.text
+    assert 'data-media-kind="image"' in gallery.text
+    assert 'data-media-kind="video"' in gallery.text
+    assert videos.status_code == 200
+    assert f'data-media-src="/media/{video_id}"' in videos.text
+    assert f'data-media-src="/media/{photo_id}"' not in videos.text
+
+
+async def test_conversation_thread_404_for_unknown_chat(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/chats/-1009999999999")
+
+    assert response.status_code == 404
+
+
+async def test_conversation_thread_loads_older_history(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    chat_id = -1001234567890
+    database = Database(settings.database_url)
+    await database.initialize()
+    archive = ArchiveRepository(database)
+    await archive.upsert_chat(make_chat())
+    base = datetime(2026, 8, 1, 8, 0, tzinfo=UTC)
+    for index in range(55):
+        await archive.upsert_message(
+            make_no_media_message(
+                telegram_message_id=2000 + index,
+                sender_id=100,
+                sender_name="Test Sender",
+                text=f"older message {index}",
+                message_date=base + timedelta(minutes=index),
+            )
+        )
+    await database.close()
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            first = await client.get(f"/chats/{chat_id}")
+            older = await client.get(f"/chats/{chat_id}", params={"page": 2})
+
+    assert first.status_code == 200
+    assert "Load older messages" in first.text
+    assert "older message 0" not in first.text
+    assert "older message 54" in first.text
+    assert older.status_code == 200
+    assert "Load older messages" not in older.text
+    assert "older message 0" in older.text
 
 
 async def test_web_rejects_media_outside_download_directory(tmp_path: Path) -> None:
@@ -96,28 +502,44 @@ async def test_web_rejects_media_outside_download_directory(tmp_path: Path) -> N
     assert response.status_code == 403
 
 
-def test_remote_bind_requires_password(tmp_path: Path) -> None:
+def test_remote_bind_requires_session_secret(tmp_path: Path) -> None:
     settings = _settings(tmp_path, web_host="0.0.0.0")
 
-    with pytest.raises(ConfigurationError, match="WEB_PASSWORD is required"):
+    with pytest.raises(ConfigurationError, match="WEB_SESSION_SECRET is required"):
         create_web_app(settings)
 
 
-async def test_basic_auth_protects_every_route(tmp_path: Path) -> None:
-    settings = _settings(tmp_path, web_host="0.0.0.0", web_password="correct horse")
+async def test_telegram_browser_session_protects_every_route(tmp_path: Path) -> None:
+    account_id = 909580109
+    _seed_session_account(tmp_path, account_id)
+    settings = _settings(
+        tmp_path,
+        web_host="0.0.0.0",
+        web_session_secret="test-session-secret",
+    )
     application = create_web_app(settings)
 
     async with application.router.lifespan_context(application):
         transport = httpx.ASGITransport(app=application)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             denied = await client.get("/healthz")
-            accepted = await client.get("/healthz", auth=(settings.web_username, "correct horse"))
+            client.cookies.set(
+                TelegramWebSession.cookie_name,
+                application.state.web_session.issue(account_id),
+            )
+            accepted = await client.get("/healthz")
+            client.cookies.clear()
+            basic = await client.get(
+                "/healthz",
+                headers={"Authorization": "Basic YXJjaGl2ZXI6Y29ycmVjdCBob3JzZQ=="},
+            )
 
-    assert denied.status_code == 401
-    assert denied.headers["www-authenticate"].startswith("Basic")
+    assert denied.status_code == 303
+    assert denied.headers["location"] == "/auth/telegram?next=/healthz"
     assert denied.headers["content-security-policy"].startswith("default-src 'self'")
     assert accepted.status_code == 200
     assert accepted.json() == {"status": "ok"}
+    assert basic.status_code == 303
 
 
 class _FakeTelegramAuth:
@@ -181,6 +603,37 @@ async def test_telegram_account_page_and_csrf_protection(tmp_path: Path) -> None
     assert qr_image.headers["content-type"].startswith("image/svg+xml")
     assert alias.status_code == 307
     assert alias.headers["location"] == "/auth/telegram"
+
+
+async def test_telegram_continue_issues_browser_session(tmp_path: Path) -> None:
+    account_id = 909580109
+    _seed_session_account(tmp_path, account_id)
+    settings = _settings(tmp_path, web_session_secret="test-session-secret")
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        await application.state.telegram_auth.close()
+        fake_auth = _FakeTelegramAuth()
+        fake_auth.snapshot = TelegramAuthSnapshot(
+            TelegramAuthStatus.CONNECTED,
+            "Telegram is connected.",
+            identity="@archive_owner",
+        )
+        application.state.telegram_auth = fake_auth
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", follow_redirects=False
+        ) as client:
+            response = await client.post(
+                "/auth/telegram/continue",
+                data={"csrf_token": application.state.csrf_token, "next": "/operations"},
+            )
+            health = await client.get("/healthz")
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/operations"
+    assert TelegramWebSession.cookie_name in response.headers["set-cookie"]
+    assert health.status_code == 200
 
 
 async def test_web_chat_selection_saves_specific_and_all_modes(tmp_path: Path) -> None:
@@ -322,7 +775,7 @@ async def test_web_operations_run_with_progress_csrf_and_safe_stop(tmp_path: Pat
     async with application.router.lifespan_context(application):
         application.state.operations = OperationManager(
             settings,
-            application.state.database,
+            OperationRepository(application.state.database),
             executors={"sync": fake_sync, "listen": fake_listener},
         )
         await application.state.operations.startup()
@@ -389,6 +842,7 @@ async def test_web_operations_run_with_progress_csrf_and_safe_stop(tmp_path: Pat
                 phase="cancelled",
                 detail="Stopped safely by the operator",
             )
+            cancelled_sync_status = await client.get(f"/api/v1/operations/{sync_id}")
             sync_page = await client.get(f"/operations?job={sync_id}")
 
             listener_started = await client.post(
@@ -413,6 +867,26 @@ async def test_web_operations_run_with_progress_csrf_and_safe_stop(tmp_path: Pat
                 if final_listener.json()["operation"]["terminal"]:
                     break
                 await asyncio.sleep(0.01)
+            listener_page = await client.get(f"/operations?job={listener_id}")
+            retried = await client.post(
+                f"/operations/{listener_id}/retry",
+                data={"csrf_token": application.state.csrf_token},
+            )
+            retried_id = int(retried.headers["location"].split("job=")[1].split("&")[0])
+            for _ in range(100):
+                retry_status = await client.get(f"/api/v1/operations/{retried_id}")
+                if retry_status.json()["operation"]["phase"] == "starting":
+                    break
+                await asyncio.sleep(0.01)
+            retry_stopped = await client.post(
+                f"/operations/{retried_id}/stop",
+                data={"csrf_token": application.state.csrf_token},
+            )
+            for _ in range(100):
+                retry_final = await client.get(f"/api/v1/operations/{retried_id}")
+                if retry_final.json()["operation"]["terminal"]:
+                    break
+                await asyncio.sleep(0.01)
             resumed = await client.post(
                 f"/operations/{sync_id}/resume",
                 data={"csrf_token": application.state.csrf_token},
@@ -433,6 +907,14 @@ async def test_web_operations_run_with_progress_csrf_and_safe_stop(tmp_path: Pat
     assert "Unknown content type" in unknown_type.text
     assert started.status_code == 303
     assert "Resume sync" in sync_page.text
+    assert cancelled_sync_status.json()["operation"]["action"] == {
+        "kind": "resume",
+        "label": "Resume sync",
+        "enabled": True,
+    }
+    assert "Restart listener" in listener_page.text
+    assert retried.status_code == 303
+    assert retry_stopped.status_code == 303
     assert resumed.status_code == 303
     assert resumed.headers["location"].startswith(f"/operations?job={sync_id}&")
     assert captured == {
@@ -477,3 +959,140 @@ async def test_filtered_csv_export_neutralizes_spreadsheet_formulas(tmp_path: Pa
     assert rows[0]["sender_name"] == "'+Formula sender"
     assert rows[0]["text"] == "'=2+3"
     assert rows[0]["filename"] == "'@payload.pdf"
+
+
+def _system_settings_form(concurrency: str = "2", log_level: str = "INFO") -> dict[str, str]:
+    return {
+        "download_photos": "false",
+        "download_videos": "false",
+        "download_audios": "false",
+        "download_documents": "false",
+        "max_file_size_mb": "100",
+        "download_concurrency": concurrency,
+        "download_retries": "3",
+        "web_refresh_seconds": "30",
+        "allowed_extensions": "",
+        "ignored_extensions": "",
+        "keywords": "",
+        "log_level": log_level,
+    }
+
+
+async def test_web_system_settings_saves_applies_and_resets(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", follow_redirects=True
+        ) as client:
+            initial = await client.get("/system")
+            assert initial.status_code == 200
+            assert "Effective configuration" in initial.text
+            assert initial.text.count(">overridden<") == 0
+
+            form = _system_settings_form(concurrency="7", log_level="DEBUG")
+            saved = await client.post(
+                "/system/settings", data={"csrf_token": application.state.csrf_token, **form}
+            )
+            assert saved.status_code == 200
+            assert "Configuration saved." in saved.text
+            assert 'name="download_concurrency" min="1" max="20" value="7"' in saved.text
+            assert 'name="max_file_size_mb" min="0" value="100"' in saved.text
+            assert 'name="web_refresh_seconds" min="5" max="3600" value="30"' in saved.text
+            assert '<option value="DEBUG" selected' in saved.text
+            assert saved.text.count(">overridden<") == 8
+
+            applied = await client.get("/system")
+            assert 'name="download_concurrency" min="1" max="20" value="7"' in applied.text
+            assert '<option value="DEBUG" selected' in applied.text
+            assert applied.text.count(">overridden<") == 8
+
+            reset_one = await client.post(
+                "/system/settings",
+                data={
+                    "csrf_token": application.state.csrf_token,
+                    **_system_settings_form(concurrency="2", log_level="DEBUG"),
+                },
+            )
+            assert reset_one.status_code == 200
+            assert 'name="download_concurrency" min="1" max="20" value="2"' in reset_one.text
+            assert (
+                "download_concurrency"
+                not in await RuntimeSettingsRepository(application.state.database).overrides()
+            )
+
+            reset = await client.post(
+                "/system/settings/reset", data={"csrf_token": application.state.csrf_token}
+            )
+            assert reset.status_code == 200
+            assert "Configuration reset." in reset.text
+            assert 'name="download_concurrency" min="1" max="20" value="2"' in reset.text
+            assert reset.text.count(">overridden<") == 0
+
+            after_reset = await client.get("/system")
+            assert 'name="download_concurrency" min="1" max="20" value="2"' in after_reset.text
+            assert after_reset.text.count(">overridden<") == 0
+
+
+async def test_web_system_settings_rejects_invalid_values_and_csrf(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", follow_redirects=True
+        ) as client:
+            invalid_form = _system_settings_form(log_level="loud")
+            invalid_form["allowed_extensions"] = "pdf"
+            for checkbox in (
+                "download_photos",
+                "download_videos",
+                "download_documents",
+                "download_audio",
+            ):
+                invalid_form.pop(checkbox, None)
+            invalid = await client.post(
+                "/system/settings",
+                data={
+                    "csrf_token": application.state.csrf_token,
+                    **invalid_form,
+                },
+            )
+            assert invalid.status_code == 422
+            assert "Configuration was not saved." in invalid.text
+            assert "loud" in invalid.text
+            assert 'name="allowed_extensions" value="pdf"' in invalid.text
+            assert 'name="download_photos" value="true" checked' not in invalid.text
+
+            csrf_rejected = await client.post(
+                "/system/settings", data={"csrf_token": "wrong", **_system_settings_form()}
+            )
+            assert csrf_rejected.status_code == 403
+
+            reset_rejected = await client.post(
+                "/system/settings/reset", data={"csrf_token": "wrong"}
+            )
+            assert reset_rejected.status_code == 403
+
+
+async def test_web_ignores_invalid_runtime_rows_on_startup(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _settings(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize()
+    await RuntimeSettingsRepository(database).set_values(
+        {"download_concurrency": "many", "download_retries": "5"}
+    )
+    await database.close()
+    application = create_web_app(settings)
+
+    with caplog.at_level("WARNING"):
+        async with application.router.lifespan_context(application):
+            assert application.state.settings.download_concurrency == 2
+            assert application.state.settings.download_retries == 5
+
+    assert "Ignoring invalid runtime setting download_concurrency" in caplog.text

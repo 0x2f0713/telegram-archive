@@ -1,10 +1,11 @@
 import asyncio
 from types import SimpleNamespace
 
+from app.application.archive import ArchiveService, ProcessResult, RetryProgress
+from app.application.archive_records import RetryCandidate
+from app.application.listener import ListenerProgress, RealtimeListener
 from app.config import Settings
-from app.database.repository import RetryCandidate
-from app.services.archive import ArchiveService, ProcessResult
-from app.telegram.listener import RealtimeListener
+from app.infrastructure.telegram.translation import content_types_of, message_data
 from tests.helpers import make_chat
 
 
@@ -30,11 +31,17 @@ class SelectiveArchive:
 async def test_listener_schedules_only_selected_content_types() -> None:
     chat = make_chat()
     archive = SelectiveArchive()
+    progress: list[ListenerProgress] = []
+
+    async def record_progress(update: ListenerProgress) -> None:
+        progress.append(update)
+
     listener = RealtimeListener(
         SimpleNamespace(),
         {chat.telegram_chat_id: chat},
         archive,  # type: ignore[arg-type]
         Settings(_env_file=None),
+        progress=record_progress,
         manage_signals=False,
     )
 
@@ -54,6 +61,8 @@ async def test_listener_schedules_only_selected_content_types() -> None:
     await asyncio.gather(*tasks)
 
     assert archive.processed == [2]
+    assert [update.stage for update in progress] == ["started", "completed"]
+    assert all(update.chat_id == chat.telegram_chat_id for update in progress)
 
 
 class RetryRepository:
@@ -91,17 +100,28 @@ async def test_retry_does_not_fetch_unselected_media_types() -> None:
         Settings(_env_file=None),
         repository,  # type: ignore[arg-type]
         SimpleNamespace(),  # type: ignore[arg-type]
+        message_data,
+        content_types_of,
+        lambda _error: None,
+        lambda _error: False,
         frozenset({"voice"}),
     )
     client = RecordingClient()
     chat = make_chat()
+    progress: list[RetryProgress] = []
+
+    async def record_progress(update: RetryProgress) -> None:
+        progress.append(update)
 
     attempted, completed = await archive.retry_candidates(
         client,
         {chat.telegram_chat_id: chat},
         failed_only=True,
+        progress=record_progress,
     )
 
     assert attempted == 0
     assert completed == 0
     assert client.calls == 0
+    assert progress[1].chat_id == chat.telegram_chat_id
+    assert progress[1].chat_title == chat.title

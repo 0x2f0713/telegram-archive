@@ -4,7 +4,7 @@ This how-to guide is for developers and operators integrating Telegram Archiver 
 
 ## Runtime contract
 
-The application requires Python 3.12+, writable persistent storage, outbound access to Telegram, and this environment contract. Only `TG_API_HASH`, `WEB_PASSWORD`, and the resulting session data are secrets in this example:
+The application requires Python 3.12+, writable persistent storage, outbound access to Telegram, and this environment contract. `TG_API_HASH`, `WEB_SESSION_SECRET`, and the resulting Telegram session data are secrets in this example:
 
 ```dotenv
 TG_API_ID=123456
@@ -16,8 +16,7 @@ TARGET_CHATS=-1001234567890
 WEB_HOST=127.0.0.1
 WEB_PORT=8686
 WEB_HOST_PORT=8686
-WEB_USERNAME=archiver
-WEB_PASSWORD=
+WEB_SESSION_SECRET=replace_with_a_long_random_value
 WEB_REFRESH_SECONDS=15
 TUI_REFRESH_SECONDS=5
 ```
@@ -75,32 +74,31 @@ The included image has this interface:
 ENTRYPOINT: python -m app
 default command: listen
 persistent paths: /app/data, /app/downloads
-runtime user: UID/GID 10001
+runtime user: UID/GID 10001 by default (configurable with `ARCHIVER_UID`/`ARCHIVER_GID`)
 ```
 
-The included Compose file uses named volumes. To expose archives directly on the host, replace them with bind mounts and grant the container user access:
+The included Compose file uses configurable bind mounts. `ARCHIVER_DATA_DIR` stores the SQLite database, WAL sidecars, web state, and Telethon session; `ARCHIVER_DOWNLOADS_DIR` stores downloaded media:
 
 ```yaml
 services:
   telegram-archiver:
     volumes:
-      - ./data:/app/data
-      - ./downloads:/app/downloads
+      - ${ARCHIVER_DATA_DIR:-./data}:/app/data
+      - ${ARCHIVER_DOWNLOADS_DIR:-./downloads}:/app/downloads
 ```
 
-On Linux, either make these directories owned by UID/GID 10001 or set Compose `user` to a host UID/GID that can write the mounts. Never mount a session file read-only: Telethon may update it. Do not put secret values in the Dockerfile or image build arguments.
+On Linux, set `ARCHIVER_UID` and `ARCHIVER_GID` to the host owner of these directories. Never mount a session file read-only: Telethon may update it. Do not put secret values in the Dockerfile or image build arguments.
 
 When using `CONFIG_FILE` in Docker, mount that YAML file read-only and set its container path, for example `./config.yml:/app/config.yml:ro` with `CONFIG_FILE=/app/config.yml`. The default Compose stack relies on `TARGET_CHATS` and does not mount an optional YAML file automatically.
 
-Use the same named volume during interactive login and the listener. A login container using a different volume creates a session the worker cannot see.
+Use the same bind-mounted data directory during interactive login and the listener. A login container using a different mount creates a session the worker cannot see.
 
 ### Add the web dashboard to Compose
 
-The included `telegram-web` service is behind the `web` profile. It shares `archive-data` and `archive-downloads` with the worker and publishes the configured host port on loopback only. Set a strong password in `.env` before starting it because its container bind is `0.0.0.0`:
+The included `telegram-web` service is behind the `web` profile. It shares the configured data and download bind mounts with the worker and publishes the configured host port on loopback only. Set a long random `WEB_SESSION_SECRET` in `.env` because its container bind is `0.0.0.0`:
 
 ```dotenv
-WEB_USERNAME=archiver
-WEB_PASSWORD=replace_with_a_long_unique_password
+WEB_SESSION_SECRET=replace_with_a_long_random_value
 WEB_HOST_PORT=8686
 ```
 
@@ -115,7 +113,7 @@ Open `http://127.0.0.1:8686`. Starting the named `telegram-web` service avoids a
 ssh -L 8686:127.0.0.1:8686 archive-host
 ```
 
-Then browse to `http://127.0.0.1:8686` on the operator machine. If you use a reverse proxy instead, keep the application port private, terminate HTTPS at the proxy, preserve the `Authorization` header, and add a stronger identity-aware access layer when practical. Application Basic Auth is an access check, not transport encryption.
+Then browse to `http://127.0.0.1:8686` on the operator machine, approve or confirm the Telegram account, and continue into the archive. If you use a reverse proxy instead, keep the application port private, terminate HTTPS at the proxy, preserve cookies, and add a stronger identity-aware access layer when practical. The signed Telegram browser session is an access check, not transport encryption.
 
 ### Run the TUI in Compose
 
@@ -129,7 +127,7 @@ Compose allocates an interactive terminal by default. Use `q` for a clean exit. 
 
 ## Web integration reference
 
-Start the dashboard locally with `python -m app web`. `--host` and `--port` override `WEB_HOST` and `WEB_PORT` for that invocation. An unauthenticated non-loopback bind fails at startup. When `WEB_PASSWORD` is non-empty, HTTP Basic Auth protects every route, including static files, health checks, JSON, and media.
+Start the dashboard locally with `python -m app web`. `--host` and `--port` override `WEB_HOST` and `WEB_PORT` for that invocation. An unauthenticated non-loopback bind fails at startup. When `WEB_SESSION_SECRET` is set, the signed Telegram browser session protects every route, including health checks, JSON, and media.
 
 The HTML routes are:
 
@@ -146,6 +144,8 @@ The HTML routes are:
 | `GET` | `/system` | Redacted runtime and security posture |
 | `GET` | `/auth/telegram` | Existing-account status and official QR connection workflow |
 | `POST` | `/auth/telegram/start` | CSRF-protected creation of one short-lived QR request |
+| `POST` | `/auth/telegram/continue` | CSRF-protected creation of a Telegram-bound browser session |
+| `POST` | `/auth/telegram/logout` | Clears the current browser session |
 | `GET` | `/auth/telegram/qr.svg` | Current QR image while authorization is pending |
 | `GET` | `/media/{database_id}` | Completed media constrained to `DOWNLOAD_DIR` |
 | `GET` | `/exports/messages.csv` | Streamed CSV using the active message filters |
@@ -186,14 +186,14 @@ curl --get http://127.0.0.1:8686/api/v1/messages \
   --data-urlencode 'page_size=25'
 ```
 
-With dashboard authentication enabled:
+With Telegram browser authentication enabled:
 
 ```bash
-curl --user "$WEB_USERNAME:$WEB_PASSWORD" --fail \
+curl --cookie "telegram_archiver_session=$TELEGRAM_ARCHIVER_SESSION" --fail \
   http://127.0.0.1:8686/api/v1/stats
 ```
 
-Avoid putting the literal password in a command because it can enter shell history. The environment-variable form above still exposes it to the local process environment, so use a protected secret source in managed deployments.
+Obtain the browser cookie through the web login flow. Avoid copying it into shell history or logs because it grants access until it expires.
 
 ## Telegram QR authorization integration
 
@@ -202,13 +202,14 @@ The `/auth/telegram` flow implements Telegram's official QR login protocol throu
 Authorization sequence:
 
 1. Start the web service with `TG_API_ID`, `TG_API_HASH`, and a writable persistent `TG_SESSION_NAME`.
-2. Open `/auth/telegram` through loopback, an SSH tunnel, or a TLS-protected reverse proxy with Basic Auth enabled.
+2. Open `/auth/telegram` through loopback, an SSH tunnel, or a TLS-protected reverse proxy.
 3. Submit the start form and scan the code in Telegram under **Settings → Devices → Link Desktop Device**.
 4. Poll `/api/v1/auth/telegram` only for `pending`, `connected`, `expired`, `two_factor`, `failed`, or `unavailable` state.
-5. If `two_factor` is returned, stop the web attempt and run `python -m app login` in a trusted terminal. The web process does not accept the Telegram password.
-6. Run `python -m app chats` and configure only IDs shown for that authenticated account.
+5. When the account is connected, choose **Continue to archive**. The server signs an HttpOnly cookie bound to the Telegram user ID in the local session.
+6. If `two_factor` is returned, stop the web attempt and run `python -m app login` in a trusted terminal. The web process does not accept the Telegram password.
+7. Run `python -m app chats` and configure only IDs shown for that authenticated account.
 
-Do not proxy or cache `/auth/telegram/qr.svg`, capture it in observability tools, or embed it in another origin. Security middleware sends `Cache-Control: no-store`, a same-origin Content Security Policy, frame denial, and no-referrer headers. Do not start simultaneous CLI and web authorization attempts against the same session file. Existing authorized sessions are detected and reused; no new QR is created.
+Do not proxy or cache `/auth/telegram/qr.svg`, capture it in observability tools, or embed it in another origin. Security middleware sends `Cache-Control: no-store`, a same-origin Content Security Policy, frame denial, and no-referrer headers. Do not start simultaneous CLI and web authorization attempts against the same session file. Existing authorized sessions are detected and reused; no new QR is created. A browser must still choose **Continue to archive** before protected pages are available.
 
 This connection is single-account and local. "Register" means initializing the archive with an existing Telegram account. New Telegram account registration stays in Telegram's official applications.
 
@@ -218,13 +219,13 @@ For an in-process integration, construct one settings/database/repository/servic
 
 ```python
 from app.config import Settings
-from app.database.repository import ArchiveRepository
-from app.database.session import Database
-from app.services.archive import ArchiveService
-from app.services.chat_selection import ChatSelectionService
-from app.services.downloader import MediaDownloader
-from app.telegram.client import connect_authorized, create_client
-from app.telegram.history import sync_history
+from app.infrastructure.persistence.repository import ArchiveRepository
+from app.infrastructure.persistence.database import Database
+from app.application.archive import ArchiveService
+from app.application.chat_selection import ChatSelectionService
+from app.infrastructure.download import MediaDownloader
+from app.infrastructure.telegram.client import connect_authorized, create_client
+from app.application.sync import sync_history
 
 settings = Settings()
 database = Database(settings.database_url)
@@ -252,7 +253,9 @@ finally:
 
 Do not share a SQLAlchemy `AsyncSession`; repository operations intentionally create short-lived transactions. One `ArchiveService` may process concurrent listener events safely: a per-message lock prevents duplicate work and `MediaDownloader` applies the configured global semaphore. Historical sync also uses `DOWNLOAD_CONCURRENCY` as its bounded in-flight window. It settles tasks and advances the per-chat checkpoint in source order, so a newer completed transfer can never make restart recovery skip older in-flight work.
 
-`ChatInfo` and `MessageData` in `app.telegram.entities` are the adapter boundary between Telethon objects and archive logic. Integrations should prefer these data types and repository methods over direct ORM mutation, because explicit repository transitions preserve retry and deduplication invariants.
+`ChatInfo` and `MessageData` in `app.domain` are the pure business value objects. `app.infrastructure.telegram.translation` adapts raw Telethon objects into them at the adapter boundary. Integrations should prefer these data types and repository methods over direct ORM mutation, because explicit repository transitions preserve retry and deduplication invariants.
+
+The package layout follows the business model: `app.domain` holds the artifact hierarchy (Chat -> Message -> MediaArtifact) with no framework imports, `app.application` holds the workflows (archive, sync, listener, operations, media policy), `app.infrastructure` holds the Telethon, persistence, and download adapters, and `app.interfaces` holds the CLI, TUI, and web surfaces.
 
 ## Database and file consistency contract
 

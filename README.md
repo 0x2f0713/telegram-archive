@@ -205,7 +205,65 @@ python -m app stats
 python -m app doctor
 ```
 
-`stats` reports selected chats, archived messages, downloaded files/bytes, skipped and failed media, and the newest archived message per known chat. `doctor` checks required environment values, SQLite access, download-directory writes, session authorization, and access to every selected chat. It never prints the API hash or session content.
+`stats` reports selected chats, archived messages, downloaded files/bytes, skipped and failed media, and the newest archived message per known chat. `doctor` checks required environment values, SQLite access, download-directory writes, session authorization, and access to every selected chat. In TeraBox mode it also verifies the TeraBox login, the remote archive folder, and the unidisk mount. It never prints the API hash, session content, or the ndus cookie.
+
+## Storage modes: hard drive or TeraBox
+
+`STORAGE_MODE` selects where archived media lives. Everything else — database, chat selection, web dashboard, sync/listen/retry commands — is identical in both modes.
+
+### `local` (default)
+
+Unchanged behavior: media stays in `DOWNLOAD_DIR` on the hard drive. Faststart remuxes and HEVC→H.264 variants are honored.
+
+### `terabox`
+
+Archives media to a TeraBox drive while the hard drive acts as a temporary
+download buffer and a read cache:
+
+1. Each download still writes to `DOWNLOAD_DIR` through the crash-safe
+   `.part` flow.
+2. After the atomic rename, the file is uploaded to TeraBox using the Web
+   upload protocol (server-side dedupe via `rapidupload` first, then
+   chunked `superfile2` upload and commit), and the upload is verified
+   against the server's size/MD5.
+3. The verified local copy is then removed; the archive row points at the
+   read-only unidisk FUSE mount (`TERABOX_MOUNT_DIR`), whose block cache
+   sits on the hard drive, so playback and thumbnails read back through the
+   cache without re-downloading from Telegram.
+
+Consequences of remote storage:
+
+- **Pristine originals only.** `MEDIA_FASTSTART` and `MEDIA_VARIANTS` are
+  forced off in this mode; the cloud keeps unmodified source files and the
+  `optimize-media` operation is disabled.
+- **Repair semantics.** A file left in `DOWNLOAD_DIR` without a completed
+  status is treated as downloaded-but-not-uploaded and is uploaded on the
+  next sync/retry, without re-downloading from Telegram.
+- **Credentials.** `TERABOX_NDUS` (or the `ndus` key of
+  `TERABOX_PROFILE`, a unidisk `terabox.profile.json`) authenticates the
+  upload API. Refresh the cookie when doctor reports a login failure.
+
+Minimal `.env` additions for TeraBox mode:
+
+```dotenv
+STORAGE_MODE=terabox
+TERABOX_NDUS=your_ndus_cookie
+# or: TERABOX_PROFILE=/mnt/data/workspace/terabox-drive/terabox.profile.json
+TERABOX_MOUNT_DIR=/mnt/data/workspace/terabox-drive/mnt/terabox
+TERABOX_REMOTE_DIR=/Telegram Archive
+```
+
+Mount requirements for reading archived media back:
+
+- Start the unidisk FUSE mount before launching the app: run
+  `mount.sh` in the `terabox-drive` repo (or ensure your service brings up
+  `/mnt/data/workspace/terabox-drive/mnt/terabox`).
+- Ensure the mount is readable by the app's user. For bind mounting into
+  Docker, pass `allow_other` at FUSE mount time and keep `ARCHIVER_UID`
+  matching the mount owner.
+- With Docker Compose the host mount path is exposed read-only at
+  `/mnt/terabox` automatically; the container overrides
+  `TERABOX_MOUNT_DIR`/`TERABOX_PROFILE` to that path.
 
 ## Web dashboard and Telegram account connection
 
@@ -224,28 +282,28 @@ The Operations page exposes the application workflows that previously required a
 - **Retry failed** can narrow recovery to selected media categories and reports candidate and completed counts.
 - **Doctor** reports configuration, SQLite, download storage, authorization, and selected-chat checks without exposing credentials.
 
-Only one web operation runs at a time. Start and stop actions are allowlisted application calls protected by the same Basic Auth and CSRF boundary as chat selection; the browser cannot supply a shell command. Job state and bounded logs are stored in SQLite, so completed history survives page reloads. If the web process exits during a job, that job is marked `interrupted` at restart; the next sync resumes from message checkpoints and completed files. Do not run a separate CLI `sync`, `listen`, `retry-failed`, or `doctor` against the same Telethon session while a web operation is active.
+Only one web operation runs at a time. Start and stop actions are allowlisted application calls protected by a signed Telegram-bound browser session and CSRF, just like chat selection; the browser cannot supply a shell command. Job state and bounded logs are stored in SQLite, so completed history survives page reloads. If the web process exits during a job, that job is marked `interrupted` at restart; the next sync resumes from message checkpoints and completed files. Do not run a separate CLI `sync`, `listen`, `retry-failed`, or `doctor` against the same Telethon session while a web operation is active.
 
 The **Account** page adds a safe first-run alternative to `python -m app login`:
 
 1. Open `/auth/telegram` and select **Create secure QR code**.
 2. In the official Telegram mobile app, open **Settings → Devices → Link Desktop Device**.
 3. Scan the short-lived QR code and approve the connection.
-4. The resulting Telethon session is stored at `TG_SESSION_NAME`, exactly as with CLI login.
+4. Choose **Continue to archive** to sign this browser in to the connected Telegram account.
+5. The resulting Telethon session is stored at `TG_SESSION_NAME`, exactly as with CLI login.
 
 This flow connects an existing Telegram account. It does not create a Telegram account; use an official Telegram app to register a new account first. The web application never asks for a phone number, OTP, Telegram password, API hash, or uploaded session. If the account has Telegram 2FA enabled, complete the process with `python -m app login` so the password stays in Telethon's interactive terminal flow.
 
-The default bind is loopback-only and does not require a web password. Any non-loopback `WEB_HOST`, including `0.0.0.0`, is rejected unless `WEB_PASSWORD` is set:
+The default bind is loopback-only. The browser sign-in is tied to the local Telegram account and stored as a signed HttpOnly cookie. Any non-loopback `WEB_HOST`, including `0.0.0.0`, is rejected unless a persistent `WEB_SESSION_SECRET` is set:
 
 ```dotenv
 WEB_HOST=127.0.0.1
 WEB_PORT=8686
-WEB_USERNAME=archiver
-WEB_PASSWORD=
+WEB_SESSION_SECRET=
 WEB_REFRESH_SECONDS=15
 ```
 
-Use a long, unique password if the dashboard is exposed through a private network. Basic Auth does not provide transport encryption, so terminate TLS in a trusted reverse proxy before allowing remote access. Do not expose it directly to the public internet. Media delivery is limited to completed database records whose resolved files remain inside `DOWNLOAD_DIR`.
+Use a long, random session secret if the dashboard is exposed through a private network. The Telegram cookie is an application login session, not transport encryption, so terminate TLS in a trusted reverse proxy before allowing remote access. Do not expose it directly to the public internet. Media delivery is limited to completed database records whose resolved files remain inside `DOWNLOAD_DIR`.
 
 Read-only integration endpoints are:
 
@@ -259,7 +317,7 @@ Read-only integration endpoints are:
 
 The operator-only `POST /chats/selection` form saves the durable selection policy after refreshing Telegram's accessible dialogs. `POST /operations/start` and `POST /operations/{id}/stop` control allowlisted jobs. Every mutation rejects invalid CSRF tokens; chat selection also rejects IDs absent from the authenticated account's current dialog list.
 
-When `WEB_PASSWORD` is configured, the same Basic Auth credentials protect HTML, JSON, static assets, health checks, and archived media.
+When `WEB_SESSION_SECRET` is configured, the signed Telegram browser session protects every route, including health checks, JSON, operations, and media. The QR bootstrap page and its short-lived QR image remain public so the operator can establish the first session.
 
 ## Terminal dashboard
 
@@ -286,21 +344,21 @@ docker compose up -d
 docker compose logs -f telegram-archiver
 ```
 
-The service defaults to `listen`. Compose overrides internal paths to `/app/data` and `/app/downloads` and persists them in named volumes `archive-data` and `archive-downloads`; secrets remain runtime environment values and are never baked into the image. `docker compose down` preserves volumes. `docker compose down -v` permanently deletes the database, session, and downloads and should be used only intentionally.
+The service defaults to `listen`. Compose mounts host directories from `ARCHIVER_DATA_DIR` and `ARCHIVER_DOWNLOADS_DIR` into `/app/data` and `/app/downloads`; set `ARCHIVER_UID` and `ARCHIVER_GID` to the directories' owner when using bind mounts. Secrets remain runtime environment values and are never baked into the image. `docker compose down` preserves the mounted files.
 
-Run the TUI against the same volumes with:
+Run the TUI against the same mounted directories with:
 
 ```bash
 docker compose run --rm telegram-archiver tui
 ```
 
-The optional web service binds only to host loopback. Set a strong `WEB_PASSWORD` in `.env` because the container listens on `0.0.0.0` internally, then start its profile:
+The optional web service binds only to host loopback. Set a long random `WEB_SESSION_SECRET` in `.env` because the container listens on `0.0.0.0` internally, then start its profile:
 
 ```bash
 docker compose --profile web up -d telegram-web
 ```
 
-Visit [http://127.0.0.1:8686](http://127.0.0.1:8686) and enter `WEB_USERNAME` plus `WEB_PASSWORD`. Starting only `telegram-web` lets the Operations page own sync/listener lifecycle. Do not also start `telegram-archiver` while a web worker is active; both services share the same sensitive session and persistent volumes.
+Visit [http://127.0.0.1:8686](http://127.0.0.1:8686), connect or confirm the Telegram account, and choose **Continue to archive**. Starting only `telegram-web` lets the Operations page own sync/listener lifecycle. Do not also start `telegram-archiver` while a web worker is active; both services share the same sensitive session and mounted persistent directories.
 
 To use a custom host port without changing the container port, add this to `.env`:
 
@@ -312,12 +370,46 @@ Then open `http://127.0.0.1:9090`. The Compose mapping is `127.0.0.1:${WEB_HOST_
 
 For bind-mounted files or embedding into another service, see [INTEGRATION.md](INTEGRATION.md).
 
+### Media delivery and transcoding
+
+Posters and HEVC→H.264 variants use a host-side ffmpeg when one is mounted. `FFMPEG_BIN`, `FFPROBE_BIN`, and `FFMPEG_LIB_DIR` point at the binaries and their dynamic libraries; `FFMPEG_LD_LIBRARY_PATH` is applied only to ffmpeg child processes, never the app. Keep `FFMPEG_LIB_DIR` curated (no `libc`/`libm`/`libpthread`) so the container's own runtime is never shadowed. Without ffmpeg, galleries fall back to the original video and no posters are extracted.
+
+Rockchip boards ship an MPP userspace built for their host glibc. In a container with a different glibc, `hevc_rkmpp` **decode** fails at runtime while `h264_rkmpp` **encode** still works, so set `VIDEO_HWACCEL=none` (software decode, hardware encode) there:
+
+```dotenv
+FFMPEG_BIN=/usr/bin/ffmpeg
+FFPROBE_BIN=/usr/bin/ffprobe
+FFMPEG_LIB_DIR=./.ffmpeg-libs
+VIDEO_HWACCEL=none
+```
+
+### Remote transcoding node
+
+HEVC transcodes can run on a second machine with its own working Rockchip ffmpeg, leaving the app host's VPU free. The setup assumes both machines share the archive via NFS at the **same absolute path** (e.g. `/mnt/disk2/telegram-archiver/downloads`) and that the remote `uid` matches the archive owner:
+
+1. Install the host's Rockchip ffmpeg natively on the node (do not replace `/usr/bin/ffmpeg`): binaries in `/usr/local/lib/ffmpeg-custom/` with a `/usr/local/bin/ffmpeg` wrapper that sets `LD_LIBRARY_PATH=/usr/local/lib/ffmpeg-custom`, and verify `h264_rkmpp`/`hevc_rkmpp` are present.
+2. Export the archive over NFS from the app host and mount it on the node at the identical path.
+3. Give the container passwordless SSH access: `SSH_DIR` (default `~/.ssh`) is bind-mounted read-only at `/app/.ssh`; the image ships `openssh-client`.
+
+Then enable remote transcoding on the web service:
+
+```dotenv
+FFMPEG_REMOTE_HOST=namhh@192.168.1.2
+FFMPEG_REMOTE_BIN=/usr/local/bin/ffmpeg
+FFMPEG_REMOTE_IDENTITY=/app/.ssh/id_ed25519
+FFMPEG_REMOTE_KNOWN_HOSTS=/app/.ssh/known_hosts
+HOST_DOWNLOAD_DIR=/mnt/disk2/telegram-archiver/downloads
+```
+
+The app translates container paths to `HOST_DOWNLOAD_DIR` before invoking the remote command, forces `-hwaccel rkmpp` (the node's native MPP works), and streams progress over ssh unchanged. If ssh fails (host down, key rejected), the transcode automatically falls back to a local run. Leave `FFMPEG_REMOTE_HOST` empty to always transcode locally.
+
 ## Recovery and troubleshooting
 
 - **Not authenticated:** run `python -m app login` in the same environment and with the same `TG_SESSION_NAME` used by other commands.
 - **Chat ID cannot be resolved:** run `python -m app chats`; confirm the account is still a member and copy the exact ID. The archiver will not request an inaccessible entity.
 - **A chat shows as deleted:** Telegram no longer returns a usable name for that dialog. Its Telegram ID is retained so existing archive records remain identifiable, but inaccessible content is never requested.
 - **Database is locked:** ensure only a small number of archiver processes use the same SQLite file. WAL and a 30-second busy timeout are enabled, but SQLite is not a multi-host database.
+- **QueuePool limit reached:** confirm the service is current and inspect preceding `SQLite connection checked out` warnings for the retaining task. Stop duplicate host/CLI workers, restart the service, then resume the checkpointed operation.
 - **A `.part` file remains:** the previous attempt did not complete. The next sync/retry removes the stale partial before starting a fresh transfer; it never treats it as archived media.
 - **Completed database row but missing file:** `sync` detects it during the repair pass and downloads it again when Telegram still exposes the message.
 - **FloodWait message:** leave the application running. It sleeps for Telegram's required duration. Do not run many parallel instances against the same account.
@@ -336,7 +428,9 @@ python -m ruff format --check .
 
 Tests use temporary SQLite databases and fake Telegram messages; they do not need a Telegram account or network access.
 
-Dashboard JavaScript, GSAP, CSS, and Geist fonts are bundled locally, so the browser makes no CDN requests. Node.js is needed only when editing frontend assets:
+See [docs/architecture.md](docs/architecture.md) for module boundaries, dependency rules, and composition guidance.
+
+Dashboard JavaScript, CSS, Plyr controls, and Geist fonts are bundled locally, so the browser makes no CDN requests. Node.js is needed only when editing frontend assets:
 
 ```bash
 npm install

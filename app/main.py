@@ -1,5 +1,5 @@
 """Application CLI entrypoint."""
 
-from app.cli.commands import app
+from app.interfaces.cli import app
 
 __all__ = ["app"]

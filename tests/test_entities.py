@@ -1,6 +1,7 @@
 from telethon.tl.types import User
 
-from app.telegram.entities import chat_info, display_chat_title
+from app.domain import display_chat_title
+from app.infrastructure.telegram.translation import chat_info
 
 
 def test_deleted_private_chat_gets_human_title_instead_of_id() -> None:

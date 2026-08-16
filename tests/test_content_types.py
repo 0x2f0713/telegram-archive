@@ -2,16 +2,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.application.media_policy import MediaFilter
 from app.config import Settings
-from app.services.content_types import (
-    ALL_CONTENT_TYPES,
-    ContentTypeSelectionError,
-    canonical_content_type_list,
-    message_content_types,
-    normalize_content_types,
-)
-from app.services.filters import MediaFilter
-from app.telegram.entities import classify_media
+from app.domain import ALL_CONTENT_TYPES, ContentType, ContentTypeSelectionError
+from app.domain.content import canonical_content_type_list, normalize_content_types
+from app.infrastructure.telegram.translation import classify_media, content_types_of
 from tests.helpers import make_message
 
 
@@ -31,8 +26,8 @@ from tests.helpers import make_message
 def test_telegram_downloadable_media_categories_are_distinct(attribute: str, expected: str) -> None:
     message = SimpleNamespace(**{attribute: object()})
 
-    assert classify_media(message) == expected
-    assert message_content_types(message) == frozenset({expected})
+    assert classify_media(message).value == expected
+    assert content_types_of(message) == frozenset({ContentType(expected)})
 
 
 def test_message_can_match_text_and_media_or_other_content() -> None:
@@ -40,15 +35,17 @@ def test_message_can_match_text_and_media_or_other_content() -> None:
     unsupported = SimpleNamespace(message="", media=object())
     service = SimpleNamespace(message="")
 
-    assert message_content_types(captioned_video) == frozenset({"text", "video"})
-    assert message_content_types(unsupported) == frozenset({"other"})
-    assert message_content_types(service) == frozenset({"other"})
+    assert content_types_of(captioned_video) == frozenset({ContentType.TEXT, ContentType.VIDEO})
+    assert content_types_of(unsupported) == frozenset({ContentType.OTHER})
+    assert content_types_of(service) == frozenset({ContentType.OTHER})
 
 
 def test_content_type_aliases_normalize_to_stable_order() -> None:
     selected = normalize_content_types(("images, GIF, voice-messages, pdf",))
 
-    assert selected == frozenset({"photo", "animation", "voice", "document"})
+    assert selected == frozenset(
+        {ContentType.PHOTO, ContentType.ANIMATION, ContentType.VOICE, ContentType.DOCUMENT}
+    )
     assert canonical_content_type_list(selected) == [
         "photo",
         "voice",
@@ -68,7 +65,7 @@ def test_empty_and_unknown_content_selections_are_rejected() -> None:
 def test_operation_selection_distinguishes_voice_from_audio() -> None:
     media_filter = MediaFilter(
         Settings(_env_file=None),
-        frozenset({"voice"}),
+        frozenset({ContentType.VOICE}),
     )
 
     voice = media_filter.evaluate(make_message(media_type="voice", extension=".ogg"))
@@ -82,7 +79,7 @@ def test_operation_selection_distinguishes_voice_from_audio() -> None:
 def test_text_only_selection_archives_caption_without_its_media() -> None:
     media_filter = MediaFilter(
         Settings(_env_file=None),
-        frozenset({"text"}),
+        frozenset({ContentType.TEXT}),
     )
 
     decision = media_filter.evaluate(

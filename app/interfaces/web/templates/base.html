@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#081210">
+  <meta name="description" content="Private local dashboard for Telegram Archiver">
+  <title>{% block title %}Telegram Archiver{% endblock %}</title>
+  <link rel="icon" href="{{ url_for('static', path='/favicon.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', path='/assets/dashboard.css') }}">
+  <script defer src="{{ url_for('static', path='/assets/dashboard.js') }}"></script>
+</head>
+<body class="page-{{ section or 'unknown' }}" data-auto-refresh="{{ 'true' if section == 'overview' else 'false' }}" data-refresh-seconds="{{ refresh_seconds }}">
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+  <div class="route-progress" data-route-progress aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/" aria-label="Telegram Archiver overview">
+        <span class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </span>
+        <span class="brand-copy"><strong>Archive</strong><small>Telegram utility</small></span>
+      </a>
+
+      <nav class="primary-nav" aria-label="Primary navigation">
+        <a href="/" {% if section == 'overview' %}aria-current="page"{% endif %}>Overview</a>
+        <a href="/messages" {% if section == 'messages' %}aria-current="page"{% endif %}>Explorer</a>
+        <a href="/chats" {% if section == 'chats' %}aria-current="page"{% endif %}>Coverage</a>
+        <a href="/operations" {% if section == 'operations' %}aria-current="page"{% endif %}>Operations</a>
+        <a href="/system" {% if section == 'system' %}aria-current="page"{% endif %}>System</a>
+        <a href="/auth/telegram" {% if section == 'account' %}aria-current="page"{% endif %}>Account</a>
+      </nav>
+
+      <div class="topbar-actions">
+        <span class="local-state"><span aria-hidden="true"></span>Local only</span>
+        {% if section != 'account' %}<a class="archive-chat-link" href="/archive/chats" {% if section == 'archived-chats' %}aria-current="page"{% endif %}>Archived chats</a>{% endif %}
+        <button class="command-trigger" type="button" data-command-open aria-haspopup="dialog">
+          Jump to <kbd>⌘ K</kbd>
+        </button>
+        <label class="theme-field">
+          <span class="sr-only">Color theme</span>
+          <select data-theme-select aria-label="Color theme">
+            <option value="dark">Dark</option>
+            <option value="light">Light</option>
+            <option value="system">System</option>
+          </select>
+        </label>
+      </div>
+
+      <details class="mobile-menu">
+        <summary>Menu</summary>
+        <nav aria-label="Mobile navigation">
+          <a href="/" {% if section == 'overview' %}aria-current="page"{% endif %}>Overview</a>
+          <a href="/messages" {% if section == 'messages' %}aria-current="page"{% endif %}>Explorer</a>
+          <a href="/chats" {% if section == 'chats' %}aria-current="page"{% endif %}>Coverage</a>
+          <a href="/operations" {% if section == 'operations' %}aria-current="page"{% endif %}>Operations</a>
+          <a href="/system" {% if section == 'system' %}aria-current="page"{% endif %}>System</a>
+          <a href="/auth/telegram" {% if section == 'account' %}aria-current="page"{% endif %}>Account</a>
+          {% if section != 'account' %}<a href="/archive/chats" {% if section == 'archived-chats' %}aria-current="page"{% endif %}>Archived chats</a>{% endif %}
+          <button type="button" data-command-open>Open command menu</button>
+          <label>Theme
+            <select data-theme-select>
+              <option value="dark">Dark</option>
+              <option value="light">Light</option>
+              <option value="system">System</option>
+            </select>
+          </label>
+        </nav>
+      </details>
+    </div>
+  </header>
+
+  <main id="main-content" tabindex="-1">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="site-footer">
+    <div>
+      <a class="brand footer-brand" href="/">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <span class="brand-copy"><strong>Telegram Archiver</strong><small>Private by design</small></span>
+      </a>
+      <p>SQLite, archived media, and the sensitive Telethon session stay on this machine.</p>
+    </div>
+    <nav aria-label="Footer navigation">
+      <a href="/messages">Search archive</a>
+      <a href="/chats">Chat coverage</a>
+      <a href="/operations">Worker operations</a>
+      <a href="/system">Security posture</a>
+      <a href="/auth/telegram">Telegram account</a>
+      <a href="/healthz">Health JSON</a>
+    </nav>
+    <time datetime="{{ generated_at.isoformat() }}">Rendered {{ generated_at|datetime }}</time>
+  </footer>
+
+  <dialog class="command-dialog" data-command-dialog aria-labelledby="command-title">
+    <div class="command-head">
+      <div><span>Navigation and commands</span><h2 id="command-title">Jump anywhere</h2></div>
+      <button type="button" class="dialog-close" data-command-close aria-label="Close command menu">Close</button>
+    </div>
+    <label class="command-search">
+      <span class="sr-only">Filter commands</span>
+      <input type="search" autocomplete="off" placeholder="Type a page or operator command" data-command-search>
+    </label>
+    <div class="command-list" data-command-list>
+      <a href="/" data-command-item><span>Overview</span><small>Archive health and next action</small></a>
+      <a href="/messages" data-command-item><span>Explorer</span><small>Search every stored record</small></a>
+      <a href="/archive/chats" data-command-item><span>Archived chats</span><small>Browse every archived conversation</small></a>
+      <a href="/messages?status=failed&media_only=true" data-command-item><span>Failed downloads</span><small>Inspect retryable media</small></a>
+      <a href="/chats" data-command-item><span>Coverage</span><small>Review configured coverage</small></a>
+      <a href="/operations" data-command-item><span>Operations</span><small>Run sync, listener, retry, and doctor</small></a>
+      <a href="/system" data-command-item><span>System</span><small>Storage, privacy, and runtime</small></a>
+      <a href="/auth/telegram" data-command-item><span>Telegram account</span><small>Connect or inspect the local session</small></a>
+    </div>
+    <p class="command-empty" data-command-empty hidden>No matching command. Try messages, system, sync, or listen.</p>
+    <div class="command-foot"><span><kbd>↑</kbd><kbd>↓</kbd> move</span><span><kbd>Enter</kbd> open</span><span><kbd>Esc</kbd> close</span></div>
+  </dialog>
+  <div class="toast" data-toast role="status" aria-live="polite" aria-atomic="true"></div>
+</body>
+</html>

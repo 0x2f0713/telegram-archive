@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+{% block title %}Overview | Telegram Archiver{% endblock %}
+{% block content %}
+<header class="overview-workspace-header" aria-labelledby="overview-title">
+  <div>
+    <p class="eyebrow">Archive control</p>
+    <h1 id="overview-title">Archive overview</h1>
+    <p>Current records, media health, and recovery work from the local SQLite archive.</p>
+    <span class="overview-snapshot">Snapshot rendered <time datetime="{{ generated_at.isoformat() }}">{{ generated_at|datetime }}</time></span>
+  </div>
+  <div class="overview-header-actions">
+    <a class="button secondary" href="/messages">Explore messages</a>
+    <a class="button primary" href="{{ next_action[2] }}">{{ next_action[3] }}</a>
+  </div>
+</header>
+
+<section class="next-action-panel" aria-labelledby="next-action-title">
+  <span class="next-action-marker" aria-hidden="true"></span>
+  <div>
+    <p class="panel-kicker">Recommended next action</p>
+    <h2 id="next-action-title">{{ next_action[0] }}</h2>
+    <p>{{ next_action[1] }}</p>
+  </div>
+  <a href="{{ next_action[2] }}">{{ next_action[3] }} <span aria-hidden="true">→</span></a>
+</section>
+
+<dl class="overview-metrics" aria-label="Archive totals">
+  <div>
+    <dt>Messages</dt>
+    <dd>{{ "{:,}".format(overview.stats.total_messages) }}</dd>
+    <span>stored records</span>
+  </div>
+  <div>
+    <dt>Media complete</dt>
+    <dd>{{ "{:,}".format(overview.stats.downloaded_files) }}</dd>
+    <span>downloaded files</span>
+  </div>
+  <div>
+    <dt>Storage</dt>
+    <dd>{{ overview.stats.downloaded_bytes|bytes }}</dd>
+    <span>indexed bytes</span>
+  </div>
+  <div>
+    <dt>Archive targets</dt>
+    <dd>{{ overview.configured_chat_ids|length }}</dd>
+    <span>selected chats</span>
+  </div>
+  <div class="{% if overview.stats.failed_downloads %}metric-danger{% endif %}">
+    <dt>Failed media</dt>
+    <dd>{{ "{:,}".format(overview.stats.failed_downloads) }}</dd>
+    <span>{% if overview.stats.failed_downloads %}needs recovery{% else %}nothing to retry{% endif %}</span>
+  </div>
+</dl>
+
+<div class="overview-operator-grid">
+  <section class="operator-panel overview-activity-panel" aria-labelledby="activity-title">
+    <header class="operator-panel-heading">
+      <div>
+        <p class="panel-kicker">Archive volume</p>
+        <h2 id="activity-title">Message activity</h2>
+        <p>{{ "{:,}".format(activity_total) }} records in the selected range</p>
+      </div>
+      <nav class="range-switch" aria-label="Activity range">
+        {% for range in (14, 30, 90) %}<a href="/?days={{ range }}" {% if days == range %}aria-current="true"{% endif %}>{{ range }}d</a>{% endfor %}
+      </nav>
+    </header>
+    <div class="overview-chart" role="img" aria-label="Archive activity over {{ days }} days. Peak day has {{ activity_peak }} messages.">
+      <svg viewBox="0 0 1000 220" preserveAspectRatio="none" aria-hidden="true">
+        <line x1="0" y1="55" x2="1000" y2="55"/>
+        <line x1="0" y1="110" x2="1000" y2="110"/>
+        <line x1="0" y1="165" x2="1000" y2="165"/>
+        <polyline class="activity-line-shadow" points="{{ activity_points }}"/>
+        <polyline class="activity-line" points="{{ activity_points }}"/>
+      </svg>
+      <div class="chart-axis">
+        <time>{{ overview.activity[0].day.strftime('%b %d') if overview.activity else '' }}</time>
+        <span>Peak {{ activity_peak }}</span>
+        <time>{{ overview.activity[-1].day.strftime('%b %d') if overview.activity else '' }}</time>
+      </div>
+    </div>
+    <details class="chart-table">
+      <summary>Read activity as a table</summary>
+      <table>
+        <thead><tr><th>Date</th><th>Messages</th></tr></thead>
+        <tbody>{% for point in overview.activity %}<tr><td>{{ point.day.isoformat() }}</td><td>{{ point.count }}</td></tr>{% endfor %}</tbody>
+      </table>
+    </details>
+  </section>
+
+  <section class="operator-panel overview-attention-panel" aria-labelledby="attention-title">
+    <header class="operator-panel-heading">
+      <div>
+        <p class="panel-kicker">Recovery queue</p>
+        <h2 id="attention-title">Needs attention</h2>
+        <p>{{ overview.attention_messages|length }} recent problem records</p>
+      </div>
+      {% if overview.attention_messages %}<a class="panel-link" href="/messages?status=failed&media_only=true">View all</a>{% endif %}
+    </header>
+    {% if overview.attention_messages %}
+      <div class="overview-record-list">
+        {% for message in overview.attention_messages[:5] %}
+        <a class="overview-record-row" href="/messages/{{ message.id }}">
+          <span class="state-dot status-{{ message.download_status }}" aria-hidden="true"></span>
+          <span class="record-row-copy">
+            <strong>{{ message.filename or message.text or 'Media message' }}</strong>
+            <small>{{ message.chat_title }} · #{{ message.telegram_message_id }}</small>
+          </span>
+          <span class="record-row-state">{{ message.download_status|replace('_', ' ') }}</span>
+        </a>
+        {% endfor %}
+      </div>
+      <a class="button secondary panel-action" href="/operations">Open recovery controls</a>
+    {% else %}
+      <div class="overview-healthy-state">
+        <span aria-hidden="true">✓</span>
+        <div><strong>No media needs attention</strong><p>There are no recent failed or incomplete download records.</p></div>
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="operator-panel overview-recent-panel" aria-labelledby="recent-title">
+    <header class="operator-panel-heading">
+      <div>
+        <p class="panel-kicker">Latest records</p>
+        <h2 id="recent-title">Recently archived</h2>
+        <p>The latest ten durable message identities.</p>
+      </div>
+      <a class="panel-link" href="/messages">Open explorer</a>
+    </header>
+    {% if overview.recent_messages %}
+      <div class="overview-record-list recent-record-list">
+        {% for message in overview.recent_messages %}
+        <a class="overview-record-row" href="/messages/{{ message.id }}">
+          <span class="record-type">{{ (message.media_type or 'text')[:3]|upper }}</span>
+          <span class="record-row-copy">
+            <strong>{{ message.text or message.filename or 'Media message' }}</strong>
+            <small>{{ message.sender_name or 'Unknown sender' }} in {{ message.chat_title }}</small>
+          </span>
+          <time datetime="{{ message.message_date.isoformat() }}">{{ message.message_date|datetime }}</time>
+        </a>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="overview-empty-state">
+        <strong>No archive records yet</strong>
+        <p>Choose Telegram chats, then run the first historical sync.</p>
+        <a class="button secondary" href="/chats">Choose chats</a>
+      </div>
+    {% endif %}
+  </section>
+
+  <aside class="overview-side-column" aria-label="Archive state details">
+    <section class="operator-panel" aria-labelledby="states-title">
+      <header class="operator-panel-heading">
+        <div><p class="panel-kicker">Media workflow</p><h2 id="states-title">Download states</h2></div>
+      </header>
+      {% if overview.status_counts %}
+      <div class="download-state-list">
+        {% for status, count in overview.status_counts %}
+          {% if status == 'failed' %}{% set state_href = '/messages?status=failed&media_only=true' %}{% set state_action = 'Review' %}
+          {% elif status in ('pending', 'downloading') %}{% set state_href = '/operations' %}{% set state_action = 'Operate' %}
+          {% else %}{% set state_href = '/messages?status=' ~ status %}{% set state_action = 'Inspect' %}{% endif %}
+          <a class="download-state-row" href="{{ state_href }}">
+            <span class="state-dot status-{{ status }}" aria-hidden="true"></span>
+            <span>{{ status|replace('_', ' ') }}</span>
+            <strong>{{ "{:,}".format(count) }}</strong>
+            <small>{{ state_action }}</small>
+          </a>
+        {% endfor %}
+      </div>
+      {% else %}<p class="panel-empty-copy">Download states appear after the first sync.</p>{% endif %}
+    </section>
+
+    <section class="operator-panel overview-coverage-panel" aria-labelledby="coverage-title">
+      <header class="operator-panel-heading"><div><p class="panel-kicker">Configuration</p><h2 id="coverage-title">Target coverage</h2></div><strong>{{ configured_coverage }}%</strong></header>
+      <progress aria-label="Selected targets known to SQLite" value="{{ configured_coverage }}" max="100">{{ configured_coverage }}%</progress>
+      <p>{{ overview.chats|length }} known chat records for {{ overview.configured_chat_ids|length }} selected targets.</p>
+      <a class="panel-link" href="/chats">Manage coverage</a>
+    </section>
+
+    <section class="operator-panel" aria-labelledby="media-title">
+      <header class="operator-panel-heading"><div><p class="panel-kicker">Indexed files</p><h2 id="media-title">Media mix</h2></div><strong>{{ "{:,}".format(media_total) }}</strong></header>
+      {% if overview.media_counts %}
+      <dl class="media-mix-list">{% for media_type, count in overview.media_counts[:6] %}<div><dt>{{ media_type }}</dt><dd>{{ count }}</dd></div>{% endfor %}</dl>
+      {% else %}<p class="panel-empty-copy">No media has been indexed.</p>{% endif %}
+      <a class="panel-link" href="/exports/messages.csv">Download CSV manifest</a>
+    </section>
+  </aside>
+</div>
+{% endblock %}

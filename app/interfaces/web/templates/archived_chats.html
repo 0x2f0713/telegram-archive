@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block title %}Archived chats | Telegram Archiver{% endblock %}
+{% block content %}
+<header class="page-heading archive-directory-heading">
+  <div>
+    <p class="eyebrow">Conversation archive</p>
+    <h1>Archived chats</h1>
+    <p>Open every conversation already stored in SQLite, including the chat currently being archived.</p>
+  </div>
+  <div class="heading-actions">
+    <span class="result-count">{{ "{:,}".format(archived.total) }} chat{{ '' if archived.total == 1 else 's' }}</span>
+    <a class="button secondary" href="/chats">Manage coverage</a>
+  </div>
+</header>
+
+{% if deletion_success %}
+<div class="selection-feedback success archive-deletion-feedback" role="status">
+  <strong>Archive deleted.</strong>
+  <span>Removed {{ "{:,}".format(deleted_messages) }} message{{ '' if deleted_messages == 1 else 's' }} and {{ "{:,}".format(deleted_files) }} local file{{ '' if deleted_files == 1 else 's' }}. Chat coverage and sync checkpoints were kept.</span>
+</div>
+{% endif %}
+{% if cleanup_warnings %}
+<div class="selection-feedback warning archive-deletion-feedback" role="alert">
+  <strong>Media cleanup needs attention.</strong>
+  <span>{{ cleanup_warnings }} recorded path{{ '' if cleanup_warnings == 1 else 's' }} could not be removed safely. Check download permissions and application logs.</span>
+</div>
+{% endif %}
+{% if deletion_error %}
+<div class="selection-feedback error archive-deletion-feedback" role="alert">
+  <strong>Archive was not deleted.</strong>
+  <span>{{ deletion_error }}</span>
+</div>
+{% endif %}
+
+<form class="archive-directory-search" method="get" action="/archive/chats" role="search">
+  <label>
+    <span>Search archived chats</span>
+    <input type="search" name="q" value="{{ search }}" placeholder="Title, username, type, or Telegram ID" autocomplete="off">
+  </label>
+  <button class="button primary" type="submit">Search</button>
+  {% if search %}<a class="button text-button" href="/archive/chats">Clear</a>{% endif %}
+</form>
+
+<section class="archive-directory" aria-labelledby="archive-directory-title">
+  <header class="archive-directory-summary">
+    <div>
+      <h2 id="archive-directory-title">{{ 'Search results' if search else 'All archived chats' }}</h2>
+      <p>{% if search %}{{ "{:,}".format(archived.total) }} result{{ '' if archived.total == 1 else 's' }} for “{{ search }}”.{% else %}Ordered by the latest stored message.{% endif %}</p>
+    </div>
+    {% if archived.total %}<span>Page {{ archived.page }} of {{ archived.pages }}</span>{% endif %}
+  </header>
+
+  {% if archived.items %}
+  <div class="archive-directory-list">
+    {% for chat in archived.items %}
+    {% set is_active = chat.telegram_chat_id == active_chat_id %}
+    <article class="archive-chat-row{{ ' is-active' if is_active else '' }}">
+      <div class="archive-chat-identity">
+        <span class="chat-type">{{ chat.type }}</span>
+        <h3><a href="/chats/{{ chat.telegram_chat_id }}">{{ chat.title }}</a></h3>
+        <small>{{ '@' ~ chat.username if chat.username else 'Telegram ID ' ~ chat.telegram_chat_id }}</small>
+        {% if is_active %}<strong class="archive-live-state"><i aria-hidden="true"></i>Archiving now <small>{{ active_operation.phase|replace('-', ' ') }}</small></strong>{% endif %}
+      </div>
+      <dl class="archive-chat-metrics">
+        <div><dt>Messages</dt><dd>{{ "{:,}".format(chat.message_count) }}</dd></div>
+        <div><dt>Media</dt><dd>{{ "{:,}".format(chat.media_count) }}</dd></div>
+        <div><dt>Files</dt><dd>{{ "{:,}".format(chat.completed_count) }}</dd></div>
+        <div class="{{ 'has-failures' if chat.failed_count else '' }}"><dt>Failed</dt><dd>{{ "{:,}".format(chat.failed_count) }}</dd></div>
+      </dl>
+      <div class="archive-chat-recency">
+        <span>Latest stored message</span>
+        {% if chat.newest_message_date %}<time datetime="{{ chat.newest_message_date.isoformat() }}">{{ chat.newest_message_date|datetime }}</time>{% else %}<strong>Starting archive</strong>{% endif %}
+      </div>
+      <div class="archive-chat-actions">
+        <a class="button secondary" href="/chats/{{ chat.telegram_chat_id }}">Open chat</a>
+        <a href="/messages?chat={{ chat.telegram_chat_id }}">Explorer</a>
+        <button class="archive-delete-trigger danger-button" type="button" data-archive-delete-open data-delete-action="/archive/chats/{{ chat.telegram_chat_id }}/delete" data-chat-title="{{ chat.title }}" data-message-count="{{ chat.message_count }}" data-file-count="{{ chat.completed_count }}" aria-haspopup="dialog" aria-controls="archive-delete-dialog" {% if is_active or deletion_globally_blocked %}disabled title="Finish the active archive operation before deleting this chat"{% endif %}>Delete archive</button>
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+
+  {% if archived.pages > 1 %}
+  <nav class="pagination" aria-label="Archived chat pages">
+    <div>{% if previous_url %}<a class="button secondary" href="{{ previous_url }}">Previous</a>{% endif %}</div>
+    <span>Page {{ archived.page }} of {{ archived.pages }}</span>
+    <div>{% if next_url %}<a class="button secondary" href="{{ next_url }}">Next</a>{% endif %}</div>
+  </nav>
+  {% endif %}
+  {% elif search %}
+  <div class="empty-state archive-directory-empty">
+    <strong>No archived chats match “{{ search }}”.</strong>
+    <p>Try a title, username, chat type, or Telegram ID.</p>
+    <a class="button secondary" href="/archive/chats">Clear search</a>
+  </div>
+  {% else %}
+  <div class="empty-state archive-directory-empty">
+    <strong>No conversations are archived yet.</strong>
+    <p>Choose Telegram chats, then run a historical sync or start the listener.</p>
+    <div><a class="button primary" href="/operations">Open operations</a><a class="button secondary" href="/chats">Choose chats</a></div>
+  </div>
+  {% endif %}
+</section>
+
+<dialog class="archive-delete-dialog" id="archive-delete-dialog" data-archive-delete-dialog aria-labelledby="archive-delete-title" aria-describedby="archive-delete-description">
+  <form method="post" data-archive-delete-form>
+    <header>
+      <p class="eyebrow">Permanent local deletion</p>
+      <h2 id="archive-delete-title">Delete this archive?</h2>
+      <p id="archive-delete-description">This removes the stored conversation and downloaded media from this server. It does not delete anything from Telegram.</p>
+    </header>
+    <div class="archive-delete-target">
+      <span>Selected chat</span>
+      <strong data-archive-delete-title>Archived chat</strong>
+      <small><span data-archive-delete-messages>0 messages</span><span aria-hidden="true"> · </span><span data-archive-delete-files>0 files</span></small>
+    </div>
+    <ul>
+      <li>Messages and app-owned media files are permanently removed.</li>
+      <li>Coverage and sync checkpoints remain unchanged.</li>
+      <li>Future Telegram messages may be archived again.</li>
+    </ul>
+    <label class="archive-delete-confirmation">
+      <span>Type <strong>DELETE</strong> to confirm</span>
+      <input type="text" name="confirmation" autocomplete="off" autocapitalize="characters" spellcheck="false" data-archive-delete-confirmation>
+    </label>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="q" value="{{ search }}">
+    <input type="hidden" name="page" value="{{ archived.page }}">
+    <footer>
+      <button class="button secondary" type="button" data-archive-delete-cancel>Cancel</button>
+      <button class="button danger-button" type="submit" data-archive-delete-submit disabled>Delete local archive</button>
+    </footer>
+  </form>
+</dialog>
+{% endblock %}

@@ -2,13 +2,60 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from functools import cached_property
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
+
+#: Settings keys an operator may edit from the web "Effective configuration"
+#: panel. Secrets and environment-sensitive paths intentionally stay outside.
+RUNTIME_OVERRIDE_FIELDS: frozenset[str] = frozenset(
+    {
+        "download_photos",
+        "download_videos",
+        "download_documents",
+        "download_audio",
+        "max_file_size_mb",
+        "download_concurrency",
+        "download_retries",
+        "allowed_extensions",
+        "ignored_extensions",
+        "keywords",
+        "log_level",
+        "web_refresh_seconds",
+        "media_faststart",
+        "media_variants",
+    }
+)
+
+_BOOL_OVERRIDES: frozenset[str] = frozenset(
+    {
+        "download_photos",
+        "download_videos",
+        "download_documents",
+        "download_audio",
+        "media_faststart",
+        "media_variants",
+    }
+)
+
+_INT_OVERRIDES: frozenset[str] = frozenset(
+    {
+        "max_file_size_mb",
+        "download_concurrency",
+        "download_retries",
+        "web_refresh_seconds",
+    }
+)
+
+_TRUE_VALUES: frozenset[str] = frozenset({"1", "true", "on", "yes"})
 
 
 class ConfigurationError(ValueError):
@@ -40,6 +87,28 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///data/archive.db"
     download_dir: Path = Path("downloads")
 
+    #: Archive storage mode. ``local`` keeps media on the hard drive (the
+    #: historical behavior). ``terabox`` uses the hard drive as a temporary
+    #: download buffer, uploads each finalized file to TeraBox, verifies the
+    #: upload, then removes the local copy; archived bytes are then served
+    #: through the read-only unidisk FUSE mount.
+    storage_mode: Literal["local", "terabox"] = "local"
+
+    #: TeraBox session cookie token (the ``ndus`` value from the browser or
+    #: the unidisk profile). Required when ``storage_mode`` is ``terabox``.
+    terabox_ndus: SecretStr | None = None
+    #: Path to a unidisk ``terabox.profile.json`` whose ``ndus`` key is used
+    #: when ``terabox_ndus`` is not set directly.
+    terabox_profile: Path | None = Path("/mnt/data/workspace/terabox-drive/terabox.profile.json")
+    #: Read-only root where the unidisk FUSE mount exposes the TeraBox drive.
+    #: Archived media is served from here when not present in the local buffer.
+    terabox_mount_dir: Path = Path("/mnt/data/workspace/terabox-drive/mnt/terabox")
+    #: Remote base folder for the archive inside the TeraBox drive.
+    terabox_remote_dir: str = "/Telegram Archive"
+    #: Chunk size (bytes) for TeraBox superfile2 uploads. 4 MiB is the
+    #: protocol default for non-VIP accounts; the server may reject others.
+    terabox_chunk_size: int = Field(default=4 * 1024 * 1024, ge=256 * 1024, le=128 * 1024 * 1024)
+
     download_photos: bool = True
     download_videos: bool = True
     download_documents: bool = True
@@ -56,10 +125,46 @@ class Settings(BaseSettings):
 
     web_host: str = "127.0.0.1"
     web_port: int = Field(default=8686, ge=1, le=65535)
-    web_username: str = "archiver"
-    web_password: SecretStr | None = None
+    web_session_secret: SecretStr | None = None
     web_refresh_seconds: int = Field(default=15, ge=5, le=3600)
     tui_refresh_seconds: int = Field(default=5, ge=1, le=3600)
+
+    # ffmpeg is optional; when absent, faststart remuxing, poster generation,
+    # and HEVC fallback variants are disabled gracefully.
+    ffmpeg_bin: str = "ffmpeg"
+    ffprobe_bin: str = "ffprobe"
+    #: Extra library search path for a host-mounted ffmpeg (bind-mounted
+    #: binaries). Applied only to the ffmpeg child process, never the app.
+    ffmpeg_ld_library_path: str = ""
+
+    #: Optional ssh target (e.g. ``namhh@192.168.1.2``) that runs HEVC
+    #: transcodes with its own Rockchip ffmpeg over an NFS-shared archive.
+    #: Empty disables remote transcoding; a connectivity failure falls back
+    #: to a local transcode.
+    ffmpeg_remote_host: str = ""
+    #: Remote ffmpeg binary (a wrapper that sets LD_LIBRARY_PATH is expected).
+    ffmpeg_remote_bin: str = "/usr/local/bin/ffmpeg"
+    #: SSH private key path (inside the app container) for the remote host.
+    ffmpeg_remote_identity: str = ""
+    #: SSH known_hosts path (inside the app container) for the remote host.
+    ffmpeg_remote_known_hosts: str = ""
+    #: Host path that ``download_dir`` maps to, used to translate arguments
+    #: for remote transcoding (the remote host mounts the same files via NFS).
+    host_download_dir: str = ""
+
+    #: Remux completed videos with -movflags +faststart (moov at file start)
+    #: so browsers can start playback without fetching the file tail.
+    media_faststart: bool = True
+    #: Transcode HEVC videos to an H.264 variant on first view and serve
+    #: JPEG poster thumbnails in galleries and players.
+    media_variants: bool = True
+
+    #: Hardware decode mode for ffmpeg child processes. ``auto``/``rkmpp``
+    #: enables MPP hardware decode when the h264_rkmpp encoder exists; ``none``
+    #: forces software decode (hardware encoding is unaffected). Set to
+    #: ``none`` where the MPP userspace is built for a different glibc than the
+    #: container's (hevc_rkmpp then fails at runtime).
+    video_hwaccel: str = "auto"
 
     @field_validator("log_level")
     @classmethod
@@ -79,6 +184,70 @@ class Settings(BaseSettings):
                 "and add credentials from https://my.telegram.org."
             )
         return self.tg_api_id, api_hash
+
+    @property
+    def terabox_enabled(self) -> bool:
+        return self.storage_mode == "terabox"
+
+    def require_terabox_ndus(self) -> str:
+        """Return the TeraBox ``ndus`` cookie or raise a secret-free error."""
+
+        if self.terabox_ndus:
+            ndus = self.terabox_ndus.get_secret_value().strip()
+            if ndus:
+                return ndus
+        if self.terabox_profile:
+            profile_path = self.terabox_profile.expanduser()
+            if profile_path.is_file():
+                try:
+                    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise ConfigurationError(
+                        f"TERABOX_PROFILE is not readable JSON: {profile_path}"
+                    ) from exc
+                if isinstance(profile, dict) and profile.get("ndus"):
+                    return str(profile["ndus"]).strip()
+        raise ConfigurationError(
+            "TERABOX_NDUS is required when STORAGE_MODE=terabox. Set the ndus cookie "
+            "value directly, or point TERABOX_PROFILE at a unidisk profile JSON."
+        )
+
+    @cached_property
+    def terabox_remote_root(self) -> str:
+        base = self.terabox_remote_dir.strip() or "/"
+        if not base.startswith("/"):
+            base = f"/{base}"
+        return base.rstrip("/") or "/"
+
+    def media_storage_roots(self) -> tuple[Path, ...]:
+        """Roots where archived media bytes may live, in serving preference order."""
+
+        roots = [self.download_dir]
+        if self.terabox_enabled:
+            roots.append(self.terabox_mount_dir)
+        return tuple(root.expanduser().resolve() for root in roots)
+
+    def with_terabox_policy(self) -> Settings:
+        """Apply TeraBox mode constraints on top of resolved settings.
+
+        Remote-only archives keep pristine originals: faststart remuxing and
+        HEVC variants would rewrite or multiply uploads and cannot be cached
+        usefully on the read-only mount.
+        """
+        if not self.terabox_enabled:
+            return self
+        updates: dict[str, object] = {}
+        if self.media_faststart:
+            updates["media_faststart"] = False
+        if self.media_variants:
+            updates["media_variants"] = False
+        if updates:
+            logger.info(
+                "TeraBox storage mode: faststart and media variants are disabled "
+                "so only pristine originals are uploaded"
+            )
+            return self.model_copy(update=updates)
+        return self
 
     @staticmethod
     def _parse_csv(value: str) -> tuple[str, ...]:
@@ -151,3 +320,121 @@ class Settings(BaseSettings):
         if value and not value.startswith("."):
             value = f".{value}"
         return value
+
+
+def decode_overrides(overrides: dict[str, str]) -> dict[str, object]:
+    """Convert stored override strings into typed values for validation.
+
+    Only keys declared in ``RUNTIME_OVERRIDE_FIELDS`` are returned; anything
+    else is dropped, which keeps secret and environment-only settings safe
+    even if a crafted or corrupt row reaches the resolver.
+    """
+    decoded: dict[str, object] = {}
+    for key, raw in overrides.items():
+        if key not in RUNTIME_OVERRIDE_FIELDS:
+            continue
+        value = raw.strip()
+        if key in _BOOL_OVERRIDES:
+            decoded[key] = value.casefold() in _TRUE_VALUES
+        elif key in _INT_OVERRIDES:
+            try:
+                decoded[key] = int(value)
+            except ValueError:
+                raise ValueError(f"Runtime override {key!r} must be an integer") from None
+        else:
+            decoded[key] = value
+    return decoded
+
+
+def encode_overrides(settings: Settings) -> dict[str, str]:
+    """Canonical string form of every editable field on a settings object."""
+    return {
+        key: ("true" if getattr(settings, key) else "false")
+        if key in _BOOL_OVERRIDES
+        else str(getattr(settings, key))
+        for key in sorted(RUNTIME_OVERRIDE_FIELDS)
+    }
+
+
+def settings_form_values(settings: Settings) -> dict[str, bool | int | str]:
+    """Typed, form-usable values for every editable setting."""
+    return {
+        key: getattr(settings, key)
+        if key in _BOOL_OVERRIDES or key in _INT_OVERRIDES
+        else str(getattr(settings, key))
+        for key in sorted(RUNTIME_OVERRIDE_FIELDS)
+    }
+
+
+def merge_runtime_form_values(
+    settings: Settings, submitted: dict[str, str]
+) -> dict[str, bool | int | str]:
+    """Overlay submitted form values while retaining their invalid text."""
+    form_values = settings_form_values(settings)
+    for key, raw in submitted.items():
+        if key in _BOOL_OVERRIDES:
+            form_values[key] = raw.casefold() == "true"
+        elif key in _INT_OVERRIDES:
+            try:
+                form_values[key] = int(raw)
+            except ValueError:
+                form_values[key] = raw
+        elif key in RUNTIME_OVERRIDE_FIELDS:
+            form_values[key] = raw
+    return form_values
+
+
+def runtime_form_values(values: dict[str, list[str]]) -> dict[str, str]:
+    """Convert parsed form values into canonical override strings.
+
+    Boolean fields are checkbox keys: present means true, absent false.
+    Integer and string fields are stripped and must be non-empty. Keys
+    outside ``RUNTIME_OVERRIDE_FIELDS`` are dropped.
+    """
+    overrides: dict[str, str] = {}
+    for key in sorted(RUNTIME_OVERRIDE_FIELDS):
+        if key in _BOOL_OVERRIDES:
+            overrides[key] = "true" if key in values else "false"
+            continue
+        raw = (values.get(key, [""])[0] if values.get(key) else "").strip()
+        overrides[key] = raw
+    return overrides
+
+
+def apply_runtime_overrides(settings: Settings, overrides: dict[str, str]) -> Settings:
+    """Return a re-validated settings copy with DB overrides applied on top.
+
+    Pydantic validation runs again on the merged values, so an invalid row
+    (bad log level, out-of-range integer) raises ``ValidationError`` instead
+    of silently producing an inconsistent runtime configuration.
+    """
+    if not overrides:
+        return settings
+    merged: dict[str, Any] = settings.model_dump()
+    merged.update(decode_overrides(overrides))
+    return Settings.model_validate(merged)
+
+
+def resolve_runtime_overrides(
+    settings: Settings, overrides: dict[str, str]
+) -> tuple[Settings, dict[str, str], frozenset[str]]:
+    """Apply valid persisted overrides while isolating corrupt rows.
+
+    Runtime settings are operator-editable data, so one malformed row must not
+    prevent the rest of the application from starting. Unknown keys are
+    ignored; known keys that fail decoding or settings validation are returned
+    separately for logging and repair UI purposes.
+    """
+    valid: dict[str, str] = {}
+    invalid: set[str] = set()
+    for key, value in overrides.items():
+        if key not in RUNTIME_OVERRIDE_FIELDS:
+            continue
+        try:
+            apply_runtime_overrides(settings, {key: value})
+        except (ValidationError, ValueError):
+            invalid.add(key)
+        else:
+            valid[key] = value
+    effective = apply_runtime_overrides(settings, valid) if valid else settings
+    return effective, valid, frozenset(invalid)

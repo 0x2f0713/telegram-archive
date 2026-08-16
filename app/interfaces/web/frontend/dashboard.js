@@ -1,0 +1,39 @@
+import "@fontsource-variable/geist";
+import "../static/dashboard.css";
+
+import {
+  setupAutoRefresh,
+  setupCommandMenu,
+  setupCopyActions,
+  setupMobileMenu,
+  setupRouteProgress,
+  setupTelegramAuth,
+  setupThemes,
+} from "./core.js";
+import { setupChatSelection } from "./chat-selection.js";
+import { setupArchiveDeletion } from "./archive-deletion.js";
+import { setupOperationForms, setupOperationMonitor } from "./operations.js";
+import { setupVideoPlayers } from "./media-player.js";
+import { setupMediaGallery } from "./media-gallery.js";
+
+function initialize() {
+  setupThemes();
+  setupCopyActions();
+  setupCommandMenu();
+  setupRouteProgress();
+  setupAutoRefresh();
+  setupMobileMenu();
+  setupTelegramAuth();
+  setupChatSelection();
+  setupArchiveDeletion();
+  setupOperationMonitor();
+  setupOperationForms();
+  setupVideoPlayers();
+  setupMediaGallery();
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initialize, { once: true });
+} else {
+  initialize();
+}

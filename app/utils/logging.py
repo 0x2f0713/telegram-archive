@@ -19,6 +19,10 @@ def configure_logging(level: str = "INFO") -> None:
     # Telethon's protocol-level logs are noisy and may contain more metadata
     # than an ordinary operator needs. Warnings remain visible.
     logging.getLogger("telethon").setLevel(max(numeric_level, logging.WARNING))
+    logging.getLogger("uvicorn.error").setLevel(numeric_level)
+    logging.getLogger("uvicorn.access").setLevel(
+        logging.DEBUG if numeric_level == logging.DEBUG else logging.WARNING
+    )
 
 
 def format_bytes(value: int) -> str:

@@ -2,12 +2,12 @@ from pathlib import Path
 
 import pytest
 
+from app.application.chat_selection import ChatSelectionService
 from app.config import Settings
-from app.database.repository import ArchiveRepository
-from app.database.selection import ChatSelection, ChatSelectionRepository
-from app.database.session import Database
-from app.services.chat_selection import ChatSelectionService
-from app.telegram.client import TelegramAccessError
+from app.infrastructure.persistence.database import Database
+from app.infrastructure.persistence.repository import ArchiveRepository
+from app.infrastructure.persistence.selection import ChatSelection, ChatSelectionRepository
+from app.infrastructure.telegram.client import TelegramAccessError, resolve_accessible_chats
 from tests.helpers import make_chat
 
 
@@ -41,7 +41,7 @@ async def test_selection_policy_persists_specific_all_and_environment(tmp_path: 
 
 
 async def test_runtime_resolution_only_uses_currently_accessible_dialogs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     settings = Settings(
         _env_file=None,
@@ -51,16 +51,21 @@ async def test_runtime_resolution_only_uses_currently_accessible_dialogs(
     database = Database(settings.database_url)
     await database.initialize()
     archive = ArchiveRepository(database)
-    service = ChatSelectionService(settings, archive)
-    dialogs = (
-        make_chat(telegram_chat_id=-1001, title="First"),
-        make_chat(telegram_chat_id=-1002, title="Second"),
-    )
 
     async def fake_accessible_dialogs(_client: object):
         return list(dialogs)
 
-    monkeypatch.setattr("app.services.chat_selection.accessible_dialogs", fake_accessible_dialogs)
+    service = ChatSelectionService(
+        settings.configured_chat_ids,
+        archive,
+        ChatSelectionRepository(database),
+        fake_accessible_dialogs,
+        resolve_accessible_chats,
+    )
+    dialogs = (
+        make_chat(telegram_chat_id=-1001, title="First"),
+        make_chat(telegram_chat_id=-1002, title="Second"),
+    )
 
     environment_targets = await service.resolve_with_client(object())  # type: ignore[arg-type]
     assert tuple(environment_targets) == (-1001,)

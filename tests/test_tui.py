@@ -3,10 +3,10 @@ from pathlib import Path
 from textual.widgets import DataTable, Input, Static, TabbedContent
 
 from app.config import Settings
-from app.database.repository import ArchiveRepository
-from app.database.selection import ChatSelection
-from app.database.session import Database
-from app.tui import ArchiveTui
+from app.infrastructure.persistence.database import Database
+from app.infrastructure.persistence.repository import ArchiveRepository
+from app.infrastructure.persistence.selection import ChatSelection
+from app.interfaces.tui import ArchiveTui
 from tests.helpers import make_chat, make_message
 
 
