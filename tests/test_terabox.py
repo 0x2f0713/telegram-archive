@@ -8,11 +8,13 @@ import httpx
 import pytest
 
 from app.config import Settings
+from app.infrastructure import terabox as terabox_module
 from app.infrastructure.terabox import (
     FileHashes,
     TeraBoxAuthError,
     TeraBoxClient,
     TeraBoxMediaDeleter,
+    TeraBoxTransientError,
     TeraBoxUploader,
     create_terabox_client,
     decode_etag,
@@ -290,6 +292,148 @@ async def test_upload_file_chunked_flow(tmp_path: Path) -> None:
     assert recorder.commit_form["size"] == "5"
     assert recorder.commit_form["uploadid"] == "P1-test"
     assert recorder.commit_form["content-md5"] == hashes.file_md5
+    await client.aclose()
+
+
+class CommitVerificationRecorder(UploadRecorder):
+    """Returns errno 4000023 for the first commit, then commits normally."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.commit_attempts = 0
+        self.refreshes = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/main":
+            self.refreshes += 1
+            self.requests.append(request)
+            return httpx.Response(
+                200,
+                text='<script>var templateData = {"jsToken": "%28%22tok123%22%29"};</script>',
+            )
+        if request.url.path == "/api/create" and request.url.query != b"a=commit":
+            self.commit_attempts += 1
+            self.requests.append(request)
+            self.commit_form = _form(request)
+            if self.commit_attempts == 1:
+                return _json({"errno": 4000023})
+            return _json(
+                {"errno": 0, "md5": _scramble_etag(self.commit_form.get("content-md5", ""))}
+            )
+        return super().__call__(request)
+
+
+async def test_commit_errno_4000023_refreshes_session_and_is_transient(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    recorder = CommitVerificationRecorder()
+    payload = b"C" * 6
+    local = tmp_path / "commit.bin"
+    local.write_bytes(payload)
+    recorder.remote["/Telegram Archive/commit.bin"] = len(payload)
+    client = _client(settings, recorder)
+
+    # A 4000023 commit raises a transient error so the upload-level retry loop
+    # restarts the file against the refreshed session.
+    with pytest.raises(TeraBoxTransientError, match="4000023"):
+        await client.upload_file(local, "/Telegram Archive/commit.bin")
+
+    # Bootstrap fetched /main once; the 4000023 handler refreshed it again.
+    assert recorder.refreshes == 2
+    await client.aclose()
+
+
+async def test_uploader_retries_commit_errno_4000023_against_refreshed_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    recorder = CommitVerificationRecorder()
+    payload = b"C" * 6
+    local = settings.download_dir / "commit.bin"
+    settings.download_dir.mkdir(parents=True, exist_ok=True)
+    local.write_bytes(payload)
+    recorder.remote["/Telegram Archive/commit.bin"] = len(payload)
+    client = _client(settings, recorder)
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(terabox_module.asyncio, "sleep", no_sleep)
+    uploader = TeraBoxUploader(settings, client)
+
+    receipt = await uploader.upload(local)
+
+    assert recorder.commit_attempts == 2
+    assert receipt.size == len(payload)
+    assert recorder.commit_form["content-md5"] == hashlib.md5(payload).hexdigest()
+    await client.aclose()
+
+
+async def test_exhausted_chunk_attempts_are_transient(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+
+    recorder = UploadRecorder()
+    original_handler = recorder.__call__
+
+    def always_fail_chunks(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/rest/2.0/pcs/superfile2":
+            recorder.requests.append(request)
+            return _json({"error_code": 31168, "error_msg": "injected"})
+        return original_handler(request)
+
+    payload = b"A" * 5
+    local = tmp_path / "flaky.bin"
+    local.write_bytes(payload)
+    client = _client(settings, always_fail_chunks)
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(terabox_module.asyncio, "sleep", no_sleep)
+
+    with pytest.raises(TeraBoxTransientError, match="failed after"):
+        await client.upload_file(local, "/Telegram Archive/flaky.bin")
+    chunk_requests = [r for r in recorder.requests if r.url.path == "/rest/2.0/pcs/superfile2"]
+    assert len(chunk_requests) == terabox_module._CHUNK_MAX_TRIES
+    await client.aclose()
+
+
+async def test_uploader_retries_whole_upload_after_chunk_exhaustion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    recorder = UploadRecorder()
+    original_handler = recorder.__call__
+    state = {"failed_attempts": 0}
+
+    def flaky_chunks(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/rest/2.0/pcs/superfile2" and state["failed_attempts"] < 4:
+            recorder.requests.append(request)
+            state["failed_attempts"] += 1
+            return _json({"error_code": 31168, "error_msg": "injected"})
+        return original_handler(request)
+
+    payload = b"A" * 5
+    local = settings.download_dir / "flaky.bin"
+    settings.download_dir.mkdir(parents=True, exist_ok=True)
+    local.write_bytes(payload)
+    recorder.remote["/Telegram Archive/flaky.bin"] = len(payload)
+    client = _client(settings, flaky_chunks)
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(terabox_module.asyncio, "sleep", no_sleep)
+    uploader = TeraBoxUploader(settings, client)
+
+    receipt = await uploader.upload(local)
+
+    # Four chunk attempts exhausted -> transient error -> whole-file retry.
+    precreates = [r for r in recorder.requests if r.url.path == "/api/precreate"]
+    assert len(precreates) == 2
+    assert receipt.size == len(payload)
+    assert recorder.chunk_bodies[0] == payload
     await client.aclose()
 
 

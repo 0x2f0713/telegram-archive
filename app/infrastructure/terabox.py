@@ -744,7 +744,9 @@ class TeraBoxClient:
                     f"TeraBox chunk {partseq} MD5 mismatch (expected {expected_md5}, got {actual})"
                 )
             return
-        raise TeraBoxError(
+        # Exhausting chunk attempts is still a transient outcome: a later
+        # whole-file attempt re-precreates with a fresh host and upload-id.
+        raise TeraBoxTransientError(
             f"TeraBox chunk {partseq} failed after {failures.get(partseq, 0)} attempts"
         )
 
@@ -766,7 +768,17 @@ class TeraBoxClient:
         )
         errno = data.get("errno", -1)
         if errno != 0:
-            raise TeraBoxError(f"TeraBox create (commit) failed with errno {errno}")
+            if errno == 4000023:
+                # Commit rejected the session mid-upload, after all chunks
+                # landed. Refresh the tokens now so a whole-file retry starts
+                # against a fresh session instead of the stale one; the errno
+                # itself still surfaces to the upload-level retry loop.
+                logger.info("TeraBox commit asked for re-verification; refreshing session")
+                try:
+                    await self._refresh_app_data()
+                except TeraBoxError:
+                    logger.debug("Session refresh after commit 4000023 failed", exc_info=True)
+            raise TeraBoxTransientError(f"TeraBox create (commit) failed with errno {errno}")
         actual_md5 = decode_etag(str(data.get("md5", "")))
         if actual_md5 and actual_md5 not in hashes.commit_md5_candidates:
             # Corrupted server-side assembly; a retry restarts the upload.
