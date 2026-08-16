@@ -43,7 +43,12 @@ function setupOperationMonitor() {
     const entries = Array.isArray(tasks) ? tasks : [];
     const active = entries.filter((task) => task.status !== "completed").length;
     if (downloadSummary) {
-      downloadSummary.textContent = `${active} active · ${entries.length} shown`;
+      const totalSpeed = entries.reduce(
+        (sum, task) => (task.status !== "completed" ? sum + (Number(task.speed) || 0) : sum),
+        0,
+      );
+      downloadSummary.textContent = `${active} active · ${entries.length} shown`
+        + (active && totalSpeed ? ` · ${humanBytes(totalSpeed)}/s` : "");
     }
     if (!entries.length) {
       const empty = document.createElement("p");

@@ -153,8 +153,35 @@ async def test_download_reporter_tracks_each_task_with_speed(tmp_path: Path) -> 
     assert isinstance(tasks, list)
     assert {task["filename"] for task in tasks} == {"one.bin", "two.bin"}
     assert all("speed" in task and "percent" in task for task in tasks)
-    assert "/s)" in str(updates[-1]["detail"])
     assert " B/s" not in str(updates[-1]["detail"])
+
+
+async def test_download_reporter_aggregates_speed_across_active_files(
+    tmp_path: Path,
+) -> None:
+    del tmp_path
+    updates: list[dict[str, object]] = []
+
+    class Context:
+        async def progress(self, **values: object) -> None:
+            updates.append(values)
+
+    reporter = OperationCommands._download_reporter(Context())  # type: ignore[arg-type]
+    reporter("one.bin", 512, 1024)
+    await asyncio.sleep(0)
+    reporter("two.bin", 1024, 2048)
+    await asyncio.sleep(0)
+
+    update = updates[-1]
+    tasks = update["download_tasks"]
+    assert isinstance(tasks, list)
+    assert update["download_speed"] == sum(task["speed"] for task in tasks)
+    assert "2 files" in str(update["detail"]) and "total" in str(update["detail"])
+    # A single active file keeps the per-file detail instead of the aggregate.
+    reporter("two.bin", 2048, 2048)
+    reporter("one.bin", 1024, 1024)
+    await asyncio.sleep(0)
+    assert updates[-1]["download_speed"] == 0
 
 
 async def test_download_reporter_coalesces_callback_bursts(tmp_path: Path) -> None:

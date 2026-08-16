@@ -208,16 +208,24 @@ class OperationCommands:
                 if tasks[oldest]["status"] == "downloading":
                     break
                 tasks.pop(oldest)
+                states.pop(oldest, None)
+                last_report.pop(oldest, None)
+            active = [task for task in tasks.values() if task["status"] == "downloading"]
+            aggregate_speed = round(sum(task["speed"] for task in active))
+            if len(active) > 1:
+                detail = f"Downloading {len(active)} files · {format_bytes(aggregate_speed)}/s total"
+            else:
+                detail = (
+                    f"Downloading {filename} ({percent or 0:.1f}%, {format_bytes(round(speed))}/s)"
+                )
             pending_update = {
                 "phase": "downloading",
-                "detail": (
-                    f"Downloading {filename} ({percent or 0:.1f}%, {format_bytes(round(speed))}/s)"
-                ),
+                "detail": detail,
                 "download_filename": filename,
                 "download_current": current,
                 "download_total": total,
                 "download_percent": percent,
-                "download_speed": round(speed),
+                "download_speed": aggregate_speed,
                 "download_tasks": list(tasks.values()),
             }
             pending_force = pending_force or current >= total
