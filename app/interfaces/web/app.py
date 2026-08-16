@@ -33,7 +33,7 @@ from app.infrastructure.persistence.settings import RuntimeSettingsRepository
 from app.infrastructure.telegram.client import (
     accessible_dialogs,
     connect_authorized,
-    create_client,
+    create_readonly_client,
     resolve_accessible_chats,
 )
 from app.infrastructure.telegram.session_account import read_session_account_id
@@ -194,7 +194,7 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
             app.state.chat_selections,
             accessible_dialogs,
             resolve_accessible_chats,
-            client_factory=lambda: create_client(overridden),
+            client_factory=lambda: create_readonly_client(overridden),
             client_connector=connect_authorized,
         )
         app.state.dashboard_service = DashboardService(

@@ -40,7 +40,7 @@ from app.infrastructure.persistence.selection import ChatSelectionRepository
 from app.infrastructure.telegram.client import (
     accessible_dialogs,
     connect_authorized,
-    create_client,
+    create_readonly_client,
     flood_wait_seconds,
     is_transient_telegram_error,
     resolve_accessible_chats,
@@ -64,11 +64,13 @@ class OperationCommands:
         self,
         manager: OperationManager,
         database: Database,
-        client_factory: Callable[[Settings], Any] = create_client,
+        readonly_client_factory: Callable[[Settings], Any] = create_readonly_client,
     ) -> None:
         self.manager = manager
         self.database = database
-        self.client_factory = client_factory
+        #: Short-lived operations share the account without writing the session
+        #: file, so they never lock the archiver's Telethon SQLite session.
+        self.readonly_client_factory = readonly_client_factory
 
     @property
     def settings(self) -> Settings:
@@ -257,7 +259,7 @@ class OperationCommands:
     async def sync(self, context: OperationContext) -> None:
         content_types = self._content_types(context.parameters)
         repository, archive = self._archive_stack(content_types, self._download_reporter(context))
-        client = self.client_factory(self.settings)
+        client = self.readonly_client_factory(self.settings)
         try:
             await context.progress(
                 force=True,
@@ -369,7 +371,7 @@ class OperationCommands:
     async def retry_failed(self, context: OperationContext) -> None:
         content_types = self._content_types(context.parameters)
         repository, archive = self._archive_stack(content_types, self._download_reporter(context))
-        client = self.client_factory(self.settings)
+        client = self.readonly_client_factory(self.settings)
         try:
             await context.progress(
                 force=True,
@@ -413,7 +415,7 @@ class OperationCommands:
     async def listen(self, context: OperationContext) -> None:
         content_types = self._content_types(context.parameters)
         repository, archive = self._archive_stack(content_types, self._download_reporter(context))
-        client = self.client_factory(self.settings)
+        client = self.readonly_client_factory(self.settings)
         try:
             await context.progress(
                 force=True,
@@ -549,7 +551,7 @@ class OperationCommands:
             terabox_client = self._terabox_client()
             try:
                 await terabox_client.login_check()
-                await terabox_client.ensure_remote_dir(self.settings.terabox_remote_root)
+                await terabox_client.ensure_remote_dir(terabox_client.remote_root)
                 total, used = await terabox_client.quota()
                 await context.log(f"PASS · TeraBox authenticated; {used} / {total} bytes used")
             except Exception as exc:
@@ -573,7 +575,7 @@ class OperationCommands:
             if context.stop_event.is_set():
                 return
 
-        client = self.client_factory(self.settings)
+        client = self.readonly_client_factory(self.settings)
         repository, _archive = self._archive_stack()
         try:
             await connect_authorized(client)

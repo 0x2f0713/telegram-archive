@@ -46,7 +46,7 @@ def test_sync_command_passes_effective_concurrency(monkeypatch, tmp_path: Path) 
 
     monkeypatch.setattr(cli, "_settings", lambda: base)
     monkeypatch.setattr(cli, "_archive_stack", fake_stack)
-    monkeypatch.setattr(cli, "create_client", lambda settings: FakeClient())
+    monkeypatch.setattr(cli, "create_readonly_client", lambda settings: FakeClient())
     monkeypatch.setattr(cli, "connect_authorized", lambda client: _completed())
     monkeypatch.setattr(
         cli,

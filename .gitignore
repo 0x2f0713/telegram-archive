@@ -41,3 +41,4 @@ downloads/*
 # Host-specific ffmpeg dynamic libraries for the docker-compose deployment
 # (mounted at /opt/host-libs). Rebuild these on each host; never commit them.
 .ffmpeg-libs/
+.playwright-cli/

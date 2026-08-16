@@ -22,6 +22,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 import zlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -162,11 +163,38 @@ def decode_etag(value: str) -> str:
     return xored[8:16] + xored[0:8] + xored[24:32] + xored[16:24]
 
 
+def sanitize_remote_component(name: str) -> str:
+    """Return a TeraBox-safe single path component.
+
+    TeraBox rejects (errno -7) any component containing characters outside the
+    BMP (emoji, some CJK extensions) and a few ASCII symbols. We normalize,
+    strip those, and collapse the rest so the component still reads naturally.
+    """
+
+    normalized = unicodedata.normalize("NFKC", name)
+    cleaned = "".join(
+        "_" if ord(char) > 0xFFFF or char in '<>:"/\\|?*' or ord(char) < 0x20 else char
+        for char in normalized
+    )
+    cleaned = re.sub(r"__+", "_", cleaned)
+    cleaned = cleaned.strip(" ._")
+    return cleaned or "unnamed"
+
+
+def sanitize_remote_path(path: str) -> str:
+    """Sanitize every component of a remote path, preserving the leading slash."""
+
+    parts = PurePosixPath(path).parts
+    cleaned = "/".join(sanitize_remote_component(part) for part in parts if part != "/")
+    return f"/{cleaned}" if cleaned else "/"
+
+
 def remote_path_for(base_dir: Path, root: str, media_path: Path) -> str:
     """Translate a buffered download path into a TeraBox remote path."""
 
     relative = Path(media_path).relative_to(base_dir)
-    return str(PurePosixPath(root, *relative.parts))
+    parts = tuple(sanitize_remote_component(part) for part in relative.parts)
+    return str(PurePosixPath(sanitize_remote_path(root), *parts))
 
 
 def _form_body(data: dict[str, Any]) -> str:
@@ -222,7 +250,7 @@ class TeraBoxClient:
 
     @property
     def remote_root(self) -> str:
-        return self._settings.terabox_remote_root
+        return sanitize_remote_path(self._settings.terabox_remote_root)
 
     @property
     def mount_dir(self) -> Path:
@@ -542,6 +570,18 @@ class TeraBoxClient:
         self._upload_host = f"https://{host}"
         return self._upload_host
 
+    def invalidate_upload_host(self) -> None:
+        """Drop the cached upload host so the next chunk upload re-locates.
+
+        ``locateupload`` can hand back a host in a region that does not match
+        the account's data center; those hosts reject the superfile2 request
+        with HTTP 403. Re-locating picks a usable host for the retry.
+        """
+
+        if self._upload_host:
+            logger.info("TeraBox upload host invalidated: %s", self._upload_host)
+        self._upload_host = None
+
     async def _precreate(self, upload: TeraBoxUpload) -> None:
         hashes = upload.hashes
         base_form: dict[str, Any] = {
@@ -600,6 +640,9 @@ class TeraBoxClient:
                 payload = await asyncio.to_thread(handle.read, self.chunk_size)
                 if not payload:
                     break
+                # Re-resolve each chunk: a 403 re-locates a fresh host, and we
+                # must not send the remaining chunks to the stale one.
+                upload_host = await self._locate_upload_host()
                 await self._upload_chunk(upload_host, upload, partseq, payload, expected_md5)
                 sent += len(payload)
                 self._report(progress, sent, hashes.size)
@@ -652,6 +695,21 @@ class TeraBoxClient:
             self._merge_cookies(response)
             if response.status_code != 200:
                 failures[partseq] = failures.get(partseq, 0) + 1
+                if response.status_code == 403:
+                    # 403 from an upload host means the located host does not
+                    # serve this account's region. Drop it and re-locate so the
+                    # next attempt targets a fresh, working host.
+                    logger.warning(
+                        "TeraBox chunk %s HTTP 403 from %s; re-locating upload host (attempt %s/%s)",
+                        partseq,
+                        upload_host,
+                        attempt,
+                        _CHUNK_MAX_TRIES,
+                    )
+                    self.invalidate_upload_host()
+                    upload_host = await self._locate_upload_host()
+                    await asyncio.sleep(backoff)
+                    continue
                 logger.warning(
                     "TeraBox chunk %s returned HTTP %s (attempt %s/%s)",
                     partseq,
@@ -680,7 +738,9 @@ class TeraBoxClient:
                 continue
             actual = str(data.get("md5") or "").casefold()
             if actual and actual != expected_md5:
-                raise TeraBoxError(
+                # The server stored a corrupted copy of this chunk; a retry
+                # re-precreates and uploads the whole file again.
+                raise TeraBoxTransientError(
                     f"TeraBox chunk {partseq} MD5 mismatch (expected {expected_md5}, got {actual})"
                 )
             return
@@ -709,20 +769,41 @@ class TeraBoxClient:
             raise TeraBoxError(f"TeraBox create (commit) failed with errno {errno}")
         actual_md5 = decode_etag(str(data.get("md5", "")))
         if actual_md5 and actual_md5 not in hashes.commit_md5_candidates:
-            raise TeraBoxError(
+            # Corrupted server-side assembly; a retry restarts the upload.
+            raise TeraBoxTransientError(
                 f"TeraBox commit MD5 mismatch (expected one of "
                 f"{sorted(hashes.commit_md5_candidates)}, got {actual_md5})"
             )
 
     async def _verify_published(self, upload: TeraBoxUpload) -> None:
-        entry = await self.file_meta(upload.remote_path)
+        # TeraBox list responses can lag a committed upload for a few seconds,
+        # so poll briefly before deciding the published entry is wrong.
+        entry: dict[str, Any] | None = None
+        for attempt in range(4):
+            await asyncio.sleep(min(1.0 * attempt, 3.0))
+            entry = await self.file_meta(upload.remote_path)
+            if entry is None:
+                continue
+            if int(entry.get("size", -1)) == upload.hashes.size:
+                return
         if entry is None:
-            raise TeraBoxError(f"TeraBox verification failed: {upload.remote_path} not listed")
-        if int(entry.get("size", -1)) != upload.hashes.size:
-            raise TeraBoxError(
-                f"TeraBox verification failed: remote size {entry.get('size')} does not "
-                f"match {upload.hashes.size}"
+            raise TeraBoxTransientError(
+                f"TeraBox verification failed: {upload.remote_path} not listed"
             )
+        # The listed size does not match what we uploaded. The commit MD5 for
+        # multi-chunk uploads only verifies the block-list etag, not content
+        # integrity, so we cannot assume the published bytes are complete.
+        # Remove the wrong entry (often a stale partially-committed file) so a
+        # retry re-uploads into a clean path rather than seeing the same error.
+        size = entry.get("size")
+        try:
+            await self.delete(upload.remote_path)
+        except TeraBoxError:
+            logger.debug("Could not delete mismatched remote entry before retry", exc_info=True)
+        raise TeraBoxTransientError(
+            f"TeraBox verification failed: remote size {size} does not "
+            f"match {upload.hashes.size}; removed the mismatched entry for retry"
+        )
 
 
 class TeraBoxMediaDeleter:

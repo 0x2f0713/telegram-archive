@@ -37,7 +37,7 @@ from app.infrastructure.telegram.client import (
     TelegramAccessError,
     accessible_dialogs,
     connect_authorized,
-    create_client,
+    create_readonly_client,
     resolve_accessible_chats,
 )
 from app.utils.logging import format_bytes
@@ -348,7 +348,7 @@ class ArchiveTui(App[None]):
             self.selections,
             accessible_dialogs,
             resolve_accessible_chats,
-            client_factory=lambda: create_client(self.settings),
+            client_factory=lambda: create_readonly_client(self.settings),
             client_connector=connect_authorized,
         )
         self.service = DashboardService(

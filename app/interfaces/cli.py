@@ -39,6 +39,7 @@ from app.infrastructure.telegram.client import (
     accessible_dialogs,
     connect_authorized,
     create_client,
+    create_readonly_client,
     flood_wait_seconds,
     is_transient_telegram_error,
     login,
@@ -104,13 +105,13 @@ async def _terabox_doctor_checks(settings: Settings) -> tuple[list[tuple[str, st
     try:
         client = create_terabox_client(settings)
         await client.login_check()
-        await client.ensure_remote_dir(settings.terabox_remote_root)
+        await client.ensure_remote_dir(client.remote_root)
         total, used = await client.quota()
         checks.append(
             (
                 "TeraBox",
                 "PASS",
-                f"Authenticated; remote dir {settings.terabox_remote_root}; "
+                f"Authenticated; remote dir {client.remote_root}; "
                 f"{used} / {total} bytes used",
             )
         )
@@ -226,7 +227,7 @@ def chats_command() -> None:
         database = Database(settings.database_url)
         repository = ArchiveRepository(database)
         selection_service = _chat_selection_service(settings, repository)
-        client = create_client(settings)
+        client = create_readonly_client(settings)
         try:
             await database.initialize()
             await connect_authorized(client)
@@ -280,7 +281,7 @@ def sync_command(
         selected_types = _parse_content_types(content_types)
 
         database, repository, archive, effective = await _archive_stack(settings, selected_types)
-        client = create_client(effective)
+        client = create_readonly_client(effective)
         try:
             await connect_authorized(client)
             all_chats = await _chat_selection_service(effective, repository).resolve_with_client(
@@ -513,7 +514,7 @@ def retry_failed_command(
         settings = _settings()
         selected_types = _parse_content_types(content_types)
         database, repository, archive, effective = await _archive_stack(settings, selected_types)
-        client = create_client(effective)
+        client = create_readonly_client(effective)
         try:
             await connect_authorized(client)
             chats = await _chat_selection_service(effective, repository).resolve_with_client(client)
@@ -580,7 +581,7 @@ def doctor_command() -> None:
         if settings.tg_api_id and settings.tg_api_hash:
             client = None
             try:
-                client = create_client(settings)
+                client = create_readonly_client(settings)
                 await connect_authorized(client)
                 checks.append(("Authentication", "PASS", "Telethon session is authorized"))
                 if repository:

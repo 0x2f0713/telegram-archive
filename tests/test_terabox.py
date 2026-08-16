@@ -18,6 +18,7 @@ from app.infrastructure.terabox import (
     decode_etag,
     hash_file,
     remote_path_for,
+    sanitize_remote_component,
 )
 
 CHUNK = 4 * 1024 * 1024
@@ -193,6 +194,26 @@ def test_remote_path_for_maps_buffer_layout_to_remote_root(tmp_path: Path) -> No
     remote = remote_path_for(base, "/Telegram Archive", media)
 
     assert remote == "/Telegram Archive/-1001_Room/2026/08/16/42_clip.mp4"
+
+
+def test_remote_path_for_strips_terabox_rejected_characters(tmp_path: Path) -> None:
+    base = tmp_path / "downloads"
+    media = base / '-1001_Room🎀 / has:dots"and?stars*' / "2026" / "08" / "16" / "42_clip.mp4"
+
+    remote = remote_path_for(base, "/Telegram Archive", media)
+
+    assert "🎀" not in remote
+    for forbidden in ':?"*':
+        assert forbidden not in remote
+    assert remote.startswith("/Telegram Archive")
+    assert remote.endswith("2026/08/16/42_clip.mp4")
+
+
+def test_sanitize_remote_component_replaces_invalid_characters() -> None:
+    assert sanitize_remote_component('a:b?c"d*e<f>g|h') == "a_b_c_d_e_f_g_h"
+    sanitized = sanitize_remote_component("clip🎀.mp4")
+    assert "🎀" not in sanitized and sanitized == "clip_.mp4"
+    assert sanitize_remote_component("🎀🎀🎀") == "unnamed"
 
 
 async def test_upload_file_uses_rapid_dedupe_and_validates(tmp_path: Path) -> None:
