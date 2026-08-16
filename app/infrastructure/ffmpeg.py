@@ -283,7 +283,7 @@ async def extract_thumbnail(
     max_dimension: int = 320,
     quality: int = 75,
 ) -> bool:
-    """Extract a WebP thumbnail from an image or video into ``target``.
+    """Extract a JPEG thumbnail from an image or video into ``target``.
 
     For images: scales down preserving aspect ratio.
     For videos: extracts a frame at 1 second (or first keyframe) and scales.
@@ -301,6 +301,8 @@ async def extract_thumbnail(
     if hw_decode_enabled(settings, capabilities):
         args += ["-hwaccel", "rkmpp"]
     # For videos, seek to 1s; for images, -ss has no effect
+    # Map quality 1-100 to JPEG q:v 2-31 (lower is better for JPEG)
+    jpeg_quality = max(2, min(31, int(31 - (quality / 100) * 29)))
     args += [
         "-y",
         "-ss",
@@ -312,9 +314,9 @@ async def extract_thumbnail(
         "-vf",
         f"scale='if(gt(iw,ih),-2,{max_dimension})':'if(gt(iw,ih),{max_dimension},-2)'",
         "-q:v",
-        str(quality),
+        str(jpeg_quality),
         "-f",
-        "webp",
+        "image2",
         str(temp),
     ]
     returncode, _, stderr = await _run(capabilities.ffmpeg_bin, args, settings)

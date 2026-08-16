@@ -688,7 +688,7 @@ def generate_thumbnails_command(
                 for msg in messages:
                     thumb_dir = thumb_cache_root / str(msg.telegram_chat_id)
                     thumb_dir.mkdir(parents=True, exist_ok=True)
-                    thumb_path = thumb_dir / f"{msg.id}.webp"
+                    thumb_path = thumb_dir / f"{msg.id}.jpg"
 
                     if thumb_path.is_file() and not force:
                         skipped += 1

@@ -112,7 +112,7 @@ class MediaDownloader:
         except OSError as exc:
             logger.warning("Could not create poster dir %s: %s", poster_dir, exc)
             return
-        poster_path = poster_dir / f"{record.id}.poster.webp"
+        poster_path = poster_dir / f"{record.id}.poster.jpg"
         if await asyncio.to_thread(poster_path.is_file):
             return  # Already exists
         try:
@@ -285,7 +285,7 @@ class MediaDownloader:
         except OSError as exc:
             logger.warning("Could not create thumbnail dir %s: %s", thumb_dir, exc)
             return
-        thumb_path = thumb_dir / f"{record.id}.webp"
+        thumb_path = thumb_dir / f"{record.id}.jpg"
         if await asyncio.to_thread(thumb_path.is_file):
             return  # Already exists
         try:

@@ -1093,13 +1093,13 @@ def create_router(settings: Settings) -> APIRouter:
                 message.telegram_chat_id
             )
             if poster:
-                thumb_path = cache_root / f"{message_id}.poster.webp"
+                thumb_path = cache_root / f"{message_id}.poster.jpg"
             else:
-                thumb_path = cache_root / f"{message_id}.webp"
+                thumb_path = cache_root / f"{message_id}.jpg"
             if await asyncio.to_thread(thumb_path.is_file):
                 return FileResponse(
                     thumb_path,
-                    media_type="image/webp",
+                    media_type="image/jpeg",
                     content_disposition_type="inline",
                     headers={
                         "Cache-Control": "public, max-age=31536000, immutable",
