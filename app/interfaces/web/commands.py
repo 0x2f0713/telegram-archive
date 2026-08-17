@@ -65,9 +65,11 @@ class OperationCommands:
         manager: OperationManager,
         database: Database,
         readonly_client_factory: Callable[[Settings], Any] = create_readonly_client,
+        video_cache: Any | None = None,
     ) -> None:
         self.manager = manager
         self.database = database
+        self.video_cache = video_cache
         #: Short-lived operations share the account without writing the session
         #: file, so they never lock the archiver's Telethon SQLite session.
         self.readonly_client_factory = readonly_client_factory
@@ -128,7 +130,9 @@ class OperationCommands:
         """Compose workers against the web process's single SQLite engine."""
 
         repository = ArchiveRepository(self.database)
-        downloader = MediaDownloader(self.settings, repository, self._terabox_uploader())
+        downloader = MediaDownloader(
+            self.settings, repository, self._terabox_uploader(), self.video_cache
+        )
         return (
             repository,
             ArchiveService(

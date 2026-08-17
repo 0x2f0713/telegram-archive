@@ -226,6 +226,39 @@ def _preview_kind(mime_type: str | None) -> str:
     return "file"
 
 
+def _browser_media_type(media_path: Path, mime_type: str | None) -> str:
+    """Return a browser-playable media type for the file.
+
+    Telegram reports .MOV files as ``video/quicktime``, which Chromium
+    refuses to play (canPlayType returns ""). Many such files are really
+    MP4 containers (ftyp brand mp42/isom/mp41); sniff the brand box and
+    serve those as ``video/mp4`` so they play inline.
+    """
+    if (mime_type or "").casefold() == "video/quicktime":
+        try:
+            with open(media_path, "rb") as fh:
+                header = fh.read(64)
+            if len(header) >= 12 and header[4:8] == b"ftyp":
+                brand = header[8:12]
+                if brand in (b"mp42", b"isom", b"mp41", b"iso2", b"avc1", b"M4V "):
+                    return "video/mp4"
+        except OSError:
+            pass
+    return mime_type or "application/octet-stream"
+
+
+def _source_media_type(mime_type: str | None) -> str:
+    """Browser-facing type for a <source> element.
+
+    Chromium filters <source> candidates by their type attribute before
+    requesting them; video/quicktime is never selected. MOV files from
+    Telegram are MP4 containers, so advertise video/mp4.
+    """
+    if (mime_type or "").casefold() == "video/quicktime":
+        return "video/mp4"
+    return mime_type or "application/octet-stream"
+
+
 def _content_disposition_header(filename: str, mime_type: str | None) -> str:
     """Build a Content-Disposition header that survives non-ASCII filenames.
 
@@ -242,6 +275,7 @@ def _content_disposition_header(filename: str, mime_type: str | None) -> str:
 
 
 templates.env.globals["preview_kind"] = _preview_kind
+templates.env.globals["source_media_type"] = _source_media_type
 
 
 def _validation_message(exc: Exception) -> str:
@@ -928,7 +962,7 @@ def create_router(settings: Settings) -> APIRouter:
 
         # Get file size and mime type
         file_size = await asyncio.to_thread(lambda: media_path.stat().st_size)
-        mime_type = message.mime_type or "application/octet-stream"
+        mime_type = _browser_media_type(media_path, message.mime_type)
 
         # Parse Range header
         range_header = request.headers.get("range")

@@ -238,7 +238,9 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
             OperationRepository(database),
             executors={},
         )
-        operations.configure_executors(OperationCommands(operations, database).executors())
+        operations.configure_executors(
+            OperationCommands(operations, database, video_cache=app.state.video_cache).executors()
+        )
         app.state.operations = operations
         app.state.account_user_id = read_session_account_id(overridden.tg_session_name)
         templates.env.globals["refresh_seconds"] = overridden.web_refresh_seconds

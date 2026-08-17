@@ -13,6 +13,12 @@ CACHE_INDEX_NAME = "index.json"
 CHUNK_SIZE = 256 * 1024  # 256KB chunks
 
 
+def _read_chunk(source_path: Path, offset: int, size: int = CHUNK_SIZE) -> bytes:
+    with open(source_path, "rb") as fh:
+        fh.seek(offset)
+        return fh.read(size)
+
+
 class VideoRangeCache:
     """Local LRU cache for video byte ranges.
 
@@ -138,17 +144,19 @@ class VideoRangeCache:
             while remaining:
                 chunk_data = remaining[: CHUNK_SIZE - offset]
                 chunk_path = self.cache_dir / f"{message_id}_{chunk_start}.cache"
+                previous = self._index[message_id].get(chunk_start)
+                previous_size = previous[1] if previous is not None else 0
                 if offset == 0 and len(chunk_data) == CHUNK_SIZE:
                     # Full chunk - write directly
                     await asyncio.to_thread(chunk_path.write_bytes, chunk_data)
                     size = len(chunk_data)
                     self._index[message_id][chunk_start] = (chunk_path, size, time.time())
-                    self._total_size += size
+                    self._total_size += size - previous_size
                 else:
                     # Partial chunk - read existing, modify, write back
                     existing = b""
-                    if chunk_start in self._index[message_id]:
-                        existing_path, _, _ = self._index[message_id][chunk_start]
+                    if previous is not None:
+                        existing_path, _, _ = previous
                         if await asyncio.to_thread(existing_path.is_file):
                             existing = await asyncio.to_thread(existing_path.read_bytes)
                     merged = bytearray(existing)
@@ -158,7 +166,7 @@ class VideoRangeCache:
                     await asyncio.to_thread(chunk_path.write_bytes, bytes(merged))
                     size = len(merged)
                     self._index[message_id][chunk_start] = (chunk_path, size, time.time())
-                    self._total_size += size
+                    self._total_size += size - previous_size
 
                 remaining = remaining[len(chunk_data) :]
                 chunk_start += CHUNK_SIZE
@@ -166,6 +174,44 @@ class VideoRangeCache:
 
             await self._save_index()
             await self._evict_if_needed()
+
+    async def seed_file(self, message_id: int, source_path: Path) -> int:
+        """Copy a local file into the cache in whole chunks (LRU-aware).
+
+        Skips chunks already present. Returns the number of chunks seeded.
+        Used to warm the cache from the local upload buffer before it is
+        deleted, so fresh videos play without touching the remote CDN.
+        """
+        await self.initialize()
+        try:
+            size = (await asyncio.to_thread(source_path.stat)).st_size
+        except OSError:
+            return 0
+        seeded = 0
+        for chunk_start in range(0, size, CHUNK_SIZE):
+            try:
+                chunk_data = await asyncio.to_thread(_read_chunk, source_path, chunk_start)
+            except OSError:
+                break
+            if not chunk_data:
+                break
+            async with self._lock:
+                chunks = self._index.setdefault(message_id, {})
+                if chunk_start in chunks:
+                    continue
+                chunk_path = self.cache_dir / f"{message_id}_{chunk_start}.cache"
+                await asyncio.to_thread(chunk_path.write_bytes, chunk_data)
+                chunks[chunk_start] = (chunk_path, len(chunk_data), time.time())
+                self._total_size += len(chunk_data)
+                seeded += 1
+                if seeded % 16 == 0:
+                    await self._save_index()
+                    await self._evict_if_needed()
+        if seeded:
+            async with self._lock:
+                await self._save_index(force=True)
+                await self._evict_if_needed()
+        return seeded
 
     async def _evict_if_needed(self) -> None:
         """Evict LRU entries if cache exceeds max size."""

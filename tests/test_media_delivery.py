@@ -137,6 +137,49 @@ async def test_media_non_ascii_filename_serves_without_500(tmp_path: Path) -> No
     assert ranged.content == b"arch"
 
 
+async def test_media_quicktime_served_as_mp4_when_ftyp_is_mp4(tmp_path: Path) -> None:
+    """MOV files that are really MP4 containers must play in Chromium.
+
+    Telegram reports .MOV videos as ``video/quicktime``, which Chromium
+    refuses (canPlayType returns ""), so the original video could never
+    play inline. The brand box says mp42/isom, so the media route must
+    serve ``video/mp4`` instead.
+    """
+    settings = _settings(tmp_path)
+    message_id = await _seed_video(settings, mime_type="video/quicktime", filename="clip.MOV")
+    application = create_web_app(settings)
+
+    # Rewrite the stored media file to a real MP4 container (brand mp42).
+    media_path = settings.download_dir / "video" / "clip.MOV"
+    media_path.write_bytes(_box(b"ftyp", b"mp42" + b"\x00" * 8) + _box(b"moov", b"\x00" * 8))
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            media = await client.get(f"/media/{message_id}")
+
+    assert media.status_code == 200
+    assert media.headers["content-type"] == "video/mp4"
+
+
+async def test_media_quicktime_kept_for_actual_qt_files(tmp_path: Path) -> None:
+    """Non-MP4 MOV files keep their original MIME type."""
+    settings = _settings(tmp_path)
+    message_id = await _seed_video(settings, mime_type="video/quicktime", filename="clip.MOV")
+    application = create_web_app(settings)
+
+    media_path = settings.download_dir / "video" / "clip.MOV"
+    media_path.write_bytes(b"\x00" * 16 + b"not an mp4 container")
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            media = await client.get(f"/media/{message_id}")
+
+    assert media.status_code == 200
+    assert media.headers["content-type"] == "video/quicktime"
+
+
 class _FakeVariantPorts:
     def __init__(self, playable: Path | None, poster: Path | None) -> None:
         self.playable = playable

@@ -25,6 +25,7 @@ from app.infrastructure.ffmpeg import (
 from app.infrastructure.persistence.repository import ArchiveRepository
 from app.infrastructure.terabox import TeraBoxError, UploadReceipt
 from app.infrastructure.transcode import POSTER_SUFFIX
+from app.infrastructure.video_cache import VideoRangeCache
 
 logger = logging.getLogger(__name__)
 DownloadProgressCallback = Callable[[int, int], None]
@@ -48,10 +49,12 @@ class MediaDownloader:
         settings: Settings,
         repository: ArchiveRepository,
         uploader: MediaUploader | None = None,
+        video_cache: VideoRangeCache | None = None,
     ) -> None:
         self.settings = settings
         self.repository = repository
         self.uploader = uploader
+        self.video_cache = video_cache
         self._semaphore = asyncio.Semaphore(settings.download_concurrency)
         self._capabilities: FfmpegCapabilities | None = None
 
@@ -263,6 +266,17 @@ class MediaDownloader:
         # Generate local thumbnail for fast gallery loading in TeraBox mode
         if self.settings.thumbnail_cache_dir:
             await self._generate_thumbnail(record, target)
+        if self.video_cache is not None and target.suffix.casefold() in _VIDEO_SUFFIXES:
+            try:
+                seeded = await self.video_cache.seed_file(record.id, target)
+                if seeded:
+                    logger.info(
+                        "Seeded video cache for message %s (%s chunks) from upload buffer",
+                        record.id,
+                        seeded,
+                    )
+            except Exception as exc:
+                logger.warning("Could not seed video cache for message %s: %s", record.id, exc)
         try:
             await asyncio.to_thread(target.unlink, True)
         except OSError as exc:
