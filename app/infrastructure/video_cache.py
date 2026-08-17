@@ -10,7 +10,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 CACHE_INDEX_NAME = "index.json"
-CHUNK_SIZE = 64 * 1024  # 64KB chunks
+CHUNK_SIZE = 256 * 1024  # 256KB chunks
 
 
 class VideoRangeCache:
@@ -35,6 +35,7 @@ class VideoRangeCache:
         ] = {}  # message_id -> {chunk_start: (path, size, last_access)}
         self._total_size = 0
         self._initialized = False
+        self._last_save = 0.0
 
     async def initialize(self) -> None:
         """Load index from disk."""
@@ -66,8 +67,12 @@ class VideoRangeCache:
                     logger.warning("Failed to load video cache index: %s", exc)
             self._initialized = True
 
-    async def _save_index(self) -> None:
-        """Persist index to disk."""
+    async def _save_index(self, force: bool = False) -> None:
+        """Persist index to disk, at most once per second unless forced."""
+        now = time.time()
+        if not force and now - self._last_save < 1.0:
+            return
+        self._last_save = now
         try:
             import json
 
@@ -101,7 +106,9 @@ class VideoRangeCache:
                     return None  # Not fully cached
                 chunk_start += CHUNK_SIZE
 
-            # All chunks present - read and concatenate
+            # All chunks present - read and concatenate, trimming to the
+            # requested range (a cached chunk may hold more bytes than the
+            # caller asked for, e.g. a 1MiB store served later as 4KiB).
             result = bytearray()
             now = time.time()
             for cs in needed_chunks:
@@ -109,6 +116,11 @@ class VideoRangeCache:
                 # Update last access time
                 chunks[cs] = (path, size, now)
                 data = await asyncio.to_thread(path.read_bytes)
+                chunk_offset = cs
+                if chunk_offset < start:
+                    data = data[start - chunk_offset :]
+                if chunk_offset + len(data) > end + 1:
+                    data = data[: end + 1 - chunk_offset]
                 result.extend(data)
             await self._save_index()
             return bytes(result)

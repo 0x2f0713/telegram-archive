@@ -108,6 +108,35 @@ async def test_media_cache_headers_and_head_support(tmp_path: Path) -> None:
     assert missing.headers["cache-control"] == "no-store"
 
 
+async def test_media_non_ascii_filename_serves_without_500(tmp_path: Path) -> None:
+    """Chinese filenames must not crash the server (latin-1 header encoding).
+
+    Regression: Content-Disposition carried the raw UTF-8 filename, so every
+    request for a Chinese-named TeraBox file raised UnicodeEncodeError and
+    returned 500, which made video playback impossible.
+    """
+    settings = _settings(tmp_path)
+    message_id = await _seed_video(settings, filename="视频测试 (1).mp4")
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            media = await client.get(f"/media/{message_id}")
+            ranged = await client.get(
+                f"/media/{message_id}",
+                headers={"Range": "bytes=0-3"},
+            )
+
+    assert media.status_code == 200
+    assert ranged.status_code == 206
+    disposition = media.headers["content-disposition"]
+    assert disposition.startswith("inline")
+    assert "filename*=UTF-8''" in disposition
+    assert "%E8%A7%86%E9%A2%91" in disposition  # percent-encoded 视频, not raw UTF-8
+    assert ranged.content == b"arch"
+
+
 class _FakeVariantPorts:
     def __init__(self, playable: Path | None, poster: Path | None) -> None:
         self.playable = playable

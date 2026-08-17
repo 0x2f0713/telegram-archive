@@ -11,8 +11,8 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import asdict, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Literal
-from urllib.parse import urlencode
+from typing import BinaryIO, Literal
+from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import (
@@ -224,6 +224,21 @@ def _preview_kind(mime_type: str | None) -> str:
     if normalized.startswith("audio/"):
         return "audio"
     return "file"
+
+
+def _content_disposition_header(filename: str, mime_type: str | None) -> str:
+    """Build a Content-Disposition header that survives non-ASCII filenames.
+
+    ASCII names use the classic ``filename=`` form; anything else uses the
+    RFC 5987 ``filename*=UTF-8''...`` form because HTTP header values are
+    latin-1 on the wire and raw UTF-8 crashes the server (UnicodeEncodeError).
+    """
+    disposition = "inline" if _preview_kind(mime_type) != "file" else "attachment"
+    try:
+        filename.encode("latin-1")
+    except UnicodeEncodeError:
+        return f"{disposition}; filename*=UTF-8''{quote(filename)}"
+    return f'{disposition}; filename="{filename}"'
 
 
 templates.env.globals["preview_kind"] = _preview_kind
@@ -937,26 +952,42 @@ def create_router(settings: Settings) -> APIRouter:
         cache_enabled = is_video and video_cache is not None and settings.video_cache_dir
 
         async def stream_from_cache_or_fuse() -> AsyncGenerator[bytes, None]:
-            """Stream bytes from cache or FUSE, caching as we go."""
+            """Stream bytes from cache or FUSE, caching as we go.
 
-            def _read_chunk(path: Path, offset: int, size: int) -> bytes:
-                with path.open("rb") as f:
-                    f.seek(offset)
-                    return f.read(size)
+            The file handle stays open for the whole request and reads use
+            1 MiB blocks: the previous per-64KiB open/seek/read/close pattern
+            round-trips the network FUSE mount tens of thousands of times on a
+            multi-GB video and stalls playback.
+            """
+            read_size = 1024 * 1024
+
+            def _open_file() -> BinaryIO:
+                return media_path.open("rb")
+
+            def _read_block(handle: BinaryIO, size: int) -> bytes:
+                return handle.read(size)
+
+            def _seek(handle: BinaryIO, offset: int) -> None:
+                handle.seek(offset)
 
             if not cache_enabled:
                 # No cache - stream directly from FUSE
                 remaining = content_length
-                chunk_size = 64 * 1024
                 current_pos = start
-                while remaining > 0:
-                    read_size = min(chunk_size, remaining)
-                    chunk = await asyncio.to_thread(_read_chunk, media_path, current_pos, read_size)
-                    if not chunk:
-                        break
-                    yield chunk
-                    current_pos += len(chunk)
-                    remaining -= len(chunk)
+                handle = await asyncio.to_thread(_open_file)
+                try:
+                    await asyncio.to_thread(_seek, handle, start)
+                    while remaining > 0:
+                        chunk = await asyncio.to_thread(
+                            _read_block, handle, min(read_size, remaining)
+                        )
+                        if not chunk:
+                            break
+                        yield chunk
+                        current_pos += len(chunk)
+                        remaining -= len(chunk)
+                finally:
+                    await asyncio.to_thread(handle.close)
                 return
 
             # Try to serve from cache first
@@ -967,33 +998,30 @@ def create_router(settings: Settings) -> APIRouter:
                 return
 
             # Not fully cached - stream from FUSE while caching
-            chunk_size = 64 * 1024
             remaining = content_length
             current_pos = start
+            handle = await asyncio.to_thread(_open_file)
+            try:
+                await asyncio.to_thread(_seek, handle, start)
+                while remaining > 0:
+                    chunk = await asyncio.to_thread(_read_block, handle, min(read_size, remaining))
+                    if not chunk:
+                        break
 
-            while remaining > 0:
-                read_size = min(chunk_size, remaining)
-                chunk = await asyncio.to_thread(_read_chunk, media_path, current_pos, read_size)
-                if not chunk:
-                    break
+                    # Cache this block (split into cache-chunk units)
+                    await video_cache.store_range(message_id, current_pos, chunk)
 
-                # Cache this chunk
-                cache_chunk_start = (current_pos // chunk_size) * chunk_size
-                await video_cache.store_range(message_id, cache_chunk_start, chunk)
-
-                yield chunk
-                current_pos += len(chunk)
-                remaining -= len(chunk)
+                    yield chunk
+                    current_pos += len(chunk)
+                    remaining -= len(chunk)
+            finally:
+                await asyncio.to_thread(handle.close)
 
         headers = {
             "Accept-Ranges": "bytes",
             "Content-Length": str(content_length),
             "Content-Range": f"bytes {start}-{end}/{file_size}",
-            "Content-Disposition": (
-                f'inline; filename="{media_path.name}"'
-                if _preview_kind(mime_type) != "file"
-                else f'attachment; filename="{media_path.name}"'
-            ),
+            "Content-Disposition": _content_disposition_header(media_path.name, mime_type),
         }
         if range_header:
             headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
