@@ -54,6 +54,8 @@ RUNTIME_PROGRESS_FIELDS = frozenset(
         "download_total",
         "download_percent",
         "download_speed",
+        "upload_speed",
+        "transfer_speed",
         "download_tasks",
     }
 )
