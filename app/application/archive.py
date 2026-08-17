@@ -22,7 +22,7 @@ from app.utils.logging import format_bytes
 from app.utils.waiting import wait_or_stop
 
 logger = logging.getLogger(__name__)
-DownloadProgressCallback = Callable[[str, int, int], None]
+DownloadProgressCallback = Callable[[str, int, int, str], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,7 +150,7 @@ class ArchiveService:
                     if self.download_progress:
 
                         def upload_progress(current: int, total: int) -> None:
-                            self.download_progress(target.name, current, total)
+                            self.download_progress(target.name, current, total, "uploading")
 
                     publish_result = await self.downloader.publish_buffered(
                         record.id, target, upload_progress
@@ -181,12 +181,18 @@ class ArchiveService:
                 return ProcessResult(created, False, True)
 
             progress = None
+            upload_progress = None
             if self.download_progress:
 
                 def progress(current: int, total: int) -> None:
-                    self.download_progress(target.name, current, total)
+                    self.download_progress(target.name, current, total, "downloading")
 
-            result = await self.downloader.download(record, raw_message, target, progress)
+                def upload_progress(current: int, total: int) -> None:
+                    self.download_progress(target.name, current, total, "uploading")
+
+            result = await self.downloader.download(
+                record, raw_message, target, progress, upload_progress
+            )
             if result.completed and result.path and result.size is not None:
                 logger.info(
                     "[%s] Downloaded %s (%s)",

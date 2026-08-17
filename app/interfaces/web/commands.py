@@ -175,14 +175,17 @@ class OperationCommands:
                     exc_info=(type(error), error, error.__traceback__),
                 )
 
-        def report(filename: str, current: int, total: int) -> None:
+        def report(filename: str, current: int, total: int, phase: str = "downloading") -> None:
             nonlocal pending_force, pending_update, reporter_task
             now = monotonic()
-            previous_report = last_report.get(filename, 0.0)
+            # Throttle per file AND per phase so a download→upload transition is
+            # never suppressed by the immediately preceding download report.
+            report_key = f"{phase}:{filename}"
+            previous_report = last_report.get(report_key, 0.0)
             if current < total and now - previous_report < 0.2:
                 return
-            last_report[filename] = now
-            last_current, last_time, previous_speed = states.get(filename, (0, now, 0.0))
+            last_report[report_key] = now
+            last_current, last_time, previous_speed = states.get(report_key, (0, now, 0.0))
             elapsed = max(0.001, now - last_time)
             instantaneous_speed = max(0, current - last_current) / elapsed
             speed = (
@@ -190,18 +193,15 @@ class OperationCommands:
                 if not previous_speed
                 else (previous_speed * 0.7 + instantaneous_speed * 0.3)
             )
-            states[filename] = (current, now, speed)
+            states[report_key] = (current, now, speed)
             percent = round(current / total * 100, 1) if total else None
 
-            # Determine phase: downloading -> uploading -> completed
-            existing = tasks.get(filename)
-            if existing and existing["status"] == "completed" and current < total:
-                # Task was completed but we're getting more progress -> upload phase
-                status = "uploading"
-                # Reset speed calculation base for upload
-                states[filename] = (current, now, 0.0)
-            elif total and current >= total:
+            # The downloader tells us the phase explicitly; a finished report
+            # wins regardless of which phase sent it.
+            if total and current >= total:
                 status = "completed"
+            elif phase == "uploading":
+                status = "uploading"
             else:
                 status = "downloading"
 
@@ -222,8 +222,9 @@ class OperationCommands:
                 if tasks[oldest]["status"] == "uploading":
                     break
                 tasks.pop(oldest)
-                states.pop(oldest, None)
-                last_report.pop(oldest, None)
+                for phase_name in ("downloading", "uploading"):
+                    states.pop(f"{phase_name}:{oldest}", None)
+                    last_report.pop(f"{phase_name}:{oldest}", None)
             downloading = [task for task in tasks.values() if task["status"] == "downloading"]
             uploading = [task for task in tasks.values() if task["status"] == "uploading"]
             aggregate_download = round(sum(task["speed"] for task in downloading))

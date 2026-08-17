@@ -134,6 +134,7 @@ class MediaDownloader:
         raw_message: object,
         target: Path,
         progress: DownloadProgressCallback | None = None,
+        upload_progress: DownloadProgressCallback | None = None,
     ) -> DownloadResult:
         temp_path = target.with_name(f"{target.name}.part")
         async with self._semaphore:
@@ -155,7 +156,7 @@ class MediaDownloader:
                     variant_path = await self._optimize(target, record)
                     if self.uploader is not None:
                         return await self._publish_to_uploader(
-                            record, target, progress, variant_path
+                            record, target, progress, variant_path, upload_progress
                         )
                     await self._optimize(target)
                     size = await asyncio.to_thread(self._current_size, target)
@@ -216,6 +217,7 @@ class MediaDownloader:
         target: Path,
         progress: DownloadProgressCallback | None,
         variant_path: Path | None = None,
+        upload_progress: DownloadProgressCallback | None = None,
     ) -> DownloadResult:
         """Upload a just-finalized file; on failure keep the buffer file.
 
@@ -223,8 +225,9 @@ class MediaDownloader:
         re-downloading from Telegram.
         """
         assert self.uploader is not None
+        upload_callback = upload_progress if upload_progress is not None else progress
         try:
-            receipt = await self.uploader.upload(target, progress)
+            receipt = await self.uploader.upload(target, upload_callback)
         except asyncio.CancelledError:
             await self.repository.mark_download_failed(record.id, "Upload interrupted")
             raise
@@ -241,7 +244,7 @@ class MediaDownloader:
         variant_mount_path: str | None = None
         if variant_path is not None and self.settings.terabox_store_both:
             try:
-                variant_receipt = await self.uploader.upload(variant_path, progress)
+                variant_receipt = await self.uploader.upload(variant_path, upload_callback)
                 variant_mount_path = variant_receipt.mount_path
                 logger.info(
                     "Uploaded H.264 variant %s to TeraBox (%s bytes, md5=%s)",

@@ -222,6 +222,42 @@ async def test_download_reporter_coalesces_callback_bursts(tmp_path: Path) -> No
     }
 
 
+async def test_download_reporter_marks_explicit_upload_phase(tmp_path: Path) -> None:
+    """Upload progress arriving right after a completed download must be labelled
+    'uploading', not re-derived from the stale 'completed' task state."""
+    del tmp_path
+    updates: list[dict[str, object]] = []
+
+    class Context:
+        async def progress(self, **values: object) -> None:
+            updates.append(values)
+
+    reporter = OperationCommands._download_reporter(Context())  # type: ignore[arg-type]
+    # A full download cycle completing…
+    reporter("movie.mp4", 512, 1024)
+    await asyncio.sleep(0)
+    reporter("movie.mp4", 1024, 1024)
+    await asyncio.sleep(0)
+    # …followed immediately by upload progress for the same file.
+    reporter("movie.mp4", 256, 1024, "uploading")
+    await asyncio.sleep(0)
+
+    tasks = updates[-1]["download_tasks"]
+    assert isinstance(tasks, list)
+    upload_task = next(task for task in tasks if task["filename"] == "movie.mp4")
+    assert upload_task["status"] == "uploading"
+    assert upload_task["current"] == 256
+    assert updates[-1]["phase"] == "uploading"
+
+    # publish_buffered path: an upload that never saw a download phase first.
+    reporter("buffered.bin", 128, 1024, "uploading")
+    await asyncio.sleep(0)
+    tasks = updates[-1]["download_tasks"]
+    assert isinstance(tasks, list)
+    buffered_task = next(task for task in tasks if task["filename"] == "buffered.bin")
+    assert buffered_task["status"] == "uploading"
+
+
 async def test_web_worker_archive_stack_reuses_application_database(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     database = Database(settings.database_url)
