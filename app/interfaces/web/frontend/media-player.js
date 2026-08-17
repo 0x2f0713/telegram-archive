@@ -46,9 +46,24 @@ function setupVideoPlayer(video) {
   const PROBE_BYTES = 4 * 1024 * 1024;
   const PROBE_START_SECONDS = 5;
   const BUFFER_AHEAD_SECONDS = 20;
+  const SLOW_SPEED_BYTES = 500 * 1024;
+  const teraboxEnabled = host.dataset.teraboxEnabled === "true";
   let probe = null;
   let probeSpeed = 0;
   let variantTimer = null;
+  let seekingActive = false;
+
+  const setStatus = (text, state) => {
+    if (!badge || !teraboxEnabled) return;
+    badge.hidden = false;
+    badge.textContent = text;
+    badge.dataset.state = state;
+  };
+  const clearStatus = () => {
+    if (!badge || !teraboxEnabled) return;
+    badge.hidden = true;
+    delete badge.dataset.state;
+  };
 
   const config = {
     controls: [
@@ -104,6 +119,7 @@ function setupVideoPlayer(video) {
     if (probe) probe.abort();
     probe = null;
     if (badge) badge.hidden = true;
+    if (teraboxEnabled && badge) delete badge.dataset.state;
   };
   const startProbe = () => {
     if (probe || !size) return;
@@ -125,7 +141,13 @@ function setupVideoPlayer(video) {
       if (elapsed < 0.15) return;
       const instantaneous = loadedBytes / elapsed;
       probeSpeed = probeSpeed ? probeSpeed * 0.7 + instantaneous * 0.3 : instantaneous;
-      if (badge) {
+      if (teraboxEnabled && !seekingActive) {
+        if (probeSpeed < SLOW_SPEED_BYTES) {
+          setStatus(`Streaming from TeraBox · ${formatSpeed(probeSpeed)} · slow link`, "terabox-slow");
+        } else {
+          setStatus(`Streaming from TeraBox · ${formatSpeed(probeSpeed)}`, "terabox-playing");
+        }
+      } else if (badge) {
         badge.hidden = false;
         badge.textContent = `Speed ${formatSpeed(probeSpeed)} · ${formatBytes(loadedBytes)} loaded`;
       }
@@ -140,7 +162,50 @@ function setupVideoPlayer(video) {
     probe.send();
   };
   const stopProbeWhenBuffered = () => {
-    if (bufferedAhead() >= BUFFER_AHEAD_SECONDS) stopProbe();
+    if (bufferedAhead() >= BUFFER_AHEAD_SECONDS) {
+      stopProbe();
+      clearStatus();
+    }
+  };
+  const handleWaiting = () => {
+    if (!teraboxEnabled || video.dataset.variantPolling) return;
+    if (seekingActive) {
+      setStatus("Seeking on TeraBox…", "terabox-seeking");
+    } else if (video.readyState < 2 && !video.dataset.firstByteSeen) {
+      setStatus("Connecting to TeraBox…", "terabox-connecting");
+    } else {
+      setStatus("Buffering from TeraBox…", "terabox-buffering");
+    }
+  };
+  const handleSeeking = () => {
+    if (!teraboxEnabled) return;
+    seekingActive = true;
+    setStatus("Seeking on TeraBox…", "terabox-seeking");
+  };
+  const handleSeekedTerabox = () => {
+    seekingActive = false;
+  };
+  const handleProgressing = () => {
+    if (!teraboxEnabled || seekingActive) return;
+    video.dataset.firstByteSeen = "true";
+  };
+  const handlePlay = () => startProbe();
+  const handleWaitingCombined = () => {
+    startProbe();
+    handleWaiting();
+  };
+  const handleSeekedCombined = () => {
+    startProbe();
+    handleSeekedTerabox();
+  };
+  const handleCanPlayThrough = () => {
+    stopProbe();
+    clearStatus();
+  };
+  const handlePlaying = () => {
+    stopProbeWhenBuffered();
+    handleProgressing();
+    if (teraboxEnabled && !seekingActive && bufferedAhead() >= PROBE_START_SECONDS) clearStatus();
   };
   const stopVariantPoll = () => {
     if (variantTimer) {
@@ -208,23 +273,27 @@ function setupVideoPlayer(video) {
     pollVariant();
   };
 
-  video.addEventListener("play", startProbe);
-  video.addEventListener("waiting", startProbe);
-  video.addEventListener("seeked", startProbe);
+  video.addEventListener("play", handlePlay);
+  video.addEventListener("waiting", handleWaitingCombined);
+  video.addEventListener("seeking", handleSeeking);
+  video.addEventListener("seeked", handleSeekedCombined);
   video.addEventListener("pause", stopProbe);
-  video.addEventListener("canplaythrough", stopProbe);
-  video.addEventListener("playing", stopProbeWhenBuffered);
+  video.addEventListener("canplaythrough", handleCanPlayThrough);
+  video.addEventListener("playing", handlePlaying);
+  video.addEventListener("progress", handleProgressing);
   video.addEventListener("error", handlePlaybackError);
   videoPlayers.set(video, {
     player,
     stopProbe,
     removeListeners: () => {
-      video.removeEventListener("play", startProbe);
-      video.removeEventListener("waiting", startProbe);
-      video.removeEventListener("seeked", startProbe);
+      video.removeEventListener("play", handlePlay);
+      video.removeEventListener("waiting", handleWaitingCombined);
+      video.removeEventListener("seeking", handleSeeking);
+      video.removeEventListener("seeked", handleSeekedCombined);
       video.removeEventListener("pause", stopProbe);
-      video.removeEventListener("canplaythrough", stopProbe);
-      video.removeEventListener("playing", stopProbeWhenBuffered);
+      video.removeEventListener("canplaythrough", handleCanPlayThrough);
+      video.removeEventListener("playing", handlePlaying);
+      video.removeEventListener("progress", handleProgressing);
       video.removeEventListener("error", handlePlaybackError);
       stopVariantPoll();
     },
@@ -243,6 +312,7 @@ function destroyVideoPlayer(video) {
   delete video.dataset.playerReady;
   delete video.dataset.variantSwapped;
   delete video.dataset.variantPolling;
+  delete video.dataset.firstByteSeen;
 }
 
 function setupVideoPlayers() {
