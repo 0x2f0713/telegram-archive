@@ -202,6 +202,8 @@ class OperationCommands:
                 status = "completed"
             elif phase == "uploading":
                 status = "uploading"
+            elif phase == "preparing":
+                status = "preparing"
             else:
                 status = "downloading"
 
@@ -217,35 +219,48 @@ class OperationCommands:
             # the in-memory operation payload without bound.
             while len(tasks) > 8:
                 oldest = next(iter(tasks))
-                if tasks[oldest]["status"] == "downloading":
-                    break
-                if tasks[oldest]["status"] == "uploading":
+                if tasks[oldest]["status"] in ("downloading", "uploading", "preparing"):
                     break
                 tasks.pop(oldest)
-                for phase_name in ("downloading", "uploading"):
+                for phase_name in ("downloading", "uploading", "preparing"):
                     states.pop(f"{phase_name}:{oldest}", None)
                     last_report.pop(f"{phase_name}:{oldest}", None)
             downloading = [task for task in tasks.values() if task["status"] == "downloading"]
             uploading = [task for task in tasks.values() if task["status"] == "uploading"]
+            preparing = [task for task in tasks.values() if task["status"] == "preparing"]
             aggregate_download = round(sum(task["speed"] for task in downloading))
             aggregate_upload = round(sum(task["speed"] for task in uploading))
-            if downloading and uploading:
-                detail = (
-                    f"Downloading {len(downloading)} at {format_bytes(aggregate_download)}/s · "
-                    f"Uploading {len(uploading)} at {format_bytes(aggregate_upload)}/s"
+            segments: list[str] = []
+            if downloading:
+                segments.append(
+                    f"Downloading {len(downloading)} file{'s' if len(downloading) != 1 else ''} "
+                    f"at {format_bytes(aggregate_download)}/s"
                 )
-            elif downloading:
-                detail = (
-                    f"Downloading {len(downloading)} files at {format_bytes(aggregate_download)}/s"
+            if preparing:
+                segments.append(
+                    f"Optimizing {len(preparing)} file{'s' if len(preparing) != 1 else ''}"
                 )
-            elif uploading:
-                detail = f"Uploading {len(uploading)} files at {format_bytes(aggregate_upload)}/s"
+            if uploading:
+                segments.append(
+                    f"Uploading {len(uploading)} file{'s' if len(uploading) != 1 else ''} "
+                    f"at {format_bytes(aggregate_upload)}/s"
+                )
+            if segments:
+                detail = " · ".join(segments)
             else:
                 detail = (
                     f"Downloading {filename} ({percent or 0:.1f}%, {format_bytes(round(speed))}/s)"
                 )
+            if downloading:
+                active_phase = "downloading"
+            elif preparing:
+                active_phase = "preparing"
+            elif uploading:
+                active_phase = "uploading"
+            else:
+                active_phase = "idle"
             pending_update = {
-                "phase": "downloading" if downloading else ("uploading" if uploading else "idle"),
+                "phase": active_phase,
                 "detail": detail,
                 "download_filename": filename,
                 "download_current": current,

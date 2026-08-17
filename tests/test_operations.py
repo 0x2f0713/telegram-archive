@@ -258,6 +258,33 @@ async def test_download_reporter_marks_explicit_upload_phase(tmp_path: Path) -> 
     assert buffered_task["status"] == "uploading"
 
 
+async def test_download_reporter_shows_preparing_phase(tmp_path: Path) -> None:
+    """While ffmpeg optimizes a downloaded file, the monitor must show a
+    preparing task instead of a frozen downloading status."""
+    del tmp_path
+    updates: list[dict[str, object]] = []
+
+    class Context:
+        async def progress(self, **values: object) -> None:
+            updates.append(values)
+
+    reporter = OperationCommands._download_reporter(Context())  # type: ignore[arg-type]
+    reporter("clip.mp4", 512, 1024)
+    await asyncio.sleep(0)
+    reporter("clip.mp4", 1024, 1024)
+    await asyncio.sleep(0)
+    # Optimization phase starts immediately after the download completes.
+    reporter("clip.mp4", 0, 1024, "preparing")
+    await asyncio.sleep(0)
+
+    tasks = updates[-1]["download_tasks"]
+    assert isinstance(tasks, list)
+    task = next(t for t in tasks if t["filename"] == "clip.mp4")
+    assert task["status"] == "preparing"
+    assert updates[-1]["phase"] == "preparing"
+    assert "Optimizing" in str(updates[-1]["detail"])
+
+
 async def test_web_worker_archive_stack_reuses_application_database(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     database = Database(settings.database_url)

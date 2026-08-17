@@ -74,6 +74,8 @@ class ArchiveDownloader(Protocol):
         raw_message: object,
         target: Path,
         progress: Callable[[int, int], None] | None = None,
+        upload_progress: Callable[[int, int], None] | None = None,
+        prepare_progress: Callable[[int, int], None] | None = None,
     ) -> DownloadResult: ...
 
     async def publish_buffered(
@@ -182,6 +184,7 @@ class ArchiveService:
 
             progress = None
             upload_progress = None
+            prepare_progress = None
             if self.download_progress:
 
                 def progress(current: int, total: int) -> None:
@@ -190,8 +193,11 @@ class ArchiveService:
                 def upload_progress(current: int, total: int) -> None:
                     self.download_progress(target.name, current, total, "uploading")
 
+                def prepare_progress(current: int, total: int) -> None:
+                    self.download_progress(target.name, current, total, "preparing")
+
             result = await self.downloader.download(
-                record, raw_message, target, progress, upload_progress
+                record, raw_message, target, progress, upload_progress, prepare_progress
             )
             if result.completed and result.path and result.size is not None:
                 logger.info(

@@ -515,11 +515,16 @@ class TeraBoxClient:
     ) -> FileHashes:
         """Upload one local file to TeraBox and verify the published entry."""
 
+        stats = await asyncio.to_thread(local_path.stat)
+        if stats.st_size == 0:
+            raise TeraBoxError("Cannot upload an empty file")
+        # Report 0% immediately: hashing a multi-GB file can take a while and
+        # the UI should show the upload phase started, not a frozen download.
+        self._report(progress, 0, stats.st_size)
         hashes = await asyncio.to_thread(hash_file, Path(local_path), self.chunk_size)
         if hashes.size == 0:
             raise TeraBoxError("Cannot upload an empty file")
         upload = TeraBoxUpload(remote_path=remote_path, hashes=hashes)
-        self._report(progress, 0, hashes.size)
         if hashes.size >= SLICE_SIZE and await self._rapid_upload(upload):
             logger.info("TeraBox dedupe hit: %s already existed remotely", remote_path)
             self._report(progress, hashes.size, hashes.size)

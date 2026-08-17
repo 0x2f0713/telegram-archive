@@ -45,6 +45,7 @@ function setupOperationMonitor() {
     if (downloadSummary) {
       const downloadTasks = entries.filter((task) => task.status === "downloading");
       const uploadTasks = entries.filter((task) => task.status === "uploading");
+      const preparingTasks = entries.filter((task) => task.status === "preparing");
       const downloadSpeed = downloadTasks.reduce(
         (sum, task) => sum + (Number(task.speed) || 0),
         0,
@@ -56,6 +57,7 @@ function setupOperationMonitor() {
       const speeds = [];
       if (downloadSpeed) speeds.push(`↓ ${humanBytes(downloadSpeed)}/s`);
       if (uploadSpeed) speeds.push(`↑ ${humanBytes(uploadSpeed)}/s`);
+      if (preparingTasks.length) speeds.push(`optimizing ${preparingTasks.length}`);
       downloadSummary.textContent = `${active} active · ${entries.length} shown`
         + (speeds.length ? ` · ${speeds.join(" · ")}` : "");
     }
@@ -77,18 +79,28 @@ function setupOperationMonitor() {
       const filename = document.createElement("strong");
       filename.textContent = task.filename || "Unnamed media";
       const percentage = document.createElement("span");
-      percentage.textContent = `${percent.toFixed(1)}%`;
+      percentage.textContent = task.status === "preparing" ? "…" : `${percent.toFixed(1)}%`;
       head.append(filename, percentage);
       const bar = document.createElement("progress");
-      bar.value = current;
-      bar.max = total || 1;
+      if (task.status === "preparing") {
+        bar.removeAttribute("value");
+        bar.removeAttribute("max");
+        bar.classList.add("preparing");
+      } else {
+        bar.value = current;
+        bar.max = total || 1;
+      }
       bar.setAttribute("aria-label", `Progress for ${task.filename || "media"}`);
       bar.textContent = `${percent.toFixed(1)}%`;
       if (task.status === "uploading") bar.classList.add("uploading");
       const stats = document.createElement("small");
-      const statusText = task.status === "uploading" ? "uploading" : (task.status || "downloading");
-      const direction = task.status === "uploading" ? "↑" : "↓";
-      stats.textContent = `${humanBytes(current)} / ${humanBytes(total)} · ${direction} ${humanBytes(task.speed || 0)}/s · ${statusText}`;
+      if (task.status === "preparing") {
+        stats.textContent = `${humanBytes(total)} · optimizing (faststart/transcode)`;
+      } else {
+        const statusText = task.status === "uploading" ? "uploading" : (task.status || "downloading");
+        const direction = task.status === "uploading" ? "↑" : "↓";
+        stats.textContent = `${humanBytes(current)} / ${humanBytes(total)} · ${direction} ${humanBytes(task.speed || 0)}/s · ${statusText}`;
+      }
       row.append(head, bar, stats);
       downloadList.append(row);
     });

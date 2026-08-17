@@ -61,7 +61,13 @@ class PublishingDownloader:
         self.downloaded: list[Path] = []
 
     async def download(
-        self, record, raw_message, target, progress=None, upload_progress=None
+        self,
+        record,
+        raw_message,
+        target,
+        progress=None,
+        upload_progress=None,
+        prepare_progress=None,
     ) -> DownloadResult:
         self.downloaded.append(target)
         return DownloadResult(True, target, 1)

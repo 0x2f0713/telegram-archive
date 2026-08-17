@@ -135,6 +135,7 @@ class MediaDownloader:
         target: Path,
         progress: DownloadProgressCallback | None = None,
         upload_progress: DownloadProgressCallback | None = None,
+        prepare_progress: DownloadProgressCallback | None = None,
     ) -> DownloadResult:
         temp_path = target.with_name(f"{target.name}.part")
         async with self._semaphore:
@@ -152,13 +153,15 @@ class MediaDownloader:
                         raise OSError("Telegram returned no completed media file")
                     size = await asyncio.to_thread(self._finalize, temp_path, target)
                     # Optimize (faststart, poster, HEVC transcode) BEFORE upload in TeraBox mode
-                    # so the optimized file gets uploaded
+                    # so the optimized file gets uploaded. The preparing report keeps the
+                    # operation monitor alive while ffmpeg works on the local file.
+                    if prepare_progress is not None:
+                        prepare_progress(0, size)
                     variant_path = await self._optimize(target, record)
                     if self.uploader is not None:
                         return await self._publish_to_uploader(
                             record, target, progress, variant_path, upload_progress
                         )
-                    await self._optimize(target)
                     size = await asyncio.to_thread(self._current_size, target)
                     await self.repository.mark_download_completed(record.id, target, size)
                     return DownloadResult(True, target, size)
