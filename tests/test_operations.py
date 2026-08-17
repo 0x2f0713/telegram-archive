@@ -176,7 +176,7 @@ async def test_download_reporter_aggregates_speed_across_active_files(
     tasks = update["download_tasks"]
     assert isinstance(tasks, list)
     assert update["download_speed"] == sum(task["speed"] for task in tasks)
-    assert "2 files" in str(update["detail"]) and "total" in str(update["detail"])
+    assert "2 files" in str(update["detail"]) and "at" in str(update["detail"])
     # A single active file keeps the per-file detail instead of the aggregate.
     reporter("two.bin", 2048, 2048)
     reporter("one.bin", 1024, 1024)
