@@ -200,3 +200,39 @@ async def test_publish_buffered_returns_none_in_local_mode(tmp_path: Path) -> No
     downloader = MediaDownloader(settings, repository)  # type: ignore[arg-type]
 
     assert await downloader.publish_buffered(1, tmp_path / "file.bin") is None
+
+
+class VariantRecordingRepository(RecordingRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.variant_mount_paths: list[str | None] = []
+
+    async def mark_download_completed(
+        self, _message_id: int, _path: Path, _size: int, _variant_mount_path: str | None = None
+    ) -> None:
+        self.variant_mount_paths.append(_variant_mount_path)
+        await super().mark_download_completed(_message_id, _path, _size, _variant_mount_path)
+
+    async def get_message_by_id(self, _message_id: int) -> object:
+        return type("Record", (), {"id": 1, "telegram_chat_id": 12345})()
+
+
+async def test_publish_buffered_records_existing_mount_variant(tmp_path: Path) -> None:
+    """A re-published upload must record an H.264 variant that is already on
+    the mount (uploaded by an earlier interrupted attempt), so /variant can
+    serve it even though publish_buffered re-uploads only the original."""
+    repository = VariantRecordingRepository()
+    settings = _terabox_settings(tmp_path)
+    settings.download_dir.mkdir(parents=True, exist_ok=True)
+    settings.terabox_mount_dir.mkdir(parents=True, exist_ok=True)
+    uploader = FakeUploader(settings.terabox_mount_dir)
+    downloader = MediaDownloader(settings, repository, uploader)  # type: ignore[arg-type]
+    target = settings.download_dir / "42_report.pdf"
+    target.write_bytes(b"complete")
+    (settings.terabox_mount_dir / "42_report.h264.mp4").write_bytes(b"variant")
+
+    result = await downloader.publish_buffered(1, target)  # type: ignore[arg-type]
+
+    assert result is not None and result.completed
+    assert uploader.uploaded == [target]
+    assert repository.variant_mount_paths == [str(settings.terabox_mount_dir / "42_report.h264.mp4")]

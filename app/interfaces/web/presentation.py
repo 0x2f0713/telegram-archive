@@ -52,6 +52,7 @@ def navigation_context(request: Request, section: str) -> dict[str, object]:
         "generated_at": datetime.now(UTC),
         "csrf_token": request.app.state.csrf_token,
         "media_variants": request.app.state.settings.media_variants,
+        "terabox_enabled": request.app.state.settings.terabox_enabled,
     }
 
 

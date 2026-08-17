@@ -272,6 +272,67 @@ async def test_variant_routes_degrade_when_feature_disabled(tmp_path: Path) -> N
     assert poster.status_code == 404
 
 
+async def test_terabox_variant_served_from_predictable_sibling_without_db_path(
+    tmp_path: Path,
+) -> None:
+    """Rows completed via the re-publish path have no media_variant_path, but
+    the H.264 variant sits at a predictable sibling path on the mount. The
+    variant route must serve it and the status route must report it ready."""
+    settings = _settings(
+        tmp_path,
+        storage_mode="terabox",
+        terabox_ndus="t",
+        terabox_profile=None,
+        terabox_mount_dir=tmp_path / "mnt",
+        terabox_remote_dir="/Telegram Archive",
+    )
+    message_id = await _seed_video(settings)
+    media_path = settings.download_dir / "video" / "clip.mp4"
+    sibling = media_path.with_name(f"{media_path.stem}.h264.mp4")
+    sibling.write_bytes(b"cached h264 variant")
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            variant = await client.get(f"/media/{message_id}/variant")
+            status = await client.get(f"/media/{message_id}/variant-status")
+
+    assert variant.status_code == 200
+    assert variant.content == b"cached h264 variant"
+    assert variant.headers["content-type"] == "video/mp4"
+    payload = status.json()
+    assert payload["enabled"] is True
+    assert payload["ready"] is True
+    assert payload["transcoding"] is False
+
+
+async def test_terabox_variant_status_reports_disabled_without_sibling(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(
+        tmp_path,
+        storage_mode="terabox",
+        terabox_ndus="t",
+        terabox_profile=None,
+        terabox_mount_dir=tmp_path / "mnt",
+        terabox_remote_dir="/Telegram Archive",
+    )
+    message_id = await _seed_video(settings)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            variant = await client.get(f"/media/{message_id}/variant")
+            status = await client.get(f"/media/{message_id}/variant-status")
+
+    assert variant.status_code == 404
+    payload = status.json()
+    assert payload["enabled"] is False
+    assert payload["ready"] is True
+
+
 async def test_moov_offset_and_faststart_detection(tmp_path: Path) -> None:
     front = tmp_path / "front.mp4"
     front.write_bytes(_mp4(moov_at_front=True))
@@ -787,6 +848,41 @@ async def test_gallery_and_player_templates_guard_variant_artifacts(
     assert "poster=" not in disabled_detail.text
     assert "data-variant-url" not in disabled_conversation.text
     assert "data-variant-url" not in disabled_detail.text
+
+
+async def test_terabox_templates_always_offer_variant_url(tmp_path: Path) -> None:
+    """In TeraBox mode the H.264 variant may exist on the mount even when
+    media_variants is disabled and media_variant_path is unset (re-published
+    rows), so templates must always attach the variant URLs for videos."""
+    settings = _settings(
+        tmp_path,
+        storage_mode="terabox",
+        terabox_ndus="t",
+        terabox_profile=None,
+        terabox_mount_dir=tmp_path / "mnt",
+        terabox_remote_dir="/Telegram Archive",
+    )
+    message_id = await _seed_video(settings)
+    image_id = await _seed_video(
+        settings,
+        mime_type="image/jpeg",
+        media_type="photo",
+        filename="snap.jpg",
+        telegram_message_id=44,
+    )
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            gallery = await client.get(f"/chats/{-1001234567890}/media")
+            conversation = await client.get(f"/chats/{-1001234567890}")
+            detail = await client.get(f"/messages/{message_id}")
+
+    assert f'data-variant-url="/media/{message_id}/variant"' in gallery.text
+    assert f'data-variant-url="/media/{image_id}/variant"' not in gallery.text
+    assert f'data-variant-url="/media/{message_id}/variant"' in conversation.text
+    assert f'data-variant-url="/media/{message_id}/variant"' in detail.text
 
 
 async def test_optimize_media_operation_fails_without_ffmpeg(

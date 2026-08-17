@@ -260,6 +260,21 @@ class MediaDownloader:
                 )
             except Exception as exc:
                 logger.warning("Failed to upload H.264 variant: %s", exc)
+        elif self.settings.terabox_store_both:
+            # Re-publish path (publish_buffered): the H.264 variant may already
+            # sit on the mount next to the original from an earlier interrupted
+            # upload. Record it so /media/{id}/variant can serve it.
+            try:
+                sibling = receipt.mount_path.with_name(f"{receipt.mount_path.stem}.h264.mp4")
+                if await asyncio.to_thread(sibling.is_file):
+                    variant_mount_path = str(sibling)
+                    logger.info(
+                        "Recorded existing H.264 variant %s for re-published message %s",
+                        sibling,
+                        record.id,
+                    )
+            except OSError:
+                pass
         await self.repository.mark_download_completed(
             record.id, receipt.mount_path, receipt.size, variant_mount_path
         )

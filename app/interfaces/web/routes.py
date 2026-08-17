@@ -33,7 +33,7 @@ from app.application.dashboard import (
     DashboardService,
     MessageQuery,
 )
-from app.application.media_variants import MediaVariantService
+from app.application.media_variants import MediaVariantService, VariantStatus
 from app.application.operations import (
     OPERATION_COMMANDS,
     OperationConflictError,
@@ -1083,9 +1083,10 @@ def create_router(settings: Settings) -> APIRouter:
         if message is None or message.download_status != "completed":
             raise HTTPException(status_code=404, detail="Completed media not found")
 
-        # Check for pre-generated variant path (TeraBox mode with HEVC transcode)
+        roots = await asyncio.to_thread(request.app.state.settings.media_storage_roots)
+
+        # Check for recorded variant path (TeraBox mode with HEVC transcode)
         if message.media_variant_path:
-            roots = await asyncio.to_thread(request.app.state.settings.media_storage_roots)
             download_root, variant_path = await asyncio.to_thread(
                 _resolved_media_paths, roots, message.media_variant_path
             )
@@ -1099,8 +1100,22 @@ def create_router(settings: Settings) -> APIRouter:
                     content_disposition_type="inline",
                 )
 
-        # Fallback: use transcode manager for local mode (on-demand transcode)
+        # Fallback: the H.264 variant lives at a predictable path alongside the
+        # original. A re-published upload (e.g. after an interrupted sync) may
+        # leave media_variant_path unset even though the variant is on the
+        # mount, so probe for it in TeraBox mode.
         media_path, _ = await _completed_media(request, message_id)
+        if request.app.state.settings.terabox_enabled:
+            sibling = media_path.with_name(f"{media_path.stem}.h264.mp4")
+            if await asyncio.to_thread(sibling.is_file):
+                return FileResponse(
+                    sibling,
+                    media_type="video/mp4",
+                    filename=sibling.name,
+                    content_disposition_type="inline",
+                )
+
+        # Fallback: use transcode manager for local mode (on-demand transcode)
         service: MediaVariantService = request.app.state.media_variants
         playable = await service.playable_path(media_path)
         if playable is None or playable == media_path:
@@ -1115,6 +1130,15 @@ def create_router(settings: Settings) -> APIRouter:
     @router.get("/media/{message_id}/variant-status")
     async def media_variant_status(request: Request, message_id: int) -> dict[str, object]:
         media_path, _ = await _completed_media(request, message_id)
+        if request.app.state.settings.terabox_enabled:
+            sibling = media_path.with_name(f"{media_path.stem}.h264.mp4")
+            available = await asyncio.to_thread(sibling.is_file)
+            return VariantStatus(
+                enabled=available,
+                ready=True,
+                transcoding=False,
+                codec="h264" if available else None,
+            ).as_dict()
         service: MediaVariantService = request.app.state.media_variants
         return service.status(media_path).as_dict()
 
