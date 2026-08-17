@@ -229,18 +229,17 @@ class OperationCommands:
             uploading = [task for task in tasks.values() if task["status"] == "uploading"]
             aggregate_download = round(sum(task["speed"] for task in downloading))
             aggregate_upload = round(sum(task["speed"] for task in uploading))
-            aggregate_speed = aggregate_download + aggregate_upload
             if downloading and uploading:
                 detail = (
-                    f"Downloading {len(downloading)} · Uploading {len(uploading)} · "
-                    f"{format_bytes(aggregate_speed)}/s total"
+                    f"Downloading {len(downloading)} at {format_bytes(aggregate_download)}/s · "
+                    f"Uploading {len(uploading)} at {format_bytes(aggregate_upload)}/s"
                 )
             elif downloading:
-                detail = f"Downloading {len(downloading)} files · {format_bytes(aggregate_download)}/s total"
-            elif uploading:
                 detail = (
-                    f"Uploading {len(uploading)} files · {format_bytes(aggregate_upload)}/s total"
+                    f"Downloading {len(downloading)} files at {format_bytes(aggregate_download)}/s"
                 )
+            elif uploading:
+                detail = f"Uploading {len(uploading)} files at {format_bytes(aggregate_upload)}/s"
             else:
                 detail = (
                     f"Downloading {filename} ({percent or 0:.1f}%, {format_bytes(round(speed))}/s)"
@@ -254,7 +253,7 @@ class OperationCommands:
                 "download_percent": percent,
                 "download_speed": aggregate_download,
                 "upload_speed": aggregate_upload,
-                "transfer_speed": aggregate_speed,
+                "transfer_speed": aggregate_download + aggregate_upload,
                 "download_tasks": list(tasks.values()),
             }
             pending_force = pending_force or current >= total

@@ -43,12 +43,21 @@ function setupOperationMonitor() {
     const entries = Array.isArray(tasks) ? tasks : [];
     const active = entries.filter((task) => task.status !== "completed").length;
     if (downloadSummary) {
-      const totalSpeed = entries.reduce(
+      const downloadTasks = entries.filter((task) => task.status === "downloading");
+      const uploadTasks = entries.filter((task) => task.status === "uploading");
+      const downloadSpeed = downloadTasks.reduce(
         (sum, task) => sum + (Number(task.speed) || 0),
         0,
       );
+      const uploadSpeed = uploadTasks.reduce(
+        (sum, task) => sum + (Number(task.speed) || 0),
+        0,
+      );
+      const speeds = [];
+      if (downloadSpeed) speeds.push(`↓ ${humanBytes(downloadSpeed)}/s`);
+      if (uploadSpeed) speeds.push(`↑ ${humanBytes(uploadSpeed)}/s`);
       downloadSummary.textContent = `${active} active · ${entries.length} shown`
-        + (active && totalSpeed ? ` · ${humanBytes(totalSpeed)}/s total` : "");
+        + (speeds.length ? ` · ${speeds.join(" · ")}` : "");
     }
     if (!entries.length) {
       const empty = document.createElement("p");
@@ -78,7 +87,8 @@ function setupOperationMonitor() {
       if (task.status === "uploading") bar.classList.add("uploading");
       const stats = document.createElement("small");
       const statusText = task.status === "uploading" ? "uploading" : (task.status || "downloading");
-      stats.textContent = `${humanBytes(current)} / ${humanBytes(total)} · ${humanBytes(task.speed || 0)}/s · ${statusText}`;
+      const direction = task.status === "uploading" ? "↑" : "↓";
+      stats.textContent = `${humanBytes(current)} / ${humanBytes(total)} · ${direction} ${humanBytes(task.speed || 0)}/s · ${statusText}`;
       row.append(head, bar, stats);
       downloadList.append(row);
     });
