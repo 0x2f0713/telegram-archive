@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from pathlib import Path
@@ -590,3 +591,180 @@ async def test_media_deleter_rejects_paths_outside_mount(tmp_path: Path) -> None
     deleter = TeraBoxMediaDeleter(settings, FakeClient())  # type: ignore[arg-type]
 
     assert await deleter(tmp_path / "elsewhere" / "clip.mp4") is False
+
+
+# ---- direct dlink download ---------------------------------------------------
+
+
+class DownloadRecorder:
+    """Routes the dlink download protocol calls used by fetch_remote_file."""
+
+    def __init__(self, payload: bytes, *, throttle_once: bool = False) -> None:
+        self.requests: list[httpx.Request] = []
+        self.payload = payload
+        self.throttle_once = throttle_once
+        self.range_headers: list[str] = []
+        self.download_calls = 0
+        self.home_calls = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        path = request.url.path
+        if path == "/main":
+            return httpx.Response(
+                200,
+                text='<script>var templateData = {"jsToken": "%28%22tok123%22%29"};</script>',
+            )
+        if path == "/api/home/info":
+            self.home_calls += 1
+            return _json(
+                {
+                    "errno": 0,
+                    "data": {"sign1": "s1value", "sign3": "s3value", "timestamp": "1717000000"},
+                }
+            )
+        if path == "/api/download":
+            self.download_calls += 1
+            return _json(
+                {
+                    "errno": 0,
+                    "dlink": [
+                        {"fs_id": 12345, "dlink": "https://dm-d.terabox.com/file?fid=12345"}
+                    ],
+                }
+            )
+        if request.url.host == "dm-d.terabox.com":
+            self.range_headers.append(request.headers.get("range", ""))
+            if self.throttle_once:
+                self.throttle_once = False
+                throttle = json.dumps({"errno": 400141, "errmsg": "need verify"}).encode()
+                return httpx.Response(
+                    200, content=throttle, headers={"content-length": str(len(throttle))}
+                )
+            body = self.payload
+            range_header = request.headers.get("range", "")
+            if range_header.startswith("bytes="):
+                start, _, end = range_header[len("bytes=") :].partition("-")
+                body = self.payload[int(start) : int(end) + 1 if end else None]
+            return httpx.Response(
+                206, content=body, headers={"content-length": str(len(body))}
+            )
+        if path == "/api/list":
+            return _json(
+                {
+                    "errno": 0,
+                    "list": [
+                        {
+                            "path": "/Telegram Archive/photo.jpg",
+                            "size": len(self.payload),
+                            "isdir": 0,
+                            "fs_id": 12345,
+                        }
+                    ],
+                    "has_more": False,
+                }
+            )
+        return _json({"errno": 0})
+
+
+def test_sign_download_matches_js_reference_vectors() -> None:
+    # Vectors generated with the terabox-api JavaScript SignDownload implementation.
+    from app.infrastructure.terabox import sign_download
+
+    assert sign_download("k1secretkey", "payloadtosign123") == "oL1WBFlrJxvuoH1tUqtpDQ=="
+    assert sign_download("k1secretkey", "") == ""
+    # JS charCodeAt(index % 0) yields NaN -> Uint8Array 0, i.e. identity key.
+    assert sign_download("", "payloadtosign123") == "rnnwLcxWOU7ldXcAOV+gXg=="
+
+
+async def test_download_url_signs_and_caches_dlink(tmp_path: Path) -> None:
+    recorder = DownloadRecorder(b"A" * 1024)
+    client = _client(_settings(tmp_path), recorder)
+
+    from app.infrastructure.terabox import sign_download
+
+    link = await client.download_url(12345)
+    second = await client.download_url(12345)
+
+    assert link == "https://dm-d.terabox.com/file?fid=12345"
+    assert second == link
+    assert recorder.download_calls == 1
+    assert recorder.home_calls == 1
+    form = _form(next(r for r in recorder.requests if r.url.path == "/api/download"))
+    assert form["sign"] == sign_download("s3value", "s1value")
+    assert form["fidlist"] == "[12345]"
+    await client.aclose()
+
+
+async def test_fetch_remote_file_writes_file_with_resume_range(tmp_path: Path) -> None:
+    payload = b"B" * 2048
+    recorder = DownloadRecorder(payload)
+    client = _client(_settings(tmp_path), recorder)
+    dest = tmp_path / "photo.jpg"
+
+    result = await client.fetch_remote_file(
+        "/Telegram Archive/photo.jpg", dest, expected_size=len(payload)
+    )
+
+    assert result == dest
+    assert dest.read_bytes() == payload
+    assert not dest.with_suffix(".jpg.part").exists()
+    assert recorder.range_headers == [f"bytes=0-{len(payload) - 1}"]
+    await client.aclose()
+
+
+async def test_fetch_remote_file_limit_bytes_fetches_prefix_only(tmp_path: Path) -> None:
+    payload = b"C" * 4096
+    recorder = DownloadRecorder(payload)
+    client = _client(_settings(tmp_path), recorder)
+    dest = tmp_path / "clip.mp4"
+
+    result = await client.fetch_remote_file(
+        "/Telegram Archive/photo.jpg", dest, limit_bytes=1024
+    )
+
+    assert result == dest
+    assert dest.read_bytes() == payload[:1024]
+    assert recorder.range_headers == ["bytes=0-1023"]
+    await client.aclose()
+
+
+async def test_fetch_remote_file_throttle_retry_arms_gate_and_refreshes_dlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sleeps: list[float] = []
+
+    async def instant_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", instant_sleep)
+    payload = b"D" * 1024
+    recorder = DownloadRecorder(payload, throttle_once=True)
+    client = _client(_settings(tmp_path), recorder)
+    dest = tmp_path / "photo.jpg"
+
+    result = await client.fetch_remote_file("/Telegram Archive/photo.jpg", dest)
+
+    assert result == dest
+    assert dest.read_bytes() == payload
+    # The throttle response must refresh the dlink (second /api/download call)
+    # and make the retry wait out the throttle window.
+    assert recorder.download_calls == 2
+    # Wait out the ~35s throttle window (monotonic drift keeps it just under 35).
+    assert any(sleep >= 34 for sleep in sleeps)
+    # The second range attempt succeeds after the gate.
+    assert recorder.range_headers == ["bytes=0-1023", "bytes=0-1023"]
+    await client.aclose()
+
+
+async def test_fetch_remote_file_rejects_oversize_and_missing(tmp_path: Path) -> None:
+    recorder = DownloadRecorder(b"E" * 128)
+    client = _client(_settings(tmp_path), recorder)
+
+    with pytest.raises(terabox_module.TeraBoxError, match="too large"):
+        await client.fetch_remote_file(
+            "/Telegram Archive/photo.jpg", tmp_path / "photo.jpg", max_bytes=64
+        )
+    with pytest.raises(terabox_module.TeraBoxError, match="not found"):
+        await client.fetch_remote_file("/nowhere/missing.jpg", tmp_path / "missing.jpg")
+    await client.aclose()

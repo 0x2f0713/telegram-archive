@@ -7,10 +7,12 @@ import csv
 import io
 import ipaddress
 import logging
+import tempfile
+import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import asdict, replace
 from datetime import UTC, date, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Literal
 from urllib.parse import quote, urlencode
 
@@ -32,6 +34,7 @@ from app.application.dashboard import (
     ChatMediaQuery,
     DashboardService,
     MessageQuery,
+    MessageView,
 )
 from app.application.media_variants import MediaVariantService, VariantStatus
 from app.application.operations import (
@@ -58,10 +61,12 @@ from app.domain.content import (
     canonical_content_type_list,
     normalize_content_types,
 )
+from app.infrastructure.ffmpeg import FfmpegCapabilities, extract_thumbnail
 from app.infrastructure.persistence.read_models import DashboardRepository
 from app.infrastructure.persistence.selection import ChatSelectionRepository
 from app.infrastructure.persistence.settings import RuntimeSettingsRepository
 from app.infrastructure.telegram.client import TelegramAccessError
+from app.infrastructure.terabox import TeraBoxClient, TeraBoxError
 from app.interfaces.web.auth_routes import create_auth_router
 from app.interfaces.web.forms import form_values as _form_values
 from app.interfaces.web.forms import require_csrf as _require_csrf
@@ -70,6 +75,9 @@ from app.interfaces.web.presentation import navigation_context, templates
 from app.interfaces.web.system import inspect_storage
 
 INLINE_IMAGE_TYPES = frozenset(GALLERY_IMAGE_MIME_TYPES)
+#: Upper bound for direct TeraBox thumbnail fetches; gallery thumbs only need
+#: enough bytes for ffmpeg to decode one frame.
+THUMB_DIRECT_MAX_BYTES = 80 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
@@ -257,6 +265,91 @@ def _source_media_type(mime_type: str | None) -> str:
     if (mime_type or "").casefold() == "video/quicktime":
         return "video/mp4"
     return mime_type or "application/octet-stream"
+
+
+async def _direct_thumb_path(
+    request: Request,
+    message: MessageView,
+    *,
+    poster: bool = False,
+) -> tuple[Path, int, int] | None:
+    """Generate a thumbnail by fetching the media straight from TeraBox.
+
+    Downloads the file (or just its head for videos) through the dlink API,
+    runs ffmpeg, and stores the JPEG in the thumbnail cache. Returns
+    ``(thumb_path, mtime_ns, size)`` on success, or ``None`` to fall back to
+    the FUSE mount. Skips silently when the archive is local-only or the
+    media file is already reachable locally.
+    """
+    settings: Settings = request.app.state.settings
+    if not settings.terabox_enabled or not message.media_path:
+        return None
+    cache_root = settings.thumbnail_cache_dir.expanduser().resolve() / str(
+        message.telegram_chat_id
+    )
+    thumb_path = cache_root / (f"{message.id}.poster.jpg" if poster else f"{message.id}.jpg")
+    try:
+        stat = await asyncio.to_thread(thumb_path.stat)
+        return thumb_path, stat.st_mtime_ns, stat.st_size
+    except OSError:
+        pass
+
+    client: TeraBoxClient | None = getattr(request.app.state, "terabox_client", None)
+    capabilities: FfmpegCapabilities = getattr(
+        request.app.state, "ffmpeg_capabilities", None
+    )
+    if client is None or capabilities is None or not capabilities.available:
+        return None
+
+    roots = await asyncio.to_thread(settings.media_storage_roots)
+    _, resolved = await asyncio.to_thread(_resolved_media_paths, roots, message.media_path)
+    mount_root = settings.terabox_mount_dir.expanduser().resolve()
+    try:
+        relative = resolved.relative_to(mount_root)
+    except ValueError:
+        return None
+    # The FUSE mount exposes the drive root, so the mount-relative path is
+    # the drive-absolute remote path (e.g. "/Telegram Archive/..."). Do not
+    # check ``is_file`` first: FUSE attrs answer from cached listings, so a
+    # cold file still reports present and would send us back to the ~40s
+    # slow path. Missing-file errors surface as fetch failures below.
+    remote = str(PurePosixPath("/", *relative.parts))
+
+    is_video = (message.mime_type or "").casefold().startswith("video/")
+    started = time.monotonic()
+    try:
+        with tempfile.TemporaryDirectory(
+            dir=str(settings.thumbnail_cache_dir.expanduser().resolve()),
+            prefix=f"thumb-{message.id}-",
+        ) as scratch:
+            suffix = Path(message.filename or resolved.name).suffix or ".bin"
+            temp_path = Path(scratch) / f"media{suffix}"
+            fetch_kwargs: dict[str, int] = {}
+            if is_video:
+                fetch_kwargs["limit_bytes"] = 4 * 1024 * 1024
+            await client.fetch_remote_file(
+                remote,
+                temp_path,
+                max_bytes=THUMB_DIRECT_MAX_BYTES,
+                expected_size=message.media_size,
+                **fetch_kwargs,
+            )
+            cache_root.mkdir(parents=True, exist_ok=True)
+            ok = await extract_thumbnail(settings, capabilities, temp_path, thumb_path)
+            if not ok or not await asyncio.to_thread(thumb_path.is_file):
+                return None
+            stat = await asyncio.to_thread(thumb_path.stat)
+            logger.info(
+                "Direct thumb fetch for message %s took %.1fs",
+                message.id,
+                time.monotonic() - started,
+            )
+            return thumb_path, stat.st_mtime_ns, stat.st_size
+    except asyncio.CancelledError:
+        raise
+    except (TeraBoxError, OSError) as exc:
+        logger.warning("Direct thumb fetch failed for message %s: %s", message.id, exc)
+        return None
 
 
 def _content_disposition_header(filename: str, mime_type: str | None) -> str:
@@ -1192,6 +1285,22 @@ def create_router(settings: Settings) -> APIRouter:
                         "ETag": f'W/"{thumb_path.stat().st_mtime_ns}-{thumb_path.stat().st_size}"',
                     },
                 )
+
+        # Direct-fetch fallback: pull the media from TeraBox straight via the
+        # CDN, generate the thumbnail, and serve the newly cached JPEG. Cheaper
+        # than reading the cold file through the FUSE mount for thumbnails.
+        direct = await _direct_thumb_path(request, message, poster=poster)
+        if direct is not None:
+            thumb_path, mtime_ns, size = direct
+            return FileResponse(
+                thumb_path,
+                media_type="image/jpeg",
+                content_disposition_type="inline",
+                headers={
+                    "Cache-Control": "public, max-age=31536000, immutable",
+                    "ETag": f'W/"{mtime_ns}-{size}"',
+                },
+            )
 
         # Fallback: serve from FUSE mount (full image/video)
         media_path, mime_type = await _completed_media(request, message_id)

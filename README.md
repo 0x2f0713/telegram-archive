@@ -236,6 +236,13 @@ Consequences of remote storage:
 - **Pristine originals only.** `MEDIA_FASTSTART` and `MEDIA_VARIANTS` are
   forced off in this mode; the cloud keeps unmodified source files and the
   `optimize-media` operation is disabled.
+- **Direct CDN thumbnails.** When a gallery thumbnail is missing, the web
+  dashboard fetches the source directly through the TeraBox `dlink` API
+  (single sequential stream with a shared "need verify" throttle gate)
+  instead of reading the cold file through the FUSE mount, then caches the
+  generated JPEG in `THUMBNAIL_CACHE_DIR`. Videos only download their first
+  4 MB. This turns a ~40 s cold mount read into ~2 s for photos; cached
+  thumbnails are served directly afterwards.
 - **Repair semantics.** A file left in `DOWNLOAD_DIR` without a completed
   status is treated as downloaded-but-not-uploaded and is uploaded on the
   next sync/retry, without re-downloading from Telegram.

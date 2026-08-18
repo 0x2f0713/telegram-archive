@@ -205,6 +205,7 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
             overridden.configured_chat_ids,
         )
         capabilities = await probe_capabilities(overridden)
+        app.state.ffmpeg_capabilities = capabilities
         app.state.variant_manager = VariantManager(overridden, capabilities)
         app.state.media_variants = MediaVariantService(
             enabled=overridden.media_variants,

@@ -297,30 +297,40 @@ async def extract_thumbnail(
         temp.unlink(missing_ok=True)
     except OSError:
         pass
-    args: list[str] = []
-    if hw_decode_enabled(settings, capabilities):
-        args += ["-hwaccel", "rkmpp"]
-    # For videos, seek to 1s; for images, -ss has no effect
-    # Map quality 1-100 to JPEG q:v 2-31 (lower is better for JPEG)
     jpeg_quality = max(2, min(31, int(31 - (quality / 100) * 29)))
-    args += [
-        "-y",
-        "-ss",
-        "1",
-        "-i",
-        str(source),
-        "-frames:v",
-        "1",
-        "-vf",
-        f"scale='if(gt(iw,ih),-2,{max_dimension})':'if(gt(iw,ih),{max_dimension},-2)'",
-        "-q:v",
-        str(jpeg_quality),
-        "-f",
-        "image2",
-        str(temp),
-    ]
-    returncode, _, stderr = await _run(capabilities.ffmpeg_bin, args, settings)
-    if returncode != 0:
+
+    def build_args(seek: bool) -> list[str]:
+        args: list[str] = []
+        if hw_decode_enabled(settings, capabilities):
+            args += ["-hwaccel", "rkmpp"]
+        args += ["-y"]
+        if seek:
+            # For videos, seek to 1s (skips black/blank intros).
+            args += ["-ss", "1"]
+        args += [
+            "-i",
+            str(source),
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            "-vf",
+            f"scale='if(gt(iw,ih),-2,{max_dimension})':'if(gt(iw,ih),{max_dimension},-2)'",
+            "-q:v",
+            str(jpeg_quality),
+            "-f",
+            "image2",
+            str(temp),
+        ]
+        return args
+
+    returncode, _, stderr = await _run(capabilities.ffmpeg_bin, build_args(True), settings)
+    if returncode == 0 and (not temp.exists() or temp.stat().st_size == 0):
+        # Still images have ~0 duration, so seeking 1s jumps past their only
+        # frame and ffmpeg "succeeds" without writing anything. Retry unseeked.
+        temp.unlink(missing_ok=True)
+        returncode, _, stderr = await _run(capabilities.ffmpeg_bin, build_args(False), settings)
+    if returncode != 0 or not temp.exists() or temp.stat().st_size == 0:
         logger.warning("thumbnail extraction failed for %s: %s", source, stderr[-500:])
         try:
             temp.unlink(missing_ok=True)
