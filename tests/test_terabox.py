@@ -599,13 +599,21 @@ async def test_media_deleter_rejects_paths_outside_mount(tmp_path: Path) -> None
 class DownloadRecorder:
     """Routes the dlink download protocol calls used by fetch_remote_file."""
 
-    def __init__(self, payload: bytes, *, throttle_once: bool = False) -> None:
+    def __init__(
+        self,
+        payload: bytes,
+        *,
+        throttle_once: bool = False,
+        filemetas: bool = True,
+    ) -> None:
         self.requests: list[httpx.Request] = []
         self.payload = payload
         self.throttle_once = throttle_once
+        self.filemetas = filemetas
         self.range_headers: list[str] = []
         self.download_calls = 0
         self.home_calls = 0
+        self.filemetas_calls = 0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -614,6 +622,21 @@ class DownloadRecorder:
             return httpx.Response(
                 200,
                 text='<script>var templateData = {"jsToken": "%28%22tok123%22%29"};</script>',
+            )
+        if path == "/api/filemetas":
+            self.filemetas_calls += 1
+            if not self.filemetas:
+                return _json({"errno": 31023})
+            return _json(
+                {
+                    "errno": 0,
+                    "info": [
+                        {
+                            "fs_id": 12345,
+                            "dlink": "https://dm-d.terabox.com/file?fid=12345&expires=8h",
+                        }
+                    ],
+                }
             )
         if path == "/api/home/info":
             self.home_calls += 1
@@ -696,6 +719,63 @@ async def test_download_url_signs_and_caches_dlink(tmp_path: Path) -> None:
     await client.aclose()
 
 
+async def test_download_url_for_path_uses_filemetas_and_caches(tmp_path: Path) -> None:
+    recorder = DownloadRecorder(b"A" * 1024)
+    client = _client(_settings(tmp_path), recorder)
+
+    link = await client.download_url_for_path("/Telegram Archive/photo.jpg")
+    second = await client.download_url_for_path("/Telegram Archive/photo.jpg")
+
+    assert link == "https://dm-d.terabox.com/file?fid=12345&expires=8h"
+    assert second == link
+    assert recorder.filemetas_calls == 1
+    assert recorder.download_calls == 0
+    assert recorder.home_calls == 0
+    request = next(r for r in recorder.requests if r.url.path == "/api/filemetas")
+    assert request.url.params["dlink"] == "1"
+    assert json.loads(request.url.params["target"]) == ["/Telegram Archive/photo.jpg"]
+    await client.aclose()
+
+
+async def test_fetch_remote_file_prefers_filemetas_over_signed_download(tmp_path: Path) -> None:
+    payload = b"F" * 1024
+    recorder = DownloadRecorder(payload)
+    client = _client(_settings(tmp_path), recorder)
+    dest = tmp_path / "photo.jpg"
+
+    result = await client.fetch_remote_file(
+        "/Telegram Archive/photo.jpg", dest, expected_size=len(payload)
+    )
+
+    assert result == dest
+    assert dest.read_bytes() == payload
+    # The unsigned filemetas route replaces the home/info + RC4 download dance.
+    assert recorder.filemetas_calls == 1
+    assert recorder.download_calls == 0
+    assert recorder.home_calls == 0
+    await client.aclose()
+
+
+async def test_fetch_remote_file_falls_back_to_signed_download_when_filemetas_fails(
+    tmp_path: Path,
+) -> None:
+    payload = b"G" * 1024
+    recorder = DownloadRecorder(payload, filemetas=False)
+    client = _client(_settings(tmp_path), recorder)
+    dest = tmp_path / "photo.jpg"
+
+    result = await client.fetch_remote_file(
+        "/Telegram Archive/photo.jpg", dest, expected_size=len(payload)
+    )
+
+    assert result == dest
+    assert dest.read_bytes() == payload
+    assert recorder.filemetas_calls == 1
+    assert recorder.download_calls == 1
+    assert recorder.home_calls == 1
+    await client.aclose()
+
+
 async def test_fetch_remote_file_writes_file_with_resume_range(tmp_path: Path) -> None:
     payload = b"B" * 2048
     recorder = DownloadRecorder(payload)
@@ -747,9 +827,9 @@ async def test_fetch_remote_file_throttle_retry_arms_gate_and_refreshes_dlink(
 
     assert result == dest
     assert dest.read_bytes() == payload
-    # The throttle response must refresh the dlink (second /api/download call)
-    # and make the retry wait out the throttle window.
-    assert recorder.download_calls == 2
+    # The throttle response must refresh the dlink (second /api/filemetas
+    # call) and make the retry wait out the throttle window.
+    assert recorder.filemetas_calls == 2
     # Wait out the ~35s throttle window (monotonic drift keeps it just under 35).
     assert any(sleep >= 34 for sleep in sleeps)
     # The second range attempt succeeds after the gate.

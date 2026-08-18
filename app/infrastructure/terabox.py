@@ -48,6 +48,8 @@ _CHUNK_MAX_TRIES = 4
 
 #: TeraBox dlinks are documented as valid for ~1 hour; cache them for 50 minutes.
 DLINK_TTL_SECONDS = 50 * 60
+#: ``/api/filemetas`` dlinks are returned with ``expires=8h``; cache for 6.
+FILEMETAS_DLINK_TTL_SECONDS = 6 * 60 * 60
 #: The CDN "need verify" throttle (errno 400141/424629) holds the session for
 #: up to ~40 s. Retry only after waiting the window out instead of hammering.
 DIRECT_DOWNLOAD_THROTTLE_SECONDS = 35.0
@@ -291,6 +293,8 @@ class TeraBoxClient:
         self._quota_cache: tuple[float, tuple[int, int]] | None = None
         # fs_id -> (dlink url, monotonic expiry); dlinks are valid ~1 hour.
         self._dlink_cache: dict[int, tuple[str, float]] = {}
+        # remote path -> (dlink url, monotonic expiry) for /api/filemetas links.
+        self._path_dlink_cache: dict[str, tuple[str, float]] = {}
         # Monotonic deadline until which the session sits inside a CDN
         # "need verify" throttle window; downloads wait it out instead of
         # retrying every few seconds until the attempts are exhausted.
@@ -556,6 +560,34 @@ class TeraBoxClient:
         self._dlink_cache[fs_id] = (link, time.monotonic() + DLINK_TTL_SECONDS)
         return link
 
+    async def download_url_for_path(self, remote_path: str) -> str:
+        """Return a CDN dlink for ``remote_path`` via ``/api/filemetas``.
+
+        Simpler than :meth:`download_url`: no ``/api/home/info`` round trip and
+        no RC4 signing — the endpoint takes the path and answers with an
+        ``expires=8h`` dlink. Cached per path for most of that window.
+        """
+
+        cache_key = remote_path
+        cached = self._path_dlink_cache.get(cache_key)
+        if cached is not None and cached[1] > time.monotonic():
+            return cached[0]
+
+        data = await self._api_json(
+            "/api/filemetas?"
+            + _query_params({**APP_PARAMS, "dlink": 1, "target": json.dumps([remote_path])})
+        )
+        if data.get("errno") not in (0, None):
+            raise TeraBoxError(
+                f"TeraBox filemetas failed with errno {data.get('errno')} for {remote_path}"
+            )
+        info = data.get("info") or []
+        link = info[0].get("dlink") if info else None
+        if not link:
+            raise TeraBoxError(f"TeraBox filemetas returned no dlink for {remote_path}")
+        self._path_dlink_cache[cache_key] = (link, time.monotonic() + FILEMETAS_DLINK_TTL_SECONDS)
+        return link
+
     async def _cdn_stream(
         self, url: str, headers: dict[str, str], *, follow_redirects: int = 10
     ) -> httpx.Response:
@@ -605,8 +637,29 @@ class TeraBoxClient:
         errmsg = str(parsed.get("errmsg", "")) if isinstance(parsed, dict) else ""
         return errno in CDN_THROTTLE_ERRNOS or bool(re.search(r"need verify", errmsg, re.I))
 
+    async def _fresh_dlink(self, fs_id: int, remote_path: str) -> str:
+        """Fetch a dlink, preferring the unsigned ``/api/filemetas`` route.
+
+        The filemetas endpoint answers with an 8-hour link straight from the
+        path; the RC4-signed ``/api/download`` flow stays as the fallback for
+        accounts or regions where filemetas refuses to hand out dlinks.
+        """
+
+        try:
+            return await self.download_url_for_path(remote_path)
+        except TeraBoxError as exc:
+            logger.info(
+                "TeraBox filemetas dlink unavailable (%s); falling back to /api/download", exc
+            )
+            return await self.download_url(fs_id)
+
     async def _download_dlink_range(
-        self, fs_id: int, dest: Path, expected_size: int, end: int | None = None
+        self,
+        fs_id: int,
+        remote_path: str,
+        dest: Path,
+        expected_size: int,
+        end: int | None = None,
     ) -> None:
         """Fetch ``[received, size)`` of the dlinked file into ``dest``.
 
@@ -616,7 +669,7 @@ class TeraBoxClient:
         retry lands on a fresh CDN node.
         """
 
-        url = await self.download_url(fs_id)
+        url = await self._fresh_dlink(fs_id, remote_path)
         part = dest.with_suffix(dest.suffix + ".part")
 
         for attempt in range(1, CDN_RANGE_ATTEMPTS + 1):
@@ -647,12 +700,12 @@ class TeraBoxClient:
                 await asyncio.sleep(_MIN_RETRY_DELAY * attempt)
                 continue
             except TeraBoxThrottleError:
-                await self._arm_throttle(fs_id)
+                await self._arm_throttle(fs_id, remote_path)
                 if attempt == CDN_RANGE_ATTEMPTS:
                     raise TeraBoxTransientError(
                         f"TeraBox CDN throttled while downloading {part.name}"
                     ) from None
-                url = await self.download_url(fs_id)
+                url = await self._fresh_dlink(fs_id, remote_path)
                 continue
 
             # Short 2xx bodies are throttle JSON instead of file bytes.
@@ -662,12 +715,12 @@ class TeraBoxClient:
                 body = await response.aread()
                 await response.aclose()
                 if self._cdn_throttle_errno(body):
-                    await self._arm_throttle(fs_id)
+                    await self._arm_throttle(fs_id, remote_path)
                     if attempt == CDN_RANGE_ATTEMPTS:
                         raise TeraBoxTransientError(
                             f"TeraBox CDN throttled while downloading {part.name}"
                         )
-                    url = await self.download_url(fs_id)
+                    url = await self._fresh_dlink(fs_id, remote_path)
                     continue
                 raise TeraBoxError(
                     f"TeraBox CDN returned a short body ({len(body)} bytes) for {part.name}"
@@ -682,12 +735,12 @@ class TeraBoxClient:
                     await asyncio.to_thread(os.write, fd, chunk)
                 await asyncio.to_thread(os.fsync, fd)
             except TeraBoxThrottleError:
-                await self._arm_throttle(fs_id)
+                await self._arm_throttle(fs_id, remote_path)
                 if attempt == CDN_RANGE_ATTEMPTS:
                     raise TeraBoxTransientError(
                         f"TeraBox CDN throttled while downloading {part.name}"
                     ) from None
-                url = await self.download_url(fs_id)
+                url = await self._fresh_dlink(fs_id, remote_path)
                 continue
             except (httpx.HTTPError, TeraBoxTransientError) as exc:
                 if attempt == CDN_RANGE_ATTEMPTS:
@@ -711,12 +764,13 @@ class TeraBoxClient:
             raise TeraBoxTransientError(f"TeraBox direct download incomplete for {part.name}")
         await asyncio.to_thread(part.replace, dest)
 
-    async def _arm_throttle(self, fs_id: int) -> None:
-        """Enter the shared throttle window and drop the stale dlink cache."""
+    async def _arm_throttle(self, fs_id: int, remote_path: str) -> None:
+        """Enter the shared throttle window and drop the stale dlink caches."""
 
         self._throttled_until = time.monotonic() + DIRECT_DOWNLOAD_THROTTLE_SECONDS
         logger.info("TeraBox CDN throttled; waiting %.0fs before retrying", DIRECT_DOWNLOAD_THROTTLE_SECONDS)
         self._dlink_cache.pop(fs_id, None)
+        self._path_dlink_cache.pop(remote_path, None)
 
     async def fetch_remote_file(
         self,
@@ -775,7 +829,9 @@ class TeraBoxClient:
         last_error: TeraBoxError | None = None
         for attempt in range(1, DIRECT_DOWNLOAD_ATTEMPTS + 1):
             try:
-                await self._download_dlink_range(fs_id, dest, target, end=target or None)
+                await self._download_dlink_range(
+                    fs_id, remote_path, dest, target, end=target or None
+                )
             except TeraBoxTransientError as exc:
                 last_error = exc
                 logger.info(
