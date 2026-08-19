@@ -199,19 +199,37 @@ function setupVideoPlayer(video) {
   };
   const swapToDirect = (url) => {
     video.dataset.directSource = "1";
+    delete video.dataset.relaySource;
     video.src = url;
     video.load();
     startDirectStallTimer();
     if (teraboxEnabled) setStatus("Direct from TeraBox CDN", "terabox-playing");
   };
-  const useFallbackSource = () => {
+  const swapToRelay = (url) => {
     delete video.dataset.directSource;
+    delete video.dataset.directExhausted;
     clearDirectStallTimer();
-    video.dataset.directExhausted = "1";
-    const target = new URL(fallbackUrl, window.location.href).href;
+    video.dataset.relaySource = "1";
+    const target = new URL(url, window.location.href).href;
     if (video.currentSrc === target) return;
     const wasPlaying = !video.paused && !video.ended;
-    video.src = fallbackUrl;
+    video.src = target;
+    video.load();
+    if (wasPlaying) {
+      const attempt = video.play();
+      attempt?.catch?.(() => {});
+    }
+    if (teraboxEnabled) setStatus("Streaming from TeraBox · CDN relay", "terabox-playing");
+  };
+  const useFallbackSource = () => {
+    delete video.dataset.directSource;
+    delete video.dataset.relaySource;
+    clearDirectStallTimer();
+    video.dataset.directExhausted = "1";
+    const target = new URL(sourceState?.stream_url || fallbackUrl, window.location.href).href;
+    if (video.currentSrc === target) return;
+    const wasPlaying = !video.paused && !video.ended;
+    video.src = target;
     video.load();
     if (wasPlaying) {
       const attempt = video.play();
@@ -281,19 +299,25 @@ function setupVideoPlayer(video) {
     startProbe();
     if (!teraboxEnabled || !sourceUrl || video.dataset.directSource || video.dataset.directExhausted) return;
     resolveSource().then((state) => {
-      if (state?.source === "terabox" && state.direct && state.url && !video.dataset.directSource) {
-        directAttempts = 0;
+      if (state?.source !== "terabox" || video.dataset.directSource) return;
+      directAttempts = 0;
+      if (state.stream_url) {
+        swapToRelay(state.stream_url);
+      } else if (state.direct && state.url) {
         swapToDirect(state.url);
-        const attempt = video.play();
-        attempt?.catch?.(() => {});
       }
+      const attempt = video.play();
+      attempt?.catch?.(() => {});
     });
   };
   const prepareDirectSource = () => {
     if (!teraboxEnabled || !sourceUrl || video.dataset.directSource || video.dataset.directExhausted) return;
     resolveSource().then((state) => {
-      if (state?.source === "terabox" && state.direct && state.url && !video.dataset.directSource) {
-        directAttempts = 0;
+      if (state?.source !== "terabox" || video.dataset.directSource) return;
+      directAttempts = 0;
+      if (state.stream_url) {
+        swapToRelay(state.stream_url);
+      } else if (state.direct && state.url) {
         swapToDirect(state.url);
       }
     });
@@ -383,6 +407,10 @@ function setupVideoPlayer(video) {
       handleDirectSourceError();
       return;
     }
+    if (video.dataset.relaySource && !video.dataset.directExhausted) {
+      useFallbackSource();
+      return;
+    }
     pollVariant();
   };
 
@@ -428,6 +456,7 @@ function destroyVideoPlayer(video) {
   delete video.dataset.variantPolling;
   delete video.dataset.firstByteSeen;
   delete video.dataset.directSource;
+  delete video.dataset.relaySource;
   delete video.dataset.directExhausted;
 }
 

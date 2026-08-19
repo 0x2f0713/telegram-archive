@@ -353,6 +353,69 @@ class FakeTeraboxSourceClient:
         return None
 
 
+class FakeTeraboxStreamClient(FakeTeraboxSourceClient):
+    """Stand-in for TeraBoxClient behind the /media/{id}/stream relay."""
+
+    def __init__(
+        self,
+        links: dict[str, tuple[str, int, bool]],
+        *,
+        body: bytes = b"stream body",
+        sizes: dict[str, int] | None = None,
+        fail: bool = False,
+    ) -> None:
+        super().__init__(links, fail=fail)
+        self.body = body
+        self.sizes = sizes or {}
+        self.range_requests: list[str | None] = []
+
+    async def file_meta(self, remote_path: str) -> dict[str, object] | None:
+        if remote_path not in self.links:
+            return None
+        return {
+            "path": remote_path,
+            "fs_id": 1,
+            "isdir": 0,
+            "size": self.sizes.get(remote_path, len(self.body)),
+        }
+
+    async def stream_remote(
+        self, remote_path: str, *, range_spec: str | None = None
+    ) -> tuple[httpx.Response, int] | None:
+        self.range_requests.append(range_spec)
+        if remote_path not in self.links:
+            return None
+        if self.fail:
+            from app.infrastructure.terabox import TeraBoxError
+
+            raise TeraBoxError("CDN refused")
+        size = self.sizes.get(remote_path, len(self.body))
+        if range_spec is None:
+            start, end, status = 0, size - 1, 200
+        else:
+            start_text, _, end_text = range_spec.partition("=")[2].partition("-")
+            start = int(start_text)
+            end = int(end_text) if end_text else size - 1
+            status = 206
+        body = self.body[start : end + 1]
+        request = httpx.Request("GET", "https://kul-ddata.terabox.com/file?fid=1")
+        return (
+            httpx.Response(
+                status,
+                request=request,
+                headers={
+                    "Content-Length": str(len(body)),
+                    "Content-Range": f"bytes {start}-{end}/{size}",
+                },
+                content=body,
+            ),
+            size,
+        )
+
+    async def aclose(self) -> None:
+        return None
+
+
 async def _seed_mount_video(
     settings: Settings,
     *,
@@ -431,6 +494,7 @@ async def test_media_source_terabox_returns_direct_link(
     assert payload == {
         "source": "terabox",
         "url": "https://dm-d.terabox.com/file?fid=1",
+        "stream_url": f"/media/{message_id}/stream",
         "direct": False,
         "media": "original",
         "mime": "video/mp4",
@@ -516,6 +580,144 @@ async def test_media_source_missing_or_incomplete_returns_404(tmp_path: Path) ->
             missing = await client.get("/media/999999/source")
 
     assert incomplete.status_code == 404
+    assert missing.status_code == 404
+
+
+async def test_media_stream_relay_forwards_range_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _terabox_settings(tmp_path)
+    fake = FakeTeraboxStreamClient(
+        {"/Telegram Archive/clip.mp4": ("https://kul-ddata.terabox.com/file?fid=1", 12, False)},
+        sizes={"/Telegram Archive/clip.mp4": 12},
+    )
+    monkeypatch.setattr("app.interfaces.web.app.create_terabox_client", lambda _s: fake)
+    message_id = await _seed_mount_video(settings)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                f"/media/{message_id}/stream", headers={"Range": "bytes=2-5"}
+            )
+
+    assert response.status_code == 206
+    assert response.content == b"ream"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.headers["content-range"] == "bytes 2-5/12"
+    assert response.headers["content-length"] == "4"
+    assert response.headers["content-type"] == "video/mp4"
+    assert fake.range_requests == ["bytes=2-5"]
+
+
+async def test_media_stream_relay_serves_full_body_without_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _terabox_settings(tmp_path)
+    fake = FakeTeraboxStreamClient(
+        {"/Telegram Archive/clip.mp4": ("https://kul-ddata.terabox.com/file?fid=1", 12, False)},
+        sizes={"/Telegram Archive/clip.mp4": 12},
+    )
+    monkeypatch.setattr("app.interfaces.web.app.create_terabox_client", lambda _s: fake)
+    message_id = await _seed_mount_video(settings)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(f"/media/{message_id}/stream")
+
+    assert response.status_code == 200
+    assert response.content == b"stream body"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert fake.range_requests == [None]
+
+
+async def test_media_stream_relay_head_returns_headers_without_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _terabox_settings(tmp_path)
+    fake = FakeTeraboxStreamClient(
+        {"/Telegram Archive/clip.mp4": ("https://kul-ddata.terabox.com/file?fid=1", 12, False)},
+        sizes={"/Telegram Archive/clip.mp4": 12},
+    )
+    monkeypatch.setattr("app.interfaces.web.app.create_terabox_client", lambda _s: fake)
+    message_id = await _seed_mount_video(settings)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            plain = await client.head(f"/media/{message_id}/stream")
+            ranged = await client.head(f"/media/{message_id}/stream", headers={"Range": "bytes=0-1"})
+
+    assert plain.status_code == 200
+    assert plain.content == b""
+    assert plain.headers["content-length"] == "12"
+    assert ranged.status_code == 206
+    assert ranged.content == b""
+    assert ranged.headers["content-range"] == "bytes 0-1/12"
+    assert fake.range_requests == []
+
+
+async def test_media_stream_relay_unsatisfiable_range_returns_416(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _terabox_settings(tmp_path)
+    fake = FakeTeraboxStreamClient(
+        {"/Telegram Archive/clip.mp4": ("https://kul-ddata.terabox.com/file?fid=1", 12, False)},
+        sizes={"/Telegram Archive/clip.mp4": 12},
+    )
+    monkeypatch.setattr("app.interfaces.web.app.create_terabox_client", lambda _s: fake)
+    message_id = await _seed_mount_video(settings)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                f"/media/{message_id}/stream", headers={"Range": "bytes=999999-"}
+            )
+
+    assert response.status_code == 416
+    assert response.headers["content-range"] == "bytes */12"
+    assert fake.range_requests == []
+
+
+async def test_media_stream_relay_502_when_all_candidates_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _terabox_settings(tmp_path)
+    fake = FakeTeraboxStreamClient(
+        {"/Telegram Archive/clip.mp4": ("https://kul-ddata.terabox.com/file?fid=1", 12, False)},
+        sizes={"/Telegram Archive/clip.mp4": 12},
+        fail=True,
+    )
+    monkeypatch.setattr("app.interfaces.web.app.create_terabox_client", lambda _s: fake)
+    message_id = await _seed_mount_video(settings)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(f"/media/{message_id}/stream")
+
+    assert response.status_code == 502
+
+
+async def test_media_stream_relay_unavailable_returns_404(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    message_id = await _seed_video(settings)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            local = await client.get(f"/media/{message_id}/stream")
+            missing = await client.get("/media/999999/stream")
+
+    assert local.status_code == 404
     assert missing.status_code == 404
 
 

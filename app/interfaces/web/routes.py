@@ -13,7 +13,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import asdict, replace
 from datetime import UTC, date, datetime
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Literal
+from typing import Any, BinaryIO, Literal
 from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -66,7 +66,7 @@ from app.infrastructure.persistence.read_models import DashboardRepository
 from app.infrastructure.persistence.selection import ChatSelectionRepository
 from app.infrastructure.persistence.settings import RuntimeSettingsRepository
 from app.infrastructure.telegram.client import TelegramAccessError
-from app.infrastructure.terabox import TeraBoxClient, TeraBoxError
+from app.infrastructure.terabox import TeraBoxClient, TeraBoxError, TeraBoxTransientError
 from app.interfaces.web.auth_routes import create_auth_router
 from app.interfaces.web.forms import form_values as _form_values
 from app.interfaces.web.forms import require_csrf as _require_csrf
@@ -278,6 +278,67 @@ def _source_media_type(mime_type: str | None) -> str:
     if (mime_type or "").casefold() == "video/quicktime":
         return "video/mp4"
     return mime_type or "application/octet-stream"
+
+
+def _terabox_source_candidates(
+    settings: Settings, message: MessageView, resolved: Path
+) -> list[tuple[str, str, str]]:
+    """Remote-path candidates for TeraBox playback of one archived file.
+
+    Ordered fastest-first: the H.264 variant (recorded path, then the
+    predictable sibling) and finally the original. Each entry is
+    ``(remote_path, media_label, mime_type)``. Returns an empty list when the
+    resolved file is not under the TeraBox mount (still buffered locally).
+    """
+    mount_root = settings.terabox_mount_dir.expanduser().resolve()
+    remote = _mount_remote_path(mount_root, resolved)
+    if remote is None:
+        return []
+    candidates: list[tuple[str, str, str]] = []
+    if (message.mime_type or "").casefold().startswith("video/"):
+        if message.media_variant_path:
+            variant_remote = _mount_remote_path(mount_root, message.media_variant_path)
+            if variant_remote is not None:
+                candidates.append((variant_remote, "h264", "video/mp4"))
+        sibling = _mount_remote_path(mount_root, resolved.with_name(f"{resolved.stem}.h264.mp4"))
+        if sibling is not None and not any(c[0] == sibling for c in candidates):
+            candidates.append((sibling, "h264", "video/mp4"))
+    candidates.append((remote, "original", _source_media_type(message.mime_type)))
+    return candidates
+
+
+def _parse_single_byte_range(
+    range_header: str | None, size: int
+) -> tuple[int, int] | Literal[False] | None:
+    """Parse one ``bytes=`` range into inclusive ``(start, end)`` bounds.
+
+    Returns ``None`` when the header is absent, malformed, or multi-range
+    (HTTP allows serving the full body then), and ``False`` when the range
+    cannot be satisfied (the caller answers 416).
+    """
+    if not range_header or not range_header.casefold().startswith("bytes="):
+        return None
+    spec = range_header.partition("=")[2].strip()
+    if not spec or "," in spec or "-" not in spec:
+        return None
+    start_text, _, end_text = spec.partition("-")
+    try:
+        if start_text:
+            start = int(start_text)
+            if start < 0 or start >= size:
+                return False
+            end = int(end_text) if end_text else size - 1
+            return start, min(end, size - 1)
+        if end_text:
+            suffix = int(end_text)
+            if suffix <= 0:
+                return None
+            if suffix >= size:
+                return 0, size - 1
+            return size - suffix, size - 1
+    except ValueError:
+        return None
+    return None
 
 
 async def _direct_thumb_path(
@@ -1238,12 +1299,12 @@ def create_router(settings: Settings) -> APIRouter:
         """Resolve the fastest playback source for a completed media file.
 
         In TeraBox mode the archive lives on the TeraBox drive, so the player
-        can bypass the FUSE mount entirely and stream the file straight from
-        the CDN using a fresh dlink. The H.264 variant is preferred when one
-        exists because browsers decode it natively. ``direct`` marks whether
-        the URL is the signed final CDN hop (usable by the browser) or an
-        unsigned fallback dlink; the player only attempts the direct hop when
-        the CDN issued one, and otherwise uses the local proxy route.
+        streams through the server-side CDN relay (``stream_url``) because the
+        signed CDN URL only validates with the desktop TeraBox User-Agent and
+        browsers always fail it with 403. The H.264 variant is preferred when
+        one exists because browsers decode it natively. ``direct`` marks
+        whether a cookie-free CDN hop exists for legacy clients; the player
+        only attempts it when no relay is offered.
         """
         repository: DashboardRepository = request.app.state.dashboard
         message = await repository.message(message_id)
@@ -1258,23 +1319,10 @@ def create_router(settings: Settings) -> APIRouter:
 
         roots = await asyncio.to_thread(settings.media_storage_roots)
         _, resolved = await asyncio.to_thread(_resolved_media_paths, roots, message.media_path)
-        mount_root = settings.terabox_mount_dir.expanduser().resolve()
-        remote = _mount_remote_path(mount_root, resolved)
-        if remote is None:
+        candidates = _terabox_source_candidates(settings, message, resolved)
+        if not candidates:
             # Still buffered locally (or outside the mount) — proxy it.
             return {"source": "proxy", "url": proxy_url}
-
-        is_video = (message.mime_type or "").casefold().startswith("video/")
-        candidates: list[tuple[str, str, str]] = []  # (remote, media, mime)
-        if is_video:
-            if message.media_variant_path:
-                variant_remote = _mount_remote_path(mount_root, message.media_variant_path)
-                if variant_remote is not None:
-                    candidates.append((variant_remote, "h264", "video/mp4"))
-            sibling = _mount_remote_path(mount_root, resolved.with_name(f"{resolved.stem}.h264.mp4"))
-            if sibling is not None and not any(c[0] == sibling for c in candidates):
-                candidates.append((sibling, "h264", "video/mp4"))
-        candidates.append((remote, "original", _source_media_type(message.mime_type)))
 
         for candidate_remote, media, mime in candidates:
             try:
@@ -1296,12 +1344,116 @@ def create_router(settings: Settings) -> APIRouter:
             return {
                 "source": "terabox",
                 "url": url,
+                "stream_url": f"/media/{message_id}/stream",
                 "direct": direct,
                 "media": media,
                 "mime": mime,
                 "size": size,
             }
         return {"source": "proxy", "url": proxy_url}
+
+    @router.api_route("/media/{message_id}/stream", methods=["GET", "HEAD"])
+    async def media_stream_proxy(request: Request, message_id: int) -> Response:
+        """Relay archived media from the TeraBox CDN to the browser.
+
+        The signed CDN URL only validates with the desktop TeraBox
+        User-Agent: the themis WAF answers browsers with 403 "sign error".
+        This route re-fetches from the CDN server-side (desktop agent +
+        session cookie) and relays the bytes, honoring single-byte Range
+        requests so <video> seeking stays smooth.
+        """
+        repository: DashboardRepository = request.app.state.dashboard
+        message = await repository.message(message_id)
+        if message is None or message.download_status != "completed" or not message.media_path:
+            raise HTTPException(status_code=404, detail="Completed media not found")
+
+        settings: Settings = request.app.state.settings
+        client: TeraBoxClient | None = getattr(request.app.state, "terabox_client", None)
+        if client is None or not settings.terabox_enabled:
+            raise HTTPException(status_code=404, detail="TeraBox streaming is not available")
+
+        roots = await asyncio.to_thread(settings.media_storage_roots)
+        _, resolved = await asyncio.to_thread(_resolved_media_paths, roots, message.media_path)
+        candidates = _terabox_source_candidates(settings, message, resolved)
+        if not candidates:
+            raise HTTPException(status_code=404, detail="Media is not on the TeraBox drive")
+
+        is_head = request.method == "HEAD"
+        range_header = request.headers.get("range")
+        filename = message.filename or resolved.name
+        relay_response: tuple[Any, int] | None = None
+        rng: tuple[int, int] | None = None
+        mime_type = ""
+        file_size = 0
+
+        for candidate_remote, _media, mime in candidates:
+            try:
+                entry = await client.file_meta(candidate_remote)
+            except TeraBoxError:
+                continue
+            if entry is None:
+                continue
+            file_size = int(entry.get("size", 0))
+            mime_type = mime
+            parsed = _parse_single_byte_range(range_header, file_size)
+            if parsed is False:
+                return Response(
+                    status_code=416,
+                    headers={"Content-Range": f"bytes */{file_size}"},
+                )
+            rng = parsed
+            if is_head:
+                break
+            range_spec = f"bytes={rng[0]}-{rng[1]}" if rng else None
+            try:
+                relay_response = await client.stream_remote(candidate_remote, range_spec=range_spec)
+            except TeraBoxTransientError as exc:
+                logger.warning("TeraBox relay throttled for %s: %s", candidate_remote, exc)
+                continue
+            except TeraBoxError as exc:
+                logger.info("TeraBox relay unavailable for %s: %s", candidate_remote, exc)
+                continue
+            if relay_response is None:
+                continue
+            break
+        else:
+            raise HTTPException(status_code=502, detail="TeraBox streaming failed")
+
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-cache",
+            "Content-Disposition": _content_disposition_header(filename, mime_type),
+        }
+        if is_head:
+            if rng:
+                start, end = rng
+                headers["Content-Length"] = str(end - start + 1)
+                headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+                return Response(status_code=206, headers=headers, media_type=mime_type)
+            headers["Content-Length"] = str(file_size)
+            return Response(status_code=200, headers=headers, media_type=mime_type)
+
+        response, _size = relay_response
+        upstream_length = response.headers.get("content-length")
+        upstream_range = response.headers.get("content-range")
+        if upstream_length:
+            headers["Content-Length"] = upstream_length
+        if upstream_range:
+            headers["Content-Range"] = upstream_range
+
+        async def relay_body() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in response.aiter_bytes(256 * 1024):
+                    yield chunk
+            finally:
+                await response.aclose()
+
+        return StreamingResponse(
+            relay_body(),
+            status_code=response.status_code,
+            media_type=mime_type,
+            headers=headers,
+        )
 
     @router.get("/media/{message_id}/variant-status")
     async def media_variant_status(request: Request, message_id: int) -> dict[str, object]:

@@ -917,6 +917,58 @@ class TeraBoxClient:
             return dest
         raise last_error or TeraBoxError(f"TeraBox direct download failed for {remote_path}")
 
+    async def stream_remote(
+        self, remote_path: str, *, range_spec: str | None = None
+    ) -> tuple[httpx.Response, int] | None:
+        """Open a streaming CDN read for ``remote_path`` with the desktop UA.
+
+        Returns ``(open response, file_size)`` or None when the path is
+        missing. The CDN sign is bound to the desktop User-Agent, so this is
+        the server-side path for playback relay: the caller streams bytes from
+        the returned response (using the client cookie session) back to its
+        own client. Inside a CDN "need verify" throttle window the request
+        waits it out and retries with a fresh dlink, mirroring
+        :meth:`_download_dlink_range`. The caller must close the response.
+        """
+
+        entry = await self.file_meta(remote_path)
+        if entry is None:
+            return None
+        fs_id = int(entry.get("fs_id", 0))
+        size = int(entry.get("size", 0))
+        if fs_id <= 0:
+            raise TeraBoxError(f"TeraBox file has no fs_id: {remote_path}")
+        url = await self._fresh_dlink(fs_id, remote_path)
+        headers = {"User-Agent": USER_AGENT, "Cookie": self._cookies}
+        if range_spec:
+            headers["Range"] = range_spec
+
+        last_error: TeraBoxError | None = None
+        for attempt in range(1, CDN_RANGE_ATTEMPTS + 1):
+            delay = await self._wait_throttle()
+            if delay:
+                logger.info(
+                    "TeraBox stream for %s waited %.0fs of throttle window",
+                    remote_path,
+                    delay,
+                )
+            try:
+                response = await self._cdn_stream(url, headers)
+                return response, size
+            except TeraBoxTransientError as exc:
+                last_error = exc
+                if attempt == CDN_RANGE_ATTEMPTS:
+                    break
+                await asyncio.sleep(_MIN_RETRY_DELAY * attempt)
+            except TeraBoxThrottleError:
+                await self._arm_throttle(fs_id, remote_path)
+                if attempt == CDN_RANGE_ATTEMPTS:
+                    break
+                url = await self._fresh_dlink(fs_id, remote_path)
+        raise last_error or TeraBoxTransientError(
+            f"TeraBox CDN throttled while opening {remote_path}"
+        )
+
     async def file_meta(self, remote_path: str) -> dict[str, Any] | None:
         """Return the list entry for one remote path, or None when absent.
 
