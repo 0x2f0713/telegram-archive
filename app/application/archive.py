@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,15 @@ class RetryProgress:
     detail: str
     chat_id: int | None = None
     chat_title: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RetryOutcome:
+    candidate: RetryCandidate
+    chat: ChatInfo
+    result: ProcessResult | None
+    stopped: bool = False
+    detail: str = ""
 
 
 RetryProgressCallback = Callable[[RetryProgress], Awaitable[None]]
@@ -225,14 +235,23 @@ class ArchiveService:
         stop_event: asyncio.Event | None = None,
         progress: RetryProgressCallback | None = None,
     ) -> tuple[int, int]:
-        """Retry failed/incomplete media and completed records missing files."""
+        """Retry failed/incomplete media with bounded parallel processing.
 
+        Candidates run through a sliding window of at most
+        ``download_concurrency`` workers so media transfers overlap. Results
+        settle oldest-first, which keeps the durable failure marks and
+        progress updates ordered.
+        """
         candidates = await self.repository.iter_retry_candidates(
             tuple(chats), failed_only=failed_only
         )
         attempted = 0
         completed = 0
+        skipped = 0
+        settled = 0
         total = len(candidates)
+        worker_count = max(1, self.settings.download_concurrency)
+        pending: deque[tuple[asyncio.Task[_RetryOutcome]]] = deque()
         if progress:
             await progress(
                 RetryProgress(
@@ -244,175 +263,199 @@ class ArchiveService:
                     detail=f"Found {total} media candidate{'s' if total != 1 else ''}",
                 )
             )
-        for current, candidate in enumerate(candidates, start=1):
-            if stop_event and stop_event.is_set():
-                break
-            chat = chats.get(candidate.telegram_chat_id)
-            chat_title = chat.title if chat is not None else None
+
+        async def settle_oldest(
+            queue: deque[tuple[asyncio.Task[_RetryOutcome]]],
+        ) -> None:
+            nonlocal completed, settled
+            task = queue.popleft()
+            outcome = await task
+            settled += 1
+            if outcome.result is not None:
+                completed += int(outcome.result.downloaded)
             if progress:
+                if outcome.stopped:
+                    detail = (
+                        f"Stopped before processing message {outcome.candidate.telegram_message_id}"
+                    )
+                elif outcome.detail:
+                    detail = outcome.detail
+                else:
+                    detail = f"Processed retry candidate {settled} of {total}"
                 await progress(
                     RetryProgress(
                         phase="repairing",
-                        current=current - 1,
+                        current=skipped + settled,
                         total=total,
                         attempted=attempted,
                         completed=completed,
-                        detail=(
-                            f"Checking media in {chat_title}"
-                            if chat_title
-                            else f"Checking chat {candidate.telegram_chat_id}"
-                        ),
-                        chat_id=candidate.telegram_chat_id,
-                        chat_title=chat_title,
+                        detail=detail,
+                        chat_id=outcome.candidate.telegram_chat_id,
+                        chat_title=outcome.chat.title,
                     )
                 )
-            if candidate.download_status == DownloadState.COMPLETED.value and candidate.media_path:
-                if await asyncio.to_thread(Path(candidate.media_path).is_file):
+
+        try:
+            for candidate in candidates:
+                if stop_event and stop_event.is_set():
+                    break
+                chat = chats.get(candidate.telegram_chat_id)
+                chat_title = chat.title if chat is not None else None
+                if (
+                    candidate.download_status == DownloadState.COMPLETED.value
+                    and candidate.media_path
+                ):
+                    if await asyncio.to_thread(Path(candidate.media_path).is_file):
+                        skipped += 1
+                        if progress:
+                            await progress(
+                                RetryProgress(
+                                    phase="repairing",
+                                    current=skipped + settled,
+                                    total=total,
+                                    attempted=attempted,
+                                    completed=completed,
+                                    detail="Verified an existing completed file",
+                                    chat_id=candidate.telegram_chat_id,
+                                    chat_title=chat_title,
+                                )
+                            )
+                        continue
+                if chat is None:
+                    skipped += 1
                     if progress:
                         await progress(
                             RetryProgress(
                                 phase="repairing",
-                                current=current,
+                                current=skipped + settled,
                                 total=total,
                                 attempted=attempted,
                                 completed=completed,
-                                detail="Verified an existing completed file",
+                                detail="Skipped a candidate outside the active chat selection",
+                                chat_id=candidate.telegram_chat_id,
+                            )
+                        )
+                    continue
+                if not self.media_filter.media_type_selected(candidate.media_type):
+                    skipped += 1
+                    if progress:
+                        await progress(
+                            RetryProgress(
+                                phase="repairing",
+                                current=skipped + settled,
+                                total=total,
+                                attempted=attempted,
+                                completed=completed,
+                                detail="Skipped a media type outside this operation selection",
                                 chat_id=candidate.telegram_chat_id,
                                 chat_title=chat_title,
                             )
                         )
                     continue
-            if chat is None:
+                attempted += 1
                 if progress:
                     await progress(
                         RetryProgress(
                             phase="repairing",
-                            current=current,
+                            current=skipped + settled,
                             total=total,
                             attempted=attempted,
                             completed=completed,
-                            detail="Skipped a candidate outside the active chat selection",
-                            chat_id=candidate.telegram_chat_id,
-                        )
-                    )
-                continue
-            if not self.media_filter.media_type_selected(candidate.media_type):
-                if progress:
-                    await progress(
-                        RetryProgress(
-                            phase="repairing",
-                            current=current,
-                            total=total,
-                            attempted=attempted,
-                            completed=completed,
-                            detail="Skipped a media type outside this operation selection",
+                            detail=f"Checking media in {chat_title}",
                             chat_id=candidate.telegram_chat_id,
                             chat_title=chat_title,
                         )
                     )
-                continue
-            attempted += 1
-            raw_message = None
-            retrieval_error: str | None = None
-            for retrieval_attempt in range(1, self.settings.download_retries + 1):
-                try:
-                    raw_message = await client.get_messages(  # type: ignore[attr-defined]
-                        chat.entity, ids=candidate.telegram_message_id
+                pending.append(
+                    asyncio.create_task(
+                        self._retry_one(client, candidate, chat, stop_event),
+                        name=(
+                            f"retry-{candidate.telegram_chat_id}-{candidate.telegram_message_id}"
+                        ),
                     )
-                    retrieval_error = None
-                    break
-                except Exception as exc:
-                    wait_seconds = self.rate_limit_delay(exc)
-                    if wait_seconds is not None:
-                        retrieval_error = f"Telegram FloodWait ({wait_seconds}s)"
-                        logger.warning("Telegram FloodWait: waiting %s seconds", wait_seconds)
-                        if retrieval_attempt < self.settings.download_retries:
-                            if progress:
-                                await progress(
-                                    RetryProgress(
-                                        phase="rate-limited",
-                                        current=current,
-                                        total=total,
-                                        attempted=attempted,
-                                        completed=completed,
-                                        detail=(f"Telegram requested a {wait_seconds}s FloodWait"),
-                                        chat_id=candidate.telegram_chat_id,
-                                        chat_title=chat_title,
-                                    )
-                                )
-                            if await wait_or_stop(stop_event, wait_seconds):
-                                break
-                    elif self.is_transient_error(exc):
-                        retrieval_error = f"{type(exc).__name__}: {exc}"
-                        if retrieval_attempt < self.settings.download_retries:
-                            delay = min(30, 2 ** (retrieval_attempt - 1))
-                            logger.warning(
-                                "[%s] Message retrieval failed; retrying in %ss: %s",
-                                chat.title,
-                                delay,
-                                exc,
-                            )
-                            if await wait_or_stop(stop_event, delay):
-                                break
-                    else:
-                        raise
+                )
+                if len(pending) >= worker_count:
+                    await settle_oldest(pending)
 
-            if stop_event and stop_event.is_set():
-                break
+            # A safe stop stops accepting candidates but lets the bounded
+            # in-flight set finish so completed files can be accounted.
+            while pending:
+                await settle_oldest(pending)
+        finally:
+            if pending:
+                tasks = list(pending)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                pending.clear()
 
-            if retrieval_error is not None:
-                await self.repository.mark_download_failed(candidate.id, retrieval_error)
-                logger.error(
-                    "[%s] Could not retrieve message %s for retry: %s",
-                    chat.title,
-                    candidate.telegram_message_id,
-                    retrieval_error,
-                )
-                if progress:
-                    await progress(
-                        RetryProgress(
-                            phase="repairing",
-                            current=current,
-                            total=total,
-                            attempted=attempted,
-                            completed=completed,
-                            detail=f"Retry failed for message {candidate.telegram_message_id}",
-                            chat_id=candidate.telegram_chat_id,
-                            chat_title=chat_title,
-                        )
-                    )
-                continue
-            if raw_message is None:
-                await self.repository.mark_download_failed(
-                    candidate.id, "Telegram message is no longer available"
-                )
-                if progress:
-                    await progress(
-                        RetryProgress(
-                            phase="repairing",
-                            current=current,
-                            total=total,
-                            attempted=attempted,
-                            completed=completed,
-                            detail="Telegram message is no longer available",
-                            chat_id=candidate.telegram_chat_id,
-                            chat_title=chat_title,
-                        )
-                    )
-                continue
-            result = await self.process_message(raw_message, chat)
-            completed += int(result.downloaded)
-            if progress:
-                await progress(
-                    RetryProgress(
-                        phase="repairing",
-                        current=current,
-                        total=total,
-                        attempted=attempted,
-                        completed=completed,
-                        detail=f"Processed retry candidate {current} of {total}",
-                        chat_id=candidate.telegram_chat_id,
-                        chat_title=chat_title,
-                    )
-                )
         return attempted, completed
+
+    async def _retry_one(
+        self,
+        client: object,
+        candidate: RetryCandidate,
+        chat: ChatInfo,
+        stop_event: asyncio.Event | None,
+    ) -> _RetryOutcome:
+        """Fetch one retry candidate and archive it, honoring stop requests."""
+        raw_message: object | None = None
+        retrieval_error: str | None = None
+        for retrieval_attempt in range(1, self.settings.download_retries + 1):
+            try:
+                raw_message = await client.get_messages(  # type: ignore[attr-defined]
+                    chat.entity, ids=candidate.telegram_message_id
+                )
+                retrieval_error = None
+                break
+            except Exception as exc:
+                wait_seconds = self.rate_limit_delay(exc)
+                if wait_seconds is not None:
+                    retrieval_error = f"Telegram FloodWait ({wait_seconds}s)"
+                    logger.warning("Telegram FloodWait: waiting %s seconds", wait_seconds)
+                    if retrieval_attempt < self.settings.download_retries:
+                        if await wait_or_stop(stop_event, wait_seconds):
+                            return _RetryOutcome(candidate, chat, None, stopped=True)
+                elif self.is_transient_error(exc):
+                    retrieval_error = f"{type(exc).__name__}: {exc}"
+                    if retrieval_attempt < self.settings.download_retries:
+                        delay = min(30, 2 ** (retrieval_attempt - 1))
+                        logger.warning(
+                            "[%s] Message retrieval failed; retrying in %ss: %s",
+                            chat.title,
+                            delay,
+                            exc,
+                        )
+                        if await wait_or_stop(stop_event, delay):
+                            return _RetryOutcome(candidate, chat, None, stopped=True)
+                else:
+                    raise
+
+        if stop_event and stop_event.is_set():
+            return _RetryOutcome(candidate, chat, None, stopped=True)
+        if retrieval_error is not None:
+            await self.repository.mark_download_failed(candidate.id, retrieval_error)
+            logger.error(
+                "[%s] Could not retrieve message %s for retry: %s",
+                chat.title,
+                candidate.telegram_message_id,
+                retrieval_error,
+            )
+            return _RetryOutcome(
+                candidate,
+                chat,
+                None,
+                detail=f"Retry failed for message {candidate.telegram_message_id}",
+            )
+        if raw_message is None:
+            await self.repository.mark_download_failed(
+                candidate.id, "Telegram message is no longer available"
+            )
+            return _RetryOutcome(
+                candidate,
+                chat,
+                None,
+                detail="Telegram message is no longer available",
+            )
+        result = await self.process_message(raw_message, chat)
+        return _RetryOutcome(candidate, chat, result)
