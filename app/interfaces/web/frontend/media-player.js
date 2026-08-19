@@ -54,6 +54,7 @@ function setupVideoPlayer(video) {
   const PROBE_BYTES = 4 * 1024 * 1024;
   const PROBE_START_SECONDS = 5;
   const BUFFER_AHEAD_SECONDS = 20;
+  const DIRECT_STALL_TIMEOUT_MS = 10000;
   const SLOW_SPEED_BYTES = 500 * 1024;
   const teraboxEnabled = host.dataset.teraboxEnabled === "true";
   const sourceUrl = host.dataset.sourceUrl || "";
@@ -138,10 +139,9 @@ function setupVideoPlayer(video) {
     if (probe || !size) return;
     if (isCrossOrigin(video.currentSrc)) return;
     if (bufferedAhead() >= PROBE_START_SECONDS) return;
-    const offset = Math.min(
-      size - 1,
-      Math.floor((video.currentTime / Math.max(video.duration, 1)) * size),
-    );
+    const position = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 1;
+    const offset = Math.min(size - 1, Math.floor((position / duration) * size));
     const end = Math.min(size - 1, offset + PROBE_BYTES - 1);
     let loadedBytes = 0;
     let startedAt = 0;
@@ -201,10 +201,12 @@ function setupVideoPlayer(video) {
     video.dataset.directSource = "1";
     video.src = url;
     video.load();
+    startDirectStallTimer();
     if (teraboxEnabled) setStatus("Direct from TeraBox CDN", "terabox-playing");
   };
   const useFallbackSource = () => {
     delete video.dataset.directSource;
+    clearDirectStallTimer();
     video.dataset.directExhausted = "1";
     const target = new URL(fallbackUrl, window.location.href).href;
     if (video.currentSrc === target) return;
@@ -229,7 +231,7 @@ function setupVideoPlayer(video) {
       badge.dataset.state = "terabox-connecting";
     }
     const state = await resolveSource();
-    if (state?.source === "terabox" && state.url && state.url !== video.currentSrc) {
+    if (state?.source === "terabox" && state.direct && state.url && state.url !== video.currentSrc) {
       swapToDirect(state.url);
       const attempt = video.play();
       attempt?.catch?.(() => {});
@@ -247,6 +249,21 @@ function setupVideoPlayer(video) {
       setStatus("Buffering from TeraBox…", "terabox-buffering");
     }
   };
+  const startDirectStallTimer = () => {
+    if (video.dataset.directStallTimer) return;
+    video.dataset.directStallTimer = window.setTimeout(() => {
+      delete video.dataset.directStallTimer;
+      if (video.dataset.directSource && video.readyState < 2) {
+        useFallbackSource();
+      }
+    }, DIRECT_STALL_TIMEOUT_MS);
+  };
+  const clearDirectStallTimer = () => {
+    if (video.dataset.directStallTimer) {
+      window.clearTimeout(Number(video.dataset.directStallTimer));
+      delete video.dataset.directStallTimer;
+    }
+  };
   const handleSeeking = () => {
     if (!teraboxEnabled) return;
     seekingActive = true;
@@ -258,12 +275,13 @@ function setupVideoPlayer(video) {
   const handleProgressing = () => {
     if (!teraboxEnabled || seekingActive) return;
     video.dataset.firstByteSeen = "true";
+    clearDirectStallTimer();
   };
   const handlePlay = () => {
     startProbe();
     if (!teraboxEnabled || !sourceUrl || video.dataset.directSource || video.dataset.directExhausted) return;
     resolveSource().then((state) => {
-      if (state?.source === "terabox" && state.url && !video.dataset.directSource) {
+      if (state?.source === "terabox" && state.direct && state.url && !video.dataset.directSource) {
         directAttempts = 0;
         swapToDirect(state.url);
         const attempt = video.play();
@@ -274,7 +292,7 @@ function setupVideoPlayer(video) {
   const prepareDirectSource = () => {
     if (!teraboxEnabled || !sourceUrl || video.dataset.directSource || video.dataset.directExhausted) return;
     resolveSource().then((state) => {
-      if (state?.source === "terabox" && state.url && !video.dataset.directSource) {
+      if (state?.source === "terabox" && state.direct && state.url && !video.dataset.directSource) {
         directAttempts = 0;
         swapToDirect(state.url);
       }
@@ -290,6 +308,7 @@ function setupVideoPlayer(video) {
   };
   const handleCanPlayThrough = () => {
     stopProbe();
+    clearDirectStallTimer();
     clearStatus();
   };
   const handlePlaying = () => {

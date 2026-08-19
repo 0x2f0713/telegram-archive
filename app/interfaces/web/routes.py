@@ -1239,10 +1239,11 @@ def create_router(settings: Settings) -> APIRouter:
 
         In TeraBox mode the archive lives on the TeraBox drive, so the player
         can bypass the FUSE mount entirely and stream the file straight from
-        the CDN using a fresh dlink (the browser attaches its own TeraBox
-        session cookie). The H.264 variant is preferred when one exists
-        because browsers decode it natively. When a direct link cannot be
-        issued the response points back at the local proxy route.
+        the CDN using a fresh dlink. The H.264 variant is preferred when one
+        exists because browsers decode it natively. ``direct`` marks whether
+        the URL is the signed final CDN hop (usable by the browser) or an
+        unsigned fallback dlink; the player only attempts the direct hop when
+        the CDN issued one, and otherwise uses the local proxy route.
         """
         repository: DashboardRepository = request.app.state.dashboard
         message = await repository.message(message_id)
@@ -1283,17 +1284,19 @@ def create_router(settings: Settings) -> APIRouter:
                 continue
             if link is None:
                 continue
-            url, size = link
+            url, size, direct = link
             logger.info(
-                "TeraBox direct source for message %s: %s (%s, %s bytes)",
+                "TeraBox direct source for message %s: %s (%s, %s bytes, direct=%s)",
                 message_id,
                 media,
                 candidate_remote,
                 size,
+                direct,
             )
             return {
                 "source": "terabox",
                 "url": url,
+                "direct": direct,
                 "media": media,
                 "mime": mime,
                 "size": size,

@@ -46,11 +46,11 @@ function setupMediaGallery() {
       playerHost.dataset.teraboxEnabled = item.dataset.teraboxEnabled || "";
       playerHost.dataset.sourceUrl = item.dataset.sourceUrl || "";
       playerHost.dataset.fallbackUrl = item.dataset.fallbackUrl || "";
-      media.src = item.dataset.mediaSrc;
+      media.src = item.dataset.hasVariant ? item.dataset.variantUrl : item.dataset.mediaSrc;
       media.className = "media-viewer-video";
       media.controls = true;
       media.playsInline = true;
-      media.preload = "metadata";
+      media.preload = item.dataset.teraboxEnabled ? "none" : "metadata";
       if (item.dataset.variantStatusUrl) {
         media.poster = `${item.dataset.mediaSrc}/poster`;
       }

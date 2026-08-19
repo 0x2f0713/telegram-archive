@@ -336,12 +336,12 @@ async def test_terabox_variant_status_reports_disabled_without_sibling(
 class FakeTeraboxSourceClient:
     """Stand-in for TeraBoxClient behind the /media/{id}/source route."""
 
-    def __init__(self, links: dict[str, tuple[str, int]], *, fail: bool = False) -> None:
+    def __init__(self, links: dict[str, tuple[str, int, bool]], *, fail: bool = False) -> None:
         self.links = links
         self.fail = fail
         self.calls: list[str] = []
 
-    async def direct_download_link(self, remote_path: str) -> tuple[str, int] | None:
+    async def direct_download_link(self, remote_path: str) -> tuple[str, int, bool] | None:
         self.calls.append(remote_path)
         if self.fail:
             from app.infrastructure.terabox import TeraBoxError
@@ -417,7 +417,7 @@ async def test_media_source_terabox_returns_direct_link(
 ) -> None:
     settings = _terabox_settings(tmp_path)
     fake = FakeTeraboxSourceClient(
-        {"/Telegram Archive/clip.mp4": ("https://dm-d.terabox.com/file?fid=1", 1234)}
+        {"/Telegram Archive/clip.mp4": ("https://dm-d.terabox.com/file?fid=1", 1234, False)}
     )
     monkeypatch.setattr("app.interfaces.web.app.create_terabox_client", lambda _s: fake)
     message_id = await _seed_mount_video(settings)
@@ -431,6 +431,7 @@ async def test_media_source_terabox_returns_direct_link(
     assert payload == {
         "source": "terabox",
         "url": "https://dm-d.terabox.com/file?fid=1",
+        "direct": False,
         "media": "original",
         "mime": "video/mp4",
         "size": 1234,
@@ -446,8 +447,9 @@ async def test_media_source_terabox_prefers_h264_variant(
     fake = FakeTeraboxSourceClient(
         {
             "/Telegram Archive/clip.h264.mp4": (
-                "https://dm-d.terabox.com/file?fid=2&expires=8h",
+                "https://kul-ddata.terabox.com/file?fid=2&expires=8h",
                 5678,
+                True,
             )
         }
     )
@@ -462,7 +464,8 @@ async def test_media_source_terabox_prefers_h264_variant(
 
     assert payload["media"] == "h264"
     assert payload["mime"] == "video/mp4"
-    assert payload["url"] == "https://dm-d.terabox.com/file?fid=2&expires=8h"
+    assert payload["url"] == "https://kul-ddata.terabox.com/file?fid=2&expires=8h"
+    assert payload["direct"] is True
     assert fake.calls[0] == "/Telegram Archive/clip.h264.mp4"
 
 

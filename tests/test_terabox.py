@@ -656,13 +656,28 @@ class DownloadRecorder:
                     ],
                 }
             )
-        if request.url.host == "dm-d.terabox.com":
+        if request.url.host in ("dm-d.terabox.com", "kul-ddata.terabox.com"):
             self.range_headers.append(request.headers.get("range", ""))
             if self.throttle_once:
                 self.throttle_once = False
                 throttle = json.dumps({"errno": 400141, "errmsg": "need verify"}).encode()
                 return httpx.Response(
                     200, content=throttle, headers={"content-length": str(len(throttle))}
+                )
+            # The 0-byte probe used to resolve a cookie-free playback URL walks
+            # the redirect chain; real range downloads skip it.
+            if (
+                request.url.host == "dm-d.terabox.com"
+                and request.headers.get("range", "") == "bytes=0-0"
+            ):
+                return httpx.Response(
+                    302,
+                    headers={
+                        "location": (
+                            "https://kul-ddata.terabox.com/file?fid=12345"
+                            "&expires=8h&r=final"
+                        )
+                    },
                 )
             body = self.payload
             range_header = request.headers.get("range", "")
@@ -744,12 +759,38 @@ async def test_direct_download_link_returns_size_and_caches_meta(tmp_path: Path)
     first = await client.direct_download_link("/Telegram Archive/photo.jpg")
     second = await client.direct_download_link("/Telegram Archive/photo.jpg")
 
-    assert first == ("https://dm-d.terabox.com/file?fid=12345&expires=8h", 1024)
+    # The signed final hop serves bytes with the desktop User-Agent (no
+    # session cookie needed), so the browser can stream it directly.
+    assert first == ("https://kul-ddata.terabox.com/file?fid=12345&expires=8h&r=final", 1024, True)
     assert second == first
-    # The second call must reuse the cached meta entry, not page the listing again.
+    # The second call must reuse the cached meta + final-URL entries, not page
+    # the listing again or re-follow the redirect chain.
     list_calls = [r for r in recorder.requests if r.url.path == "/api/list"]
     assert len(list_calls) == 1
     assert recorder.filemetas_calls == 1
+    redirect_probes = [
+        r
+        for r in recorder.requests
+        if r.url.host == "dm-d.terabox.com" and r.headers.get("range") == "bytes=0-0"
+    ]
+    assert len(redirect_probes) == 1
+    await client.aclose()
+
+
+async def test_direct_download_link_falls_back_to_unsigned_dlink_when_cdn_redirect_fails(
+    tmp_path: Path,
+) -> None:
+    recorder = DownloadRecorder(b"A" * 1024, throttle_once=True)
+    client = _client(_settings(tmp_path), recorder)
+
+    link, size, direct = await client.direct_download_link("/Telegram Archive/photo.jpg")
+
+    # The throttle body aborts the redirect walk; the unsigned dlink still
+    # works from the server side but is unusable by the browser (no cookie),
+    # so it is flagged as not-direct and the player proxies instead.
+    assert link == "https://dm-d.terabox.com/file?fid=12345&expires=8h"
+    assert size == 1024
+    assert direct is False
     await client.aclose()
 
 

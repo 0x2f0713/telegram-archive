@@ -66,6 +66,10 @@ CDN_THROTTLE_ERRNOS = frozenset({400141, 424629})
 #: How long a positive ``/api/list`` file_meta result is trusted for playback
 #: source resolution. The archive is append-only, so 5 minutes is safe.
 FILE_META_CACHE_SECONDS = 300.0
+#: The signed final hop of a dlink (``*.data.terabox.com``) expires after ~8 h
+#: and does not require the session cookie; cache it for 6 h like filemetas
+#: links so each playback click does not re-follow the redirect chain.
+FINAL_DLINK_TTL_SECONDS = 6 * 60 * 60
 
 _TEMPLATE_DATA = re.compile(r"<script>var templateData = (.*);</script>", re.DOTALL)
 _JS_TOKEN_VALUE = re.compile(r"%28%22(.*)%22%29")
@@ -298,6 +302,10 @@ class TeraBoxClient:
         self._dlink_cache: dict[int, tuple[str, float]] = {}
         # remote path -> (dlink url, monotonic expiry) for /api/filemetas links.
         self._path_dlink_cache: dict[str, tuple[str, float]] = {}
+        # remote path -> (final signed CDN url, monotonic expiry). The final
+        # hop after the dlink redirect chain serves bytes without any cookie,
+        # so the browser can stream it directly (no third-party cookie needed).
+        self._final_url_cache: dict[str, tuple[str, float]] = {}
         # remote path -> (wall-clock timestamp, entry) for positive /api/list
         # lookups; avoids a parent-directory listing per playback start.
         self._meta_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -594,9 +602,14 @@ class TeraBoxClient:
         self._path_dlink_cache[cache_key] = (link, time.monotonic() + FILEMETAS_DLINK_TTL_SECONDS)
         return link
 
-    async def direct_download_link(self, remote_path: str) -> tuple[str, int] | None:
-        """Return ``(url, size)`` of a fresh CDN dlink for playback, or None.
+    async def direct_download_link(self, remote_path: str) -> tuple[str, int, bool] | None:
+        """Return ``(url, size, direct)`` of a fresh CDN stream.
 
+        ``direct`` is True when ``url`` is the signed final hop after the
+        redirect chain, which TeraBox serves with the desktop User-Agent but
+        without the session cookie. It is False when resolution failed and the
+        unsigned dlink (cookie-gated, requires the TeraBox app session) is
+        returned as a fallback the server can still consume.
         Resolves ``fs_id`` first, then prefers the cached filemetas path.
         Raises :class:`TeraBoxError` when the listing works but no dlink is
         issued for the file.
@@ -605,8 +618,46 @@ class TeraBoxClient:
         entry = await self.file_meta(remote_path)
         if entry is None:
             return None
+        cached = self._final_url_cache.get(remote_path)
+        if cached is not None and cached[1] > time.monotonic():
+            return cached[0], int(entry.get("size", 0)), True
         url = await self._fresh_dlink(int(entry.get("fs_id", 0)), remote_path)
-        return url, int(entry.get("size", 0))
+        # Inside a "need verify" window the probe would only re-arm the
+        # throttle; hand the unsigned dlink over instead.
+        if self._throttle_delay() > 0:
+            return url, int(entry.get("size", 0)), False
+        try:
+            # A 0-byte range request walks the redirect chain without pulling
+            # the file body; the final URL is the cookie-free playback source.
+            response = await self._cdn_stream(
+                url,
+                {"User-Agent": USER_AGENT, "Cookie": self._cookies, "Range": "bytes=0-0"},
+            )
+            final = str(response.url)
+            # A 2xx straight from dm-d (no redirect) is a throttle/error body,
+            # not a playback URL; the browser cannot use it without the cookie.
+            body_len = int(response.headers.get("content-length", "0") or 0)
+            if "dm-d.terabox.com" in final:
+                await response.aclose()
+                raise TeraBoxError("TeraBox CDN issued no redirect hop for playback")
+            if response.status_code == 200 and 0 < body_len <= 512:
+                body = await response.aread()
+                await response.aclose()
+                if self._cdn_throttle_errno(body):
+                    await self._arm_throttle(int(entry.get("fs_id", 0)), remote_path)
+                    raise TeraBoxError("TeraBox CDN throttled the playback probe")
+            else:
+                await response.aclose()
+        except TeraBoxError as exc:
+            logger.info(
+                "TeraBox CDN redirect resolution failed for %s (%s); "
+                "falling back to the unsigned dlink",
+                remote_path,
+                exc,
+            )
+            return url, int(entry.get("size", 0)), False
+        self._final_url_cache[remote_path] = (final, time.monotonic() + FINAL_DLINK_TTL_SECONDS)
+        return final, int(entry.get("size", 0)), True
 
     async def _cdn_stream(
         self, url: str, headers: dict[str, str], *, follow_redirects: int = 10
