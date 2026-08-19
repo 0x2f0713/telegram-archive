@@ -233,9 +233,19 @@ download buffer and a read cache:
 
 Consequences of remote storage:
 
-- **Pristine originals only.** `MEDIA_FASTSTART` and `MEDIA_VARIANTS` are
-  forced off in this mode; the cloud keeps unmodified source files and the
-  `optimize-media` operation is disabled.
+- **Streamlined remote archives.** `MEDIA_FASTSTART` stays on (moov atom
+  remuxed to the front so the file is streamable); HEVC sources are
+  transcoded to an H.264 sibling (`.h264.mp4`, `TERABOX_TRANSCODE_HEVC`)
+  that is uploaded next to the original so browsers can play without
+  codec support; posters are cached locally in `THUMBNAIL_CACHE_DIR`.
+  `MEDIA_VARIANTS` (local on-demand transcode) is forced off.
+- **Direct CDN playback.** The player first resolves
+  `GET /media/{id}/source`, which issues a fresh TeraBox `dlink` for the
+  archived file (preferring the H.264 variant). When the browser is logged
+  into terabox.com it streams straight from the CDN — no FUSE reads, no
+  server bandwidth. Without a TeraBox session the link fails fast and the
+  player retries once, then falls back to the byte-range proxy
+  (`/media/{id}`) automatically.
 - **Direct CDN thumbnails.** When a gallery thumbnail is missing, the web
   dashboard fetches the source directly through the TeraBox `dlink` API
   (single sequential stream with a shared "need verify" throttle gate)

@@ -333,6 +333,189 @@ async def test_terabox_variant_status_reports_disabled_without_sibling(
     assert payload["ready"] is True
 
 
+class FakeTeraboxSourceClient:
+    """Stand-in for TeraBoxClient behind the /media/{id}/source route."""
+
+    def __init__(self, links: dict[str, tuple[str, int]], *, fail: bool = False) -> None:
+        self.links = links
+        self.fail = fail
+        self.calls: list[str] = []
+
+    async def direct_download_link(self, remote_path: str) -> tuple[str, int] | None:
+        self.calls.append(remote_path)
+        if self.fail:
+            from app.infrastructure.terabox import TeraBoxError
+
+            raise TeraBoxError("dlink refused")
+        return self.links.get(remote_path)
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def _seed_mount_video(
+    settings: Settings,
+    *,
+    variant: bool = False,
+    completed: bool = True,
+) -> int:
+    database = Database(settings.database_url)
+    await database.initialize()
+    archive = ArchiveRepository(database)
+    await archive.upsert_chat(make_chat(title="Video Room"))
+    record, _ = await archive.upsert_message(
+        make_message(
+            text="video clip",
+            media_type="video",
+            mime_type="video/mp4",
+            original_filename="clip.mp4",
+            extension=".mp4",
+            telegram_message_id=42,
+        )
+    )
+    mount_dir = settings.terabox_mount_dir / "Telegram Archive"
+    media_path = mount_dir / "clip.mp4"
+    media_path.parent.mkdir(parents=True, exist_ok=True)
+    media_path.write_bytes(b"remote video")
+    if completed:
+        variant_path = str(mount_dir / "clip.h264.mp4") if variant else None
+        await archive.mark_download_completed(
+            record.id, media_path, media_path.stat().st_size, variant_mount_path=variant_path
+        )
+    await database.close()
+    return record.id
+
+
+def _terabox_settings(tmp_path: Path) -> Settings:
+    return _settings(
+        tmp_path,
+        storage_mode="terabox",
+        terabox_ndus="t",
+        terabox_profile=None,
+        terabox_mount_dir=tmp_path / "mnt",
+        terabox_remote_dir="/Telegram Archive",
+    )
+
+
+async def test_media_source_local_mode_returns_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    message_id = await _seed_video(settings)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            payload = (await client.get(f"/media/{message_id}/source")).json()
+
+    assert payload == {"source": "proxy", "url": f"/media/{message_id}"}
+
+
+async def test_media_source_terabox_returns_direct_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _terabox_settings(tmp_path)
+    fake = FakeTeraboxSourceClient(
+        {"/Telegram Archive/clip.mp4": ("https://dm-d.terabox.com/file?fid=1", 1234)}
+    )
+    monkeypatch.setattr("app.interfaces.web.app.create_terabox_client", lambda _s: fake)
+    message_id = await _seed_mount_video(settings)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            payload = (await client.get(f"/media/{message_id}/source")).json()
+
+    assert payload == {
+        "source": "terabox",
+        "url": "https://dm-d.terabox.com/file?fid=1",
+        "media": "original",
+        "mime": "video/mp4",
+        "size": 1234,
+    }
+    # The unrecorded sibling is probed first, then falls through to the original.
+    assert fake.calls == ["/Telegram Archive/clip.h264.mp4", "/Telegram Archive/clip.mp4"]
+
+
+async def test_media_source_terabox_prefers_h264_variant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _terabox_settings(tmp_path)
+    fake = FakeTeraboxSourceClient(
+        {
+            "/Telegram Archive/clip.h264.mp4": (
+                "https://dm-d.terabox.com/file?fid=2&expires=8h",
+                5678,
+            )
+        }
+    )
+    monkeypatch.setattr("app.interfaces.web.app.create_terabox_client", lambda _s: fake)
+    message_id = await _seed_mount_video(settings, variant=True)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            payload = (await client.get(f"/media/{message_id}/source")).json()
+
+    assert payload["media"] == "h264"
+    assert payload["mime"] == "video/mp4"
+    assert payload["url"] == "https://dm-d.terabox.com/file?fid=2&expires=8h"
+    assert fake.calls[0] == "/Telegram Archive/clip.h264.mp4"
+
+
+async def test_media_source_terabox_falls_back_to_proxy_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _terabox_settings(tmp_path)
+    fake = FakeTeraboxSourceClient({}, fail=True)
+    monkeypatch.setattr("app.interfaces.web.app.create_terabox_client", lambda _s: fake)
+    message_id = await _seed_mount_video(settings)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            payload = (await client.get(f"/media/{message_id}/source")).json()
+
+    assert payload == {"source": "proxy", "url": f"/media/{message_id}"}
+
+
+async def test_media_source_terabox_buffered_local_copy_is_proxied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _terabox_settings(tmp_path)
+    fake = FakeTeraboxSourceClient({})
+    monkeypatch.setattr("app.interfaces.web.app.create_terabox_client", lambda _s: fake)
+    message_id = await _seed_video(settings)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            payload = (await client.get(f"/media/{message_id}/source")).json()
+
+    assert payload == {"source": "proxy", "url": f"/media/{message_id}"}
+    assert fake.calls == []
+
+
+async def test_media_source_missing_or_incomplete_returns_404(tmp_path: Path) -> None:
+    settings = _terabox_settings(tmp_path)
+    message_id = await _seed_mount_video(settings, completed=False)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            incomplete = await client.get(f"/media/{message_id}/source")
+            missing = await client.get("/media/999999/source")
+
+    assert incomplete.status_code == 404
+    assert missing.status_code == 404
+
+
 async def test_moov_offset_and_faststart_detection(tmp_path: Path) -> None:
     front = tmp_path / "front.mp4"
     front.write_bytes(_mp4(moov_at_front=True))

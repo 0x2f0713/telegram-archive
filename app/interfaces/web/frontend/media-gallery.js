@@ -43,6 +43,9 @@ function setupMediaGallery() {
       playerHost.dataset.mediaSize = item.dataset.mediaSize || "0";
       playerHost.dataset.variantUrl = item.dataset.variantUrl || "";
       playerHost.dataset.variantStatusUrl = item.dataset.variantStatusUrl || "";
+      playerHost.dataset.teraboxEnabled = item.dataset.teraboxEnabled || "";
+      playerHost.dataset.sourceUrl = item.dataset.sourceUrl || "";
+      playerHost.dataset.fallbackUrl = item.dataset.fallbackUrl || "";
       media.src = item.dataset.mediaSrc;
       media.className = "media-viewer-video";
       media.controls = true;

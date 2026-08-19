@@ -201,6 +201,19 @@ def _resolved_media_paths(roots: tuple[Path, ...], media_path: str) -> tuple[Pat
     return roots[0], resolved
 
 
+def _mount_remote_path(mount_root: Path, path: Path) -> str | None:
+    """Translate a mount-absolute path into a TeraBox remote path, or None.
+
+    The unidisk FUSE mount exposes the drive root, so a path under the mount
+    maps 1:1 to a drive-absolute remote path (e.g. ``/Telegram Archive/...``).
+    """
+    try:
+        relative = Path(path).expanduser().resolve().relative_to(mount_root)
+    except ValueError:
+        return None
+    return str(PurePosixPath("/", *relative.parts))
+
+
 async def _completed_media(request: Request, message_id: int) -> tuple[Path, str | None]:
     """Resolve the archived file for a completed media record.
 
@@ -1219,6 +1232,73 @@ def create_router(settings: Settings) -> APIRouter:
             filename=media_path.name,
             content_disposition_type="inline",
         )
+
+    @router.get("/media/{message_id}/source")
+    async def media_source(request: Request, message_id: int) -> dict[str, object]:
+        """Resolve the fastest playback source for a completed media file.
+
+        In TeraBox mode the archive lives on the TeraBox drive, so the player
+        can bypass the FUSE mount entirely and stream the file straight from
+        the CDN using a fresh dlink (the browser attaches its own TeraBox
+        session cookie). The H.264 variant is preferred when one exists
+        because browsers decode it natively. When a direct link cannot be
+        issued the response points back at the local proxy route.
+        """
+        repository: DashboardRepository = request.app.state.dashboard
+        message = await repository.message(message_id)
+        if message is None or message.download_status != "completed" or not message.media_path:
+            raise HTTPException(status_code=404, detail="Completed media not found")
+
+        settings: Settings = request.app.state.settings
+        client: TeraBoxClient | None = getattr(request.app.state, "terabox_client", None)
+        proxy_url = f"/media/{message_id}/variant" if message.media_variant_path else f"/media/{message_id}"
+        if client is None or not settings.terabox_enabled:
+            return {"source": "proxy", "url": proxy_url}
+
+        roots = await asyncio.to_thread(settings.media_storage_roots)
+        _, resolved = await asyncio.to_thread(_resolved_media_paths, roots, message.media_path)
+        mount_root = settings.terabox_mount_dir.expanduser().resolve()
+        remote = _mount_remote_path(mount_root, resolved)
+        if remote is None:
+            # Still buffered locally (or outside the mount) — proxy it.
+            return {"source": "proxy", "url": proxy_url}
+
+        is_video = (message.mime_type or "").casefold().startswith("video/")
+        candidates: list[tuple[str, str, str]] = []  # (remote, media, mime)
+        if is_video:
+            if message.media_variant_path:
+                variant_remote = _mount_remote_path(mount_root, message.media_variant_path)
+                if variant_remote is not None:
+                    candidates.append((variant_remote, "h264", "video/mp4"))
+            sibling = _mount_remote_path(mount_root, resolved.with_name(f"{resolved.stem}.h264.mp4"))
+            if sibling is not None and not any(c[0] == sibling for c in candidates):
+                candidates.append((sibling, "h264", "video/mp4"))
+        candidates.append((remote, "original", _source_media_type(message.mime_type)))
+
+        for candidate_remote, media, mime in candidates:
+            try:
+                link = await client.direct_download_link(candidate_remote)
+            except TeraBoxError as exc:
+                logger.info("TeraBox direct link unavailable for %s: %s", candidate_remote, exc)
+                continue
+            if link is None:
+                continue
+            url, size = link
+            logger.info(
+                "TeraBox direct source for message %s: %s (%s, %s bytes)",
+                message_id,
+                media,
+                candidate_remote,
+                size,
+            )
+            return {
+                "source": "terabox",
+                "url": url,
+                "media": media,
+                "mime": mime,
+                "size": size,
+            }
+        return {"source": "proxy", "url": proxy_url}
 
     @router.get("/media/{message_id}/variant-status")
     async def media_variant_status(request: Request, message_id: int) -> dict[str, object]:

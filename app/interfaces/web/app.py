@@ -131,7 +131,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; style-src 'self'; script-src 'self'; "
-            "img-src 'self' data:; media-src 'self'; frame-src 'self'; "
+            "img-src 'self' data:; media-src 'self' https://dm-d.terabox.com https://*.terabox.com; "
+            "frame-src 'self'; "
             "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
         )
         response.headers["Referrer-Policy"] = "no-referrer"

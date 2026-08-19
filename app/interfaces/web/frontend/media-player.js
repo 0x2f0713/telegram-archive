@@ -14,6 +14,14 @@ function formatSpeed(bytesPerSecond) {
   return `${formatBytes(bytesPerSecond)}/s`;
 }
 
+function isCrossOrigin(url) {
+  try {
+    return new URL(url, window.location.href).origin !== window.location.origin;
+  } catch {
+    return true;
+  }
+}
+
 function requestNativeFullscreen(host, video) {
   if (typeof video.webkitEnterFullscreen === "function") {
     try {
@@ -48,10 +56,15 @@ function setupVideoPlayer(video) {
   const BUFFER_AHEAD_SECONDS = 20;
   const SLOW_SPEED_BYTES = 500 * 1024;
   const teraboxEnabled = host.dataset.teraboxEnabled === "true";
+  const sourceUrl = host.dataset.sourceUrl || "";
+  const fallbackUrl = host.dataset.fallbackUrl || "";
   let probe = null;
   let probeSpeed = 0;
   let variantTimer = null;
   let seekingActive = false;
+  let directAttempts = 0;
+  let sourceState = null;
+  let sourceResolving = null;
 
   const setStatus = (text, state) => {
     if (!badge || !teraboxEnabled) return;
@@ -123,6 +136,7 @@ function setupVideoPlayer(video) {
   };
   const startProbe = () => {
     if (probe || !size) return;
+    if (isCrossOrigin(video.currentSrc)) return;
     if (bufferedAhead() >= PROBE_START_SECONDS) return;
     const offset = Math.min(
       size - 1,
@@ -167,6 +181,62 @@ function setupVideoPlayer(video) {
       clearStatus();
     }
   };
+  const resolveSource = async () => {
+    if (sourceState) return sourceState;
+    if (sourceResolving) return sourceResolving;
+    sourceResolving = fetch(sourceUrl, {
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+    })
+      .then((response) => (response.ok ? response.json() : null))
+      .catch(() => null);
+    sourceResolving.then((state) => {
+      sourceState = state;
+      sourceResolving = null;
+    });
+    return sourceResolving;
+  };
+  const swapToDirect = (url) => {
+    video.dataset.directSource = "1";
+    video.src = url;
+    video.load();
+    if (teraboxEnabled) setStatus("Direct from TeraBox CDN", "terabox-playing");
+  };
+  const useFallbackSource = () => {
+    delete video.dataset.directSource;
+    video.dataset.directExhausted = "1";
+    const target = new URL(fallbackUrl, window.location.href).href;
+    if (video.currentSrc === target) return;
+    const wasPlaying = !video.paused && !video.ended;
+    video.src = fallbackUrl;
+    video.load();
+    if (wasPlaying) {
+      const attempt = video.play();
+      attempt?.catch?.(() => {});
+    }
+    if (teraboxEnabled) setStatus("Streaming via server proxy", "terabox-slow");
+  };
+  const handleDirectSourceError = async () => {
+    directAttempts += 1;
+    if (directAttempts > 2) {
+      useFallbackSource();
+      return;
+    }
+    if (badge) {
+      badge.hidden = false;
+      badge.textContent = "Reconnecting to TeraBox…";
+      badge.dataset.state = "terabox-connecting";
+    }
+    const state = await resolveSource();
+    if (state?.source === "terabox" && state.url && state.url !== video.currentSrc) {
+      swapToDirect(state.url);
+      const attempt = video.play();
+      attempt?.catch?.(() => {});
+      return;
+    }
+    useFallbackSource();
+  };
   const handleWaiting = () => {
     if (!teraboxEnabled || video.dataset.variantPolling) return;
     if (seekingActive) {
@@ -189,7 +259,27 @@ function setupVideoPlayer(video) {
     if (!teraboxEnabled || seekingActive) return;
     video.dataset.firstByteSeen = "true";
   };
-  const handlePlay = () => startProbe();
+  const handlePlay = () => {
+    startProbe();
+    if (!teraboxEnabled || !sourceUrl || video.dataset.directSource || video.dataset.directExhausted) return;
+    resolveSource().then((state) => {
+      if (state?.source === "terabox" && state.url && !video.dataset.directSource) {
+        directAttempts = 0;
+        swapToDirect(state.url);
+        const attempt = video.play();
+        attempt?.catch?.(() => {});
+      }
+    });
+  };
+  const prepareDirectSource = () => {
+    if (!teraboxEnabled || !sourceUrl || video.dataset.directSource || video.dataset.directExhausted) return;
+    resolveSource().then((state) => {
+      if (state?.source === "terabox" && state.url && !video.dataset.directSource) {
+        directAttempts = 0;
+        swapToDirect(state.url);
+      }
+    });
+  };
   const handleWaitingCombined = () => {
     startProbe();
     handleWaiting();
@@ -270,6 +360,10 @@ function setupVideoPlayer(video) {
   const handlePlaybackError = () => {
     stopProbe();
     if (video.dataset.variantSwapped) return;
+    if (video.dataset.directSource) {
+      handleDirectSourceError();
+      return;
+    }
     pollVariant();
   };
 
@@ -282,6 +376,7 @@ function setupVideoPlayer(video) {
   video.addEventListener("playing", handlePlaying);
   video.addEventListener("progress", handleProgressing);
   video.addEventListener("error", handlePlaybackError);
+  if (teraboxEnabled) host.addEventListener("pointerdown", prepareDirectSource, { once: true });
   videoPlayers.set(video, {
     player,
     stopProbe,
@@ -313,6 +408,8 @@ function destroyVideoPlayer(video) {
   delete video.dataset.variantSwapped;
   delete video.dataset.variantPolling;
   delete video.dataset.firstByteSeen;
+  delete video.dataset.directSource;
+  delete video.dataset.directExhausted;
 }
 
 function setupVideoPlayers() {

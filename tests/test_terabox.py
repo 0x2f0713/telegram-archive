@@ -737,6 +737,31 @@ async def test_download_url_for_path_uses_filemetas_and_caches(tmp_path: Path) -
     await client.aclose()
 
 
+async def test_direct_download_link_returns_size_and_caches_meta(tmp_path: Path) -> None:
+    recorder = DownloadRecorder(b"A" * 1024)
+    client = _client(_settings(tmp_path), recorder)
+
+    first = await client.direct_download_link("/Telegram Archive/photo.jpg")
+    second = await client.direct_download_link("/Telegram Archive/photo.jpg")
+
+    assert first == ("https://dm-d.terabox.com/file?fid=12345&expires=8h", 1024)
+    assert second == first
+    # The second call must reuse the cached meta entry, not page the listing again.
+    list_calls = [r for r in recorder.requests if r.url.path == "/api/list"]
+    assert len(list_calls) == 1
+    assert recorder.filemetas_calls == 1
+    await client.aclose()
+
+
+async def test_direct_download_link_returns_none_when_path_missing(tmp_path: Path) -> None:
+    recorder = DownloadRecorder(b"A" * 1024)
+    client = _client(_settings(tmp_path), recorder)
+
+    assert await client.direct_download_link("/Telegram Archive/missing.mp4") is None
+    assert recorder.filemetas_calls == 0
+    await client.aclose()
+
+
 async def test_fetch_remote_file_prefers_filemetas_over_signed_download(tmp_path: Path) -> None:
     payload = b"F" * 1024
     recorder = DownloadRecorder(payload)

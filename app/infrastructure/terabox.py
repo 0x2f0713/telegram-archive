@@ -63,6 +63,9 @@ CDN_CHUNK_SIZE = 256 * 1024
 MAX_DIRECT_DOWNLOAD_BYTES = 32 * 1024 * 1024
 #: CDN errnos returned when TeraBox rate-limits a session ("need verify").
 CDN_THROTTLE_ERRNOS = frozenset({400141, 424629})
+#: How long a positive ``/api/list`` file_meta result is trusted for playback
+#: source resolution. The archive is append-only, so 5 minutes is safe.
+FILE_META_CACHE_SECONDS = 300.0
 
 _TEMPLATE_DATA = re.compile(r"<script>var templateData = (.*);</script>", re.DOTALL)
 _JS_TOKEN_VALUE = re.compile(r"%28%22(.*)%22%29")
@@ -295,6 +298,9 @@ class TeraBoxClient:
         self._dlink_cache: dict[int, tuple[str, float]] = {}
         # remote path -> (dlink url, monotonic expiry) for /api/filemetas links.
         self._path_dlink_cache: dict[str, tuple[str, float]] = {}
+        # remote path -> (wall-clock timestamp, entry) for positive /api/list
+        # lookups; avoids a parent-directory listing per playback start.
+        self._meta_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         # Monotonic deadline until which the session sits inside a CDN
         # "need verify" throttle window; downloads wait it out instead of
         # retrying every few seconds until the attempts are exhausted.
@@ -588,6 +594,20 @@ class TeraBoxClient:
         self._path_dlink_cache[cache_key] = (link, time.monotonic() + FILEMETAS_DLINK_TTL_SECONDS)
         return link
 
+    async def direct_download_link(self, remote_path: str) -> tuple[str, int] | None:
+        """Return ``(url, size)`` of a fresh CDN dlink for playback, or None.
+
+        Resolves ``fs_id`` first, then prefers the cached filemetas path.
+        Raises :class:`TeraBoxError` when the listing works but no dlink is
+        issued for the file.
+        """
+
+        entry = await self.file_meta(remote_path)
+        if entry is None:
+            return None
+        url = await self._fresh_dlink(int(entry.get("fs_id", 0)), remote_path)
+        return url, int(entry.get("size", 0))
+
     async def _cdn_stream(
         self, url: str, headers: dict[str, str], *, follow_redirects: int = 10
     ) -> httpx.Response:
@@ -847,8 +867,16 @@ class TeraBoxClient:
         raise last_error or TeraBoxError(f"TeraBox direct download failed for {remote_path}")
 
     async def file_meta(self, remote_path: str) -> dict[str, Any] | None:
-        """Return the list entry for one remote path, or None when absent."""
+        """Return the list entry for one remote path, or None when absent.
 
+        Positive results are cached briefly so repeated playback-source
+        lookups (per browser play click) do not page through the parent
+        directory listing on every request.
+        """
+
+        cached = self._meta_cache.get(remote_path)
+        if cached is not None and time.time() - cached[0] < FILE_META_CACHE_SECONDS:
+            return cached[1]
         posix = PurePosixPath(remote_path)
         if len(posix.parts) <= 1:
             return {"path": "/", "isdir": 1, "size": 0}
@@ -870,6 +898,7 @@ class TeraBoxClient:
                 return None
             for entry in data.get("list") or []:
                 if entry.get("path") == remote_path:
+                    self._meta_cache[remote_path] = (time.time(), entry)
                     return entry
             if not data.get("has_more"):
                 return None
@@ -905,6 +934,8 @@ class TeraBoxClient:
             data = await self._api_json(f"/api/filemanager?{query}", body)
         errno = data.get("errno", 0)
         if errno == 0:
+            self._meta_cache.pop(remote_path, None)
+            self._path_dlink_cache.pop(remote_path, None)
             return True
         if errno in (-7, 31066):
             return False
