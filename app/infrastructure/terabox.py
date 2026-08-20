@@ -1014,8 +1014,16 @@ class TeraBoxClient:
         current = ""
         for part in parts:
             current = f"{current}/{part}"
+            existing = await self.file_meta(current)
+            if existing is not None and existing.get("isdir") == 1:
+                continue
+            # rtype=0 makes a collision surface as errno -8: the API's default
+            # instead renames the existing folder to a "_YYYYMMDD_HHMMSS"
+            # duplicate and happily reports errno 0, littering the drive
+            # with one empty duplicate per mkdir of an existing folder.
             data = await self._api_json(
-                "/api/create?a=commit", {"path": current, "isdir": 1, "block_list": "[]"}
+                "/api/create?a=commit",
+                {"path": current, "isdir": 1, "block_list": "[]", "rtype": 0},
             )
             errno = data.get("errno", 0)
             if errno == 0:

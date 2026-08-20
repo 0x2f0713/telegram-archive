@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import httpx
 import pytest
@@ -79,6 +79,7 @@ class UploadRecorder:
         self.remote: dict[str, int] = {}
         self.precreate_form: dict[str, str] = {}
         self.commit_form: dict[str, str] = {}
+        self.mkdir_forms: list[dict[str, str]] = []
         self._rapid_errno = rapid_errno
         self._precreate_return_type = precreate_return_type
 
@@ -108,7 +109,8 @@ class UploadRecorder:
             self.chunk_bodies[partseq] = payload
             return _json({"md5": hashlib.md5(payload).hexdigest()})
         if path == "/api/create":
-            if request.url.query == "a=commit":
+            if request.url.query == b"a=commit":
+                self.mkdir_forms.append(_form(request))
                 return _json({"errno": 0})
             self.commit_form = _form(request)
             return _json(
@@ -278,6 +280,7 @@ async def test_upload_file_chunked_flow(tmp_path: Path) -> None:
     assert paths == [
         "/main",
         "/rest/2.0/pcs/file",  # locateupload (file < 256 KiB skips rapidupload)
+        "/api/list",  # existence check before mkdir parent
         "/api/create",  # mkdir parent
         "/api/precreate",
         "/rest/2.0/pcs/superfile2",
@@ -293,6 +296,58 @@ async def test_upload_file_chunked_flow(tmp_path: Path) -> None:
     assert recorder.commit_form["size"] == "5"
     assert recorder.commit_form["uploadid"] == "P1-test"
     assert recorder.commit_form["content-md5"] == hashes.file_md5
+    await client.aclose()
+
+
+async def test_ensure_remote_dir_mkdir_uses_rtype_overwrite(tmp_path: Path) -> None:
+    # rtype=0 (the /api/create default) renames an existing folder to a
+    # "_YYYYMMDD_HHMMSS" duplicate and still returns errno 0; the fix
+    # probes the parent listing first so existing folders never reach mkdir.
+    settings = _settings(tmp_path)
+    recorder = UploadRecorder()
+    client = _client(settings, recorder)
+
+    await client.ensure_remote_dir("/Telegram Archive/-1_Room/2026/08")
+
+    assert [form["path"] for form in recorder.mkdir_forms] == [
+        "/Telegram Archive",
+        "/Telegram Archive/-1_Room",
+        "/Telegram Archive/-1_Room/2026",
+        "/Telegram Archive/-1_Room/2026/08",
+    ]
+    for form in recorder.mkdir_forms:
+        assert form["rtype"] == "0"
+    await client.aclose()
+
+
+class EnsureRemoteDirExistsRecorder(UploadRecorder):
+    """A directory already exists remotely; mkdir of it must be skipped."""
+
+    def __init__(self, existing: str) -> None:
+        super().__init__()
+        self.existing = existing
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/list":
+            listed = []
+            requested_dir = _form(request).get("dir")
+            if requested_dir == str(PurePosixPath(self.existing).parent):
+                listed.append({"path": self.existing, "size": 0, "isdir": 1})
+            for remote_path, size in self.remote.items():
+                if str(PurePosixPath(remote_path).parent) == requested_dir:
+                    listed.append({"path": remote_path, "size": size, "isdir": 0})
+            return _json({"errno": 0, "list": listed, "has_more": False})
+        return super().__call__(request)
+
+
+async def test_ensure_remote_dir_skips_existing_directory(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    recorder = EnsureRemoteDirExistsRecorder("/Telegram Archive")
+    client = _client(settings, recorder)
+
+    await client.ensure_remote_dir("/Telegram Archive/-1_Room")
+
+    assert [form["path"] for form in recorder.mkdir_forms] == ["/Telegram Archive/-1_Room"]
     await client.aclose()
 
 
