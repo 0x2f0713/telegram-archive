@@ -200,14 +200,16 @@ class OperationCommands:
             states[report_key] = (current, now, speed)
             percent = round(current / total * 100, 1) if total else None
 
-            # The downloader tells us the phase explicitly; a finished report
-            # wins regardless of which phase sent it.
-            if total and current >= total:
-                status = "completed"
-            elif phase == "uploading":
+            # Keep the same task row through the download→upload transition.
+            # A final upload callback is allowed to become completed, but an
+            # in-flight upload must remain orange even when the download had
+            # already reported current == total.
+            if phase == "uploading" and (not total or current < total):
                 status = "uploading"
             elif phase == "preparing":
                 status = "preparing"
+            elif total and current >= total:
+                status = "completed"
             else:
                 status = "downloading"
 

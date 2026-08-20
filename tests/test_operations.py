@@ -249,6 +249,15 @@ async def test_download_reporter_marks_explicit_upload_phase(tmp_path: Path) -> 
     assert upload_task["current"] == 256
     assert updates[-1]["phase"] == "uploading"
 
+    # The final upload callback completes the same row instead of creating a
+    # separate task or leaving it stuck in the orange uploading state.
+    reporter("movie.mp4", 1024, 1024, "uploading")
+    await asyncio.sleep(0)
+    tasks = updates[-1]["download_tasks"]
+    assert isinstance(tasks, list)
+    completed_task = next(task for task in tasks if task["filename"] == "movie.mp4")
+    assert completed_task["status"] == "completed"
+
     # publish_buffered path: an upload that never saw a download phase first.
     reporter("buffered.bin", 128, 1024, "uploading")
     await asyncio.sleep(0)

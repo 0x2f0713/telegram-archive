@@ -320,6 +320,9 @@ progress.preparing { color: var(--ink-soft); accent-color: var(--ink-soft); }
 .operation-download-progress progress::-webkit-progress-bar { border-radius: 999px; background: var(--surface-soft); }
 .operation-download-progress progress::-webkit-progress-value { border-radius: 999px; background: var(--accent); transition: width var(--motion-base) var(--spring); }
 .operation-download-progress progress::-moz-progress-bar { border-radius: 999px; background: var(--accent); }
+.operation-download-progress progress.uploading { accent-color: var(--warning); }
+.operation-download-progress progress.uploading::-webkit-progress-value { background: var(--warning); }
+.operation-download-progress progress.uploading::-moz-progress-bar { background: var(--warning); }
 .operation-download-empty { margin: 0; color: var(--ink-faint); font-size: .75rem; }
 .operation-content-scope { display: flex; flex-wrap: wrap; gap: 0.55rem; margin: 0.45rem 0 0; color: var(--ink-faint); font-size: 0.68rem; text-transform: capitalize; }.operation-content-scope strong { color: var(--accent); font: inherit; text-transform: uppercase; }
 .operation-progress-wrap { margin-top: 1.6rem; }.operation-progress-wrap progress { display: block; width: 100%; height: 0.7rem; overflow: hidden; border: 0; border-radius: 999px; background: var(--surface-soft); color: var(--accent); accent-color: var(--accent); }.operation-progress-wrap progress::-webkit-progress-bar { border-radius: 999px; background: var(--surface-soft); }.operation-progress-wrap progress::-webkit-progress-value { border-radius: 999px; background: var(--accent); transition: width var(--motion-base) var(--spring); }.operation-progress-wrap progress::-moz-progress-bar { border-radius: 999px; background: var(--accent); }

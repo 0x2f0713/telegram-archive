@@ -92,10 +92,12 @@
     </div>
   </div>
   <p class="operation-detail" data-operation-detail>{{ focus_operation.detail or 'Preparing operation status' }}</p>
-  <details class="operation-download-disclosure" data-operation-download-details {% if focus_operation.get('download_tasks') %}open{% endif %}>
-    <summary><span>Download tasks</span><strong data-operation-download-summary>{{ focus_operation.get('download_tasks', [])|length }} active</strong></summary>
+  {% set download_tasks = focus_operation.get('download_tasks', []) %}
+  {% set active_download_tasks = download_tasks|selectattr('status', 'ne', 'completed')|list %}
+  <details class="operation-download-disclosure" data-operation-download-details {% if active_download_tasks %}open{% endif %}>
+    <summary><span>Download tasks</span><strong data-operation-download-summary>{{ active_download_tasks|length }} active · {{ download_tasks|length }} shown</strong></summary>
     <div class="operation-download-list" data-operation-download-list>
-      {% for task in focus_operation.get('download_tasks', []) %}
+      {% for task in download_tasks %}
       <article class="operation-download-progress" data-download-task>
         <div class="operation-download-progress-head"><strong data-download-filename>{{ task.filename }}</strong><span data-download-percent>{{ task.percent or 0 }}%</span></div>
         <progress data-download-bar value="{{ task.current or 0 }}" max="{{ task.total or 1 }}" aria-label="Download progress for {{ task.filename }}">{{ task.percent or 0 }}%</progress>
