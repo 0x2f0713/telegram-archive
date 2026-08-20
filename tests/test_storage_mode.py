@@ -18,19 +18,18 @@ def test_invalid_storage_mode_rejected() -> None:
         Settings(_env_file=None, storage_mode="cloud")
 
 
-def test_terabox_storage_roots_include_mount_dir(tmp_path: Path) -> None:
+def test_terabox_storage_roots_use_only_local_buffer(tmp_path: Path) -> None:
     settings = Settings(
         _env_file=None,
         storage_mode="terabox",
         terabox_ndus="token",
         download_dir=tmp_path / "downloads",
-        terabox_mount_dir=tmp_path / "mnt" / "terabox",
     )
 
     roots = settings.media_storage_roots()
 
     assert roots[0] == (tmp_path / "downloads").resolve()
-    assert roots[1] == (tmp_path / "mnt" / "terabox").resolve()
+    assert roots == ((tmp_path / "downloads").resolve(),)
 
 
 def test_terabox_policy_disables_local_only_media_flags() -> None:
@@ -69,21 +68,13 @@ def test_policy_still_applied_after_runtime_overrides() -> None:
 
 
 def test_require_terabox_ndus_prefers_env_value() -> None:
-    settings = Settings(_env_file=None, terabox_ndus="from-env", terabox_profile=None)
+    settings = Settings(_env_file=None, terabox_ndus="from-env")
 
     assert settings.require_terabox_ndus() == "from-env"
 
 
-def test_require_terabox_ndus_reads_unidisk_profile(tmp_path: Path) -> None:
-    profile = tmp_path / "terabox.profile.json"
-    profile.write_text('{"module": "TeraBox", "ndus": "from-profile"}', encoding="utf-8")
-    settings = Settings(_env_file=None, terabox_profile=profile)
-
-    assert settings.require_terabox_ndus() == "from-profile"
-
-
 def test_require_terabox_ndus_missing_has_no_secret_in_message() -> None:
-    settings = Settings(_env_file=None, terabox_profile=Path("/nonexistent/profile.json"))
+    settings = Settings(_env_file=None)
 
     with pytest.raises(ConfigurationError, match="TERABOX_NDUS is required"):
         settings.require_terabox_ndus()

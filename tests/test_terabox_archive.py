@@ -14,9 +14,7 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
     values: dict[str, object] = {
         "storage_mode": "terabox",
         "terabox_ndus": "t",
-        "terabox_profile": None,
         "download_dir": tmp_path / "downloads",
-        "terabox_mount_dir": tmp_path / "mnt",
         "terabox_remote_dir": "/Telegram Archive",
     }
     values.update(overrides)
@@ -36,7 +34,8 @@ class RecordingRepository:
         return None
 
     async def mark_download_completed(
-        self, _message_id: int, path: Path, size: int, _variant_mount_path: str | None = None
+        self, _message_id: int, path: Path, size: int, _variant_local_path: str | None = None,
+        **_kwargs: object,
     ) -> None:
         self.completed.append((path, size))
 
@@ -51,11 +50,11 @@ class PublishingDownloader:
     def __init__(
         self,
         repository: RecordingRepository,
-        mount_dir: Path,
+        remote_root: str,
         publish_error: str | None = None,
     ) -> None:
         self.repository = repository
-        self.mount_dir = mount_dir
+        self.remote_root = remote_root.rstrip("/")
         self.publish_error = publish_error
         self.published: list[Path] = []
         self.downloaded: list[Path] = []
@@ -77,9 +76,8 @@ class PublishingDownloader:
         if self.publish_error:
             self.repository.failed.append(self.publish_error)
             return DownloadResult(False, None, None, self.publish_error)
-        mount_path = self.mount_dir / buffered_path.name
-        self.repository.completed.append((mount_path, buffered_path.stat().st_size))
-        return DownloadResult(True, mount_path, buffered_path.stat().st_size)
+        self.repository.completed.append((buffered_path, buffered_path.stat().st_size))
+        return DownloadResult(True, buffered_path, buffered_path.stat().st_size)
 
 
 def _archive(settings: Settings, repository: RecordingRepository, downloader) -> ArchiveService:
@@ -112,7 +110,7 @@ async def test_terabox_mode_publishes_buffered_file(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     chat = make_chat()
     repository = RecordingRepository(_record(chat.telegram_chat_id))
-    downloader = PublishingDownloader(repository, settings.terabox_mount_dir)
+    downloader = PublishingDownloader(repository, settings.terabox_remote_root)
     archive = _archive(settings, repository, downloader)
 
     target = output_path(settings.download_dir, chat, make_message())
@@ -132,7 +130,7 @@ async def test_terabox_mode_publish_failure_records_failure(tmp_path: Path) -> N
     chat = make_chat()
     repository = RecordingRepository(_record(chat.telegram_chat_id))
     downloader = PublishingDownloader(
-        repository, settings.terabox_mount_dir, publish_error="upload refused"
+        repository, settings.terabox_remote_root, publish_error="upload refused"
     )
     archive = _archive(settings, repository, downloader)
 
@@ -152,7 +150,7 @@ async def test_terabox_mode_without_buffer_downloads_normally(tmp_path: Path) ->
     settings = _settings(tmp_path)
     chat = make_chat()
     repository = RecordingRepository(_record(chat.telegram_chat_id))
-    downloader = PublishingDownloader(repository, settings.terabox_mount_dir)
+    downloader = PublishingDownloader(repository, settings.terabox_remote_root)
     archive = _archive(settings, repository, downloader)
 
     result = await archive.process_message(object(), chat)
@@ -166,7 +164,7 @@ async def test_local_mode_treats_buffered_file_as_archived(tmp_path: Path) -> No
     settings = _settings(tmp_path, storage_mode="local")
     chat = make_chat()
     repository = RecordingRepository(_record(chat.telegram_chat_id))
-    downloader = PublishingDownloader(repository, settings.terabox_mount_dir)
+    downloader = PublishingDownloader(repository, settings.terabox_remote_root)
     archive = _archive(settings, repository, downloader)
 
     target = output_path(settings.download_dir, chat, make_message())

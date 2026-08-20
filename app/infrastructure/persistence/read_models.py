@@ -44,6 +44,8 @@ def _message_columns():
         Message.download_status,
         Message.download_error,
         Message.download_attempts,
+        Message.terabox_remote_path,
+        Message.terabox_variant_remote_path,
     )
 
 
@@ -301,7 +303,7 @@ class DashboardRepository:
         conditions = (
             Message.telegram_chat_id == query.chat_id,
             Message.download_status == DownloadState.COMPLETED.value,
-            Message.media_path.is_not(None),
+            or_(Message.media_path.is_not(None), Message.terabox_remote_path.is_not(None)),
             kind_condition,
         )
         count_statement = select(func.count(Message.id)).where(*conditions)

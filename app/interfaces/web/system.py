@@ -36,8 +36,8 @@ def inspect_storage(
 
     With a ``remote_quota`` (TeraBox ``total, used`` bytes) the free-space
     figures describe the cloud volume instead of the local disk. Missing-file
-    detection checks every media storage root, so remote-only files served
-    through the unidisk mount are not flagged.
+    detection checks only local media buffers; remote-only TeraBox objects are
+    validated through the API health check instead.
     """
 
     roots = settings.media_storage_roots()

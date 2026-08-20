@@ -178,7 +178,7 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         database = Database(settings.database_url)
-        await database.initialize()
+        await database.initialize(legacy_terabox_root=settings.terabox_remote_root)
         runtime_settings = RuntimeSettingsRepository(database)
         resolution = await load_runtime_settings(settings, runtime_settings)
         overridden = resolution.settings.with_terabox_policy()

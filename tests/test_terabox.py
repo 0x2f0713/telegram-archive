@@ -31,9 +31,7 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
     values: dict[str, object] = {
         "storage_mode": "terabox",
         "terabox_ndus": "test-token",
-        "terabox_profile": None,
         "download_dir": tmp_path / "downloads",
-        "terabox_mount_dir": tmp_path / "mnt",
         "terabox_remote_dir": "/Telegram Archive",
     }
     values.update(overrides)
@@ -566,7 +564,7 @@ async def test_cached_quota_reuses_recent_result(tmp_path: Path) -> None:
     await client.aclose()
 
 
-async def test_uploader_deletes_local_copy_and_records_mount_path(tmp_path: Path) -> None:
+async def test_uploader_returns_canonical_remote_path(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     buffer = settings.download_dir / "-1_Room" / "2026" / "08" / "16"
     buffer.mkdir(parents=True)
@@ -575,7 +573,6 @@ async def test_uploader_deletes_local_copy_and_records_mount_path(tmp_path: Path
 
     class FakeClient:
         remote_root = "/Telegram Archive"
-        mount_dir = settings.terabox_mount_dir
 
         def remote_path(self, media_path: Path) -> str:
             relative = media_path.relative_to(settings.download_dir.expanduser().resolve())
@@ -593,30 +590,22 @@ async def test_uploader_deletes_local_copy_and_records_mount_path(tmp_path: Path
                 chunk_md5s=(),
             )
 
-        def mount_path(self, remote_path: str) -> Path:
-            return self.mount_dir / Path(remote_path.lstrip("/"))
-
     fake = FakeClient()
     uploader = TeraBoxUploader(settings, fake)  # type: ignore[arg-type]
 
     receipt = await uploader.upload(local)
 
     assert receipt.remote_path == "/Telegram Archive/-1_Room/2026/08/16/42_clip.mp4"
-    assert receipt.mount_path == (
-        settings.terabox_mount_dir / "Telegram Archive/-1_Room/2026/08/16/42_clip.mp4"
-    )
     assert receipt.size == 11
 
 
-def test_create_terabox_client_resolves_ndus_from_profile(tmp_path: Path) -> None:
-    profile = tmp_path / "p.json"
-    profile.write_text('{"ndus": "profile-cookie"}', encoding="utf-8")
-    settings = _settings(tmp_path, terabox_ndus="", terabox_profile=profile)
+def test_create_terabox_client_resolves_ndus_from_settings(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, terabox_ndus="settings-cookie")
 
     assert create_terabox_client(settings) is not None
 
 
-async def test_media_deleter_translates_mount_path_to_remote(tmp_path: Path) -> None:
+async def test_media_deleter_deletes_canonical_remote_path(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     deleted: list[str] = []
 
@@ -628,24 +617,24 @@ async def test_media_deleter_translates_mount_path_to_remote(tmp_path: Path) -> 
             return True
 
     deleter = TeraBoxMediaDeleter(settings, FakeClient())  # type: ignore[arg-type]
-    mount_file = settings.terabox_mount_dir / "Telegram Archive" / "-1_Room" / "clip.mp4"
+    remote_path = "/Telegram Archive/-1_Room/clip.mp4"
 
-    assert await deleter(mount_file) is True
-    assert deleted == ["/Telegram Archive/Telegram Archive/-1_Room/clip.mp4"]
+    assert await deleter(remote_path) is True
+    assert deleted == [remote_path]
 
 
-async def test_media_deleter_rejects_paths_outside_mount(tmp_path: Path) -> None:
+async def test_media_deleter_accepts_remote_paths(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
 
     class FakeClient:
         remote_root = "/Telegram Archive"
 
-        async def delete(self, remote_path: str) -> bool:  # pragma: no cover
-            raise AssertionError("must not delete outside the mount")
+        async def delete(self, remote_path: str) -> bool:
+            return remote_path == "/Telegram Archive/clip.mp4"
 
     deleter = TeraBoxMediaDeleter(settings, FakeClient())  # type: ignore[arg-type]
 
-    assert await deleter(tmp_path / "elsewhere" / "clip.mp4") is False
+    assert await deleter("/Telegram Archive/clip.mp4") is True
 
 
 # ---- direct dlink download ---------------------------------------------------

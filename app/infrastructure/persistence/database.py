@@ -12,6 +12,7 @@ from typing import Any
 
 from sqlalchemy import event, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -120,9 +121,73 @@ class Database:
         connection_record.info.pop("checkout_started", None)
         connection_record.info.pop("checkout_task", None)
 
-    async def initialize(self) -> None:
+    async def initialize(self, *, legacy_terabox_root: str = "/Telegram Archive") -> None:
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+            columns = {
+                row[1]
+                for row in (await connection.execute(text("PRAGMA table_info(messages)"))).all()
+            }
+            for column in ("terabox_remote_path", "terabox_variant_remote_path"):
+                if column not in columns:
+                    try:
+                        await connection.execute(
+                            text(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
+                        )
+                    except OperationalError as exc:
+                        # A worker and web process can initialize the same
+                        # SQLite file concurrently. Treat a raced duplicate
+                        # column as success, but preserve all other failures.
+                        if "duplicate column name" not in str(exc).casefold():
+                            raise
+
+            # Older releases stored an absolute filesystem-mount path in media_path.
+            # Convert the archive-root suffix to the canonical remote path and
+            # clear the obsolete filesystem locator. This is intentionally
+            # idempotent and runs before any repository reads the database.
+            root = legacy_terabox_root.strip() or "/Telegram Archive"
+            if not root.startswith("/"):
+                root = f"/{root}"
+            root = root.rstrip("/") or "/"
+            rows = (
+                await connection.execute(
+                    text(
+                        "SELECT id, media_path, media_variant_path "
+                        "FROM messages WHERE media_path IS NOT NULL "
+                        "AND terabox_remote_path IS NULL"
+                    )
+                )
+            ).all()
+            for message_id, media_path, variant_path in rows:
+                remote = self._legacy_remote_path(str(media_path), root)
+                if remote is None:
+                    continue
+                variant_remote = (
+                    self._legacy_remote_path(str(variant_path), root)
+                    if variant_path
+                    else None
+                )
+                await connection.execute(
+                    text(
+                        "UPDATE messages SET media_path = NULL, media_variant_path = NULL, "
+                        "terabox_remote_path = :remote, "
+                        "terabox_variant_remote_path = :variant WHERE id = :id"
+                    ),
+                    {"id": message_id, "remote": remote, "variant": variant_remote},
+                )
+
+    @staticmethod
+    def _legacy_remote_path(value: str, root: str) -> str | None:
+        """Extract a remote archive path from an old absolute mount path."""
+
+        marker = root if root != "/" else "//"
+        index = value.find(marker)
+        if index < 0:
+            return None
+        candidate = value[index:]
+        if candidate != root and not candidate.startswith(f"{root}/"):
+            return None
+        return candidate
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[AsyncSession]:

@@ -110,3 +110,40 @@ async def test_delete_chat_archive_removes_owned_files_and_preserves_archive_sta
         chat.telegram_chat_id for chat in (await dashboard.archived_chat_summaries()).items
     }
     assert await ChatArchiveDeletionService(archive).delete(chat_id, download_dir) is None
+
+
+async def test_delete_chat_archive_removes_owned_terabox_objects(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    archive = ArchiveRepository(database)
+    chat_id = -1001234567890
+    await archive.upsert_chat(make_chat(telegram_chat_id=chat_id, title="Remote Room"))
+    record, _ = await archive.upsert_message(make_message(telegram_message_id=301))
+    await archive.mark_download_completed(
+        record.id,
+        tmp_path / "buffer.bin",
+        17,
+        terabox_remote_path="/Telegram Archive/remote.bin",
+        terabox_variant_remote_path="/Telegram Archive/remote.h264.mp4",
+    )
+
+    deleted: list[str] = []
+
+    async def remove_remote(path: str) -> bool:
+        deleted.append(path)
+        return True
+
+    result = await ChatArchiveDeletionService(archive).delete(
+        chat_id,
+        tmp_path / "downloads",
+        remove_remote=remove_remote,
+    )
+
+    assert result is not None
+    assert result.files_deleted == 2
+    assert result.bytes_deleted == 0
+    assert deleted == [
+        "/Telegram Archive/remote.bin",
+        "/Telegram Archive/remote.h264.mp4",
+    ]

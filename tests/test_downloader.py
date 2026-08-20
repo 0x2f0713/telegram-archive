@@ -19,7 +19,8 @@ class RecordingRepository:
         self.started += 1
 
     async def mark_download_completed(
-        self, _message_id: int, _path: Path, _size: int, _variant_mount_path: str | None = None
+        self, _message_id: int, _path: Path, _size: int, _variant_local_path: str | None = None,
+        **_kwargs: object,
     ) -> None:
         self.completed += 1
 
@@ -99,8 +100,8 @@ async def test_download_forwards_per_file_progress(tmp_path: Path) -> None:
 
 
 class FakeUploader:
-    def __init__(self, mount_dir: Path, *, error: str | None = None) -> None:
-        self.mount_dir = mount_dir
+    def __init__(self, remote_root: str, *, error: str | None = None) -> None:
+        self.remote_root = remote_root.rstrip("/")
         self.error = error
         self.uploaded: list[Path] = []
 
@@ -109,10 +110,8 @@ class FakeUploader:
             raise TeraBoxError(self.error)
         size = await asyncio.to_thread(lambda: target.stat().st_size)
         self.uploaded.append(target)
-        mount_path = self.mount_dir / target.name
         return UploadReceipt(
-            remote_path=f"/Telegram Archive/{target.name}",
-            mount_path=mount_path,
+            remote_path=f"{self.remote_root}/{target.name}",
             size=size,
             md5="d" * 32,
         )
@@ -124,9 +123,7 @@ def _terabox_settings(tmp_path: Path) -> Settings:
         download_retries=1,
         storage_mode="terabox",
         terabox_ndus="t",
-        terabox_profile=None,
         download_dir=tmp_path / "downloads",
-        terabox_mount_dir=tmp_path / "mnt",
         terabox_remote_dir="/Telegram Archive",
     )
 
@@ -135,7 +132,7 @@ async def test_download_uploads_to_terabox_and_removes_local_copy(tmp_path: Path
     repository = RecordingRepository()
     settings = _terabox_settings(tmp_path)
     settings.download_dir.mkdir(parents=True, exist_ok=True)
-    uploader = FakeUploader(settings.terabox_mount_dir)
+    uploader = FakeUploader(settings.terabox_remote_root)
     downloader = MediaDownloader(settings, repository, uploader)  # type: ignore[arg-type]
     target = settings.download_dir / "42_report.pdf"
     record = type("Record", (), {"id": 1, "telegram_chat_id": 12345})()
@@ -146,7 +143,7 @@ async def test_download_uploads_to_terabox_and_removes_local_copy(tmp_path: Path
     assert uploader.uploaded == [target]
     # Local buffer removed after a verified upload.
     assert not target.exists()
-    assert result.path == settings.terabox_mount_dir / "42_report.pdf"
+    assert result.path == target
     assert repository.completed == 1
 
 
@@ -154,7 +151,7 @@ async def test_download_keeps_local_copy_when_upload_fails(tmp_path: Path) -> No
     repository = RecordingRepository()
     settings = _terabox_settings(tmp_path)
     settings.download_dir.mkdir(parents=True, exist_ok=True)
-    uploader = FakeUploader(settings.terabox_mount_dir, error="boom")
+    uploader = FakeUploader(settings.terabox_remote_root, error="boom")
     downloader = MediaDownloader(settings, repository, uploader)  # type: ignore[arg-type]
     target = settings.download_dir / "42_report.pdf"
     record = type("Record", (), {"id": 1, "telegram_chat_id": 12345})()
@@ -180,13 +177,13 @@ async def test_download_records_completion_before_removing_buffer(tmp_path: Path
             self.buffer_present_at_completion: bool | None = None
 
         async def mark_download_completed(
-            self, _message_id, _path, _size, _variant_mount_path=None
+            self, _message_id, _path, _size, _variant_local_path=None, **_kwargs
         ) -> None:
             self.buffer_present_at_completion = target.is_file()
             await super().mark_download_completed(_message_id, _path, _size)
 
     repository = OrderRepository()
-    downloader = MediaDownloader(settings, repository, FakeUploader(settings.terabox_mount_dir))  # type: ignore[arg-type]
+    downloader = MediaDownloader(settings, repository, FakeUploader(settings.terabox_remote_root))  # type: ignore[arg-type]
 
     result = await downloader.download(
         type("Record", (), {"id": 1, "telegram_chat_id": 12345})(), SuccessfulMessage(), target
@@ -208,37 +205,33 @@ async def test_publish_buffered_returns_none_in_local_mode(tmp_path: Path) -> No
 class VariantRecordingRepository(RecordingRepository):
     def __init__(self) -> None:
         super().__init__()
-        self.variant_mount_paths: list[str | None] = []
+        self.variant_remote_paths: list[str | None] = []
 
     async def mark_download_completed(
-        self, _message_id: int, _path: Path, _size: int, _variant_mount_path: str | None = None
+        self, _message_id: int, _path: Path, _size: int, _variant_local_path: str | None = None,
+        **kwargs: object,
     ) -> None:
-        self.variant_mount_paths.append(_variant_mount_path)
-        await super().mark_download_completed(_message_id, _path, _size, _variant_mount_path)
+        self.variant_remote_paths.append(kwargs.get("terabox_variant_remote_path"))
+        await super().mark_download_completed(_message_id, _path, _size, _variant_local_path, **kwargs)
 
     async def get_message_by_id(self, _message_id: int) -> object:
         return type("Record", (), {"id": 1, "telegram_chat_id": 12345})()
 
 
-async def test_publish_buffered_records_existing_mount_variant(tmp_path: Path) -> None:
-    """A re-published upload must record an H.264 variant that is already on
-    the mount (uploaded by an earlier interrupted attempt), so /variant can
-    serve it even though publish_buffered re-uploads only the original."""
+async def test_publish_buffered_does_not_infer_untracked_variant(tmp_path: Path) -> None:
+    """A re-publish only records variants uploaded in the same API operation."""
     repository = VariantRecordingRepository()
     settings = _terabox_settings(tmp_path)
     settings.download_dir.mkdir(parents=True, exist_ok=True)
-    settings.terabox_mount_dir.mkdir(parents=True, exist_ok=True)
-    uploader = FakeUploader(settings.terabox_mount_dir)
+    uploader = FakeUploader(settings.terabox_remote_root)
     downloader = MediaDownloader(settings, repository, uploader)  # type: ignore[arg-type]
     target = settings.download_dir / "42_report.pdf"
     target.write_bytes(b"complete")
-    (settings.terabox_mount_dir / "42_report.h264.mp4").write_bytes(b"variant")
-
     result = await downloader.publish_buffered(1, target)  # type: ignore[arg-type]
 
     assert result is not None and result.completed
     assert uploader.uploaded == [target]
-    assert repository.variant_mount_paths == [str(settings.terabox_mount_dir / "42_report.h264.mp4")]
+    assert repository.variant_remote_paths == [None]
 
 
 async def test_hevc_transcodes_are_bounded_separately_from_downloads(
@@ -253,7 +246,7 @@ async def test_hevc_transcodes_are_bounded_separately_from_downloads(
             "terabox_generate_posters": False,
         }
     )
-    downloader = MediaDownloader(settings, RecordingRepository(), FakeUploader(tmp_path / "mnt"))
+    downloader = MediaDownloader(settings, RecordingRepository(), FakeUploader(settings.terabox_remote_root))
     downloader._capabilities = FfmpegCapabilities(
         available=True,
         ffmpeg_bin="ffmpeg",

@@ -287,11 +287,11 @@ class MediaDownloader:
             receipt.size,
             receipt.md5,
         )
-        variant_mount_path: str | None = None
+        variant_remote_path: str | None = None
         if variant_path is not None and self.settings.terabox_store_both:
             try:
                 variant_receipt = await self.uploader.upload(variant_path, upload_callback)
-                variant_mount_path = variant_receipt.mount_path
+                variant_remote_path = variant_receipt.remote_path
                 logger.info(
                     "Uploaded H.264 variant %s to TeraBox (%s bytes, md5=%s)",
                     variant_receipt.remote_path,
@@ -300,23 +300,13 @@ class MediaDownloader:
                 )
             except Exception as exc:
                 logger.warning("Failed to upload H.264 variant: %s", exc)
-        elif self.settings.terabox_store_both:
-            # Re-publish path (publish_buffered): the H.264 variant may already
-            # sit on the mount next to the original from an earlier interrupted
-            # upload. Record it so /media/{id}/variant can serve it.
-            try:
-                sibling = receipt.mount_path.with_name(f"{receipt.mount_path.stem}.h264.mp4")
-                if await asyncio.to_thread(sibling.is_file):
-                    variant_mount_path = str(sibling)
-                    logger.info(
-                        "Recorded existing H.264 variant %s for re-published message %s",
-                        sibling,
-                        record.id,
-                    )
-            except OSError:
-                pass
         await self.repository.mark_download_completed(
-            record.id, receipt.mount_path, receipt.size, variant_mount_path
+            record.id,
+            target,
+            receipt.size,
+            None,
+            terabox_remote_path=receipt.remote_path,
+            terabox_variant_remote_path=variant_remote_path,
         )
         # Generate local thumbnail for fast gallery loading in TeraBox mode
         if self.settings.thumbnail_cache_dir:
@@ -343,7 +333,7 @@ class MediaDownloader:
                 await asyncio.to_thread(variant_path.unlink, True)
             except OSError:
                 pass
-        return DownloadResult(True, receipt.mount_path, receipt.size)
+        return DownloadResult(True, target, receipt.size)
 
     async def _generate_thumbnail(self, record: MessageSnapshot, source: Path) -> None:
         """Generate a WebP thumbnail for the downloaded media."""

@@ -28,6 +28,7 @@ from pydantic import ValidationError
 from telethon.errors import RPCError
 
 from app.application.archive_deletion import ChatArchiveDeletionService
+from app.application.archive_records import ChatArchiveDeletionTarget
 from app.application.chat_selection import ChatDiscovery, ChatSelectionService
 from app.application.dashboard import (
     GALLERY_IMAGE_MIME_TYPES,
@@ -201,29 +202,19 @@ def _resolved_media_paths(roots: tuple[Path, ...], media_path: str) -> tuple[Pat
     return roots[0], resolved
 
 
-def _mount_remote_path(mount_root: Path, path: Path) -> str | None:
-    """Translate a mount-absolute path into a TeraBox remote path, or None.
-
-    The unidisk FUSE mount exposes the drive root, so a path under the mount
-    maps 1:1 to a drive-absolute remote path (e.g. ``/Telegram Archive/...``).
-    """
-    try:
-        relative = Path(path).expanduser().resolve().relative_to(mount_root)
-    except ValueError:
-        return None
-    return str(PurePosixPath("/", *relative.parts))
-
-
 async def _completed_media(request: Request, message_id: int) -> tuple[Path, str | None]:
-    """Resolve the archived file for a completed media record.
+    """Resolve a completed local media file.
 
-    Media may live in the download directory (local mode, or the TeraBox
-    upload buffer) or under the read-only unidisk FUSE mount (TeraBox mode).
-    Returns ``(media_path, mime_type)`` or raises HTTP 404/403.
+    TeraBox records are remote objects and must use the API delivery routes.
     """
     repository: DashboardRepository = request.app.state.dashboard
     message = await repository.message(message_id)
-    if message is None or message.download_status != "completed" or not message.media_path:
+    settings = request.app.state.settings
+    if message is None or message.download_status != "completed":
+        raise HTTPException(status_code=404, detail="Completed media not found")
+    if settings.terabox_enabled and message.terabox_remote_path:
+        raise HTTPException(status_code=404, detail="Media is stored remotely")
+    if not message.media_path:
         raise HTTPException(status_code=404, detail="Completed media not found")
     roots = await asyncio.to_thread(request.app.state.settings.media_storage_roots)
     download_root, media_path = await asyncio.to_thread(
@@ -281,27 +272,24 @@ def _source_media_type(mime_type: str | None) -> str:
 
 
 def _terabox_source_candidates(
-    settings: Settings, message: MessageView, resolved: Path
+    settings: Settings, message: MessageView
 ) -> list[tuple[str, str, str]]:
     """Remote-path candidates for TeraBox playback of one archived file.
 
-    Ordered fastest-first: the H.264 variant (recorded path, then the
-    predictable sibling) and finally the original. Each entry is
-    ``(remote_path, media_label, mime_type)``. Returns an empty list when the
-    resolved file is not under the TeraBox mount (still buffered locally).
+    Ordered fastest-first: the recorded H.264 remote variant, a predictable
+    sibling for older uploads, and finally the original.
     """
-    mount_root = settings.terabox_mount_dir.expanduser().resolve()
-    remote = _mount_remote_path(mount_root, resolved)
-    if remote is None:
+    remote = message.terabox_remote_path
+    if not remote:
         return []
     candidates: list[tuple[str, str, str]] = []
     if (message.mime_type or "").casefold().startswith("video/"):
-        if message.media_variant_path:
-            variant_remote = _mount_remote_path(mount_root, message.media_variant_path)
-            if variant_remote is not None:
-                candidates.append((variant_remote, "h264", "video/mp4"))
-        sibling = _mount_remote_path(mount_root, resolved.with_name(f"{resolved.stem}.h264.mp4"))
-        if sibling is not None and not any(c[0] == sibling for c in candidates):
+        variant_remote = message.terabox_variant_remote_path
+        if variant_remote:
+            candidates.append((variant_remote, "h264", "video/mp4"))
+        remote_path = PurePosixPath(remote)
+        sibling = str(remote_path.with_name(f"{remote_path.stem}.h264.mp4"))
+        if not any(c[0] == sibling for c in candidates):
             candidates.append((sibling, "h264", "video/mp4"))
     candidates.append((remote, "original", _source_media_type(message.mime_type)))
     return candidates
@@ -351,12 +339,11 @@ async def _direct_thumb_path(
 
     Downloads the file (or just its head for videos) through the dlink API,
     runs ffmpeg, and stores the JPEG in the thumbnail cache. Returns
-    ``(thumb_path, mtime_ns, size)`` on success, or ``None`` to fall back to
-    the FUSE mount. Skips silently when the archive is local-only or the
-    media file is already reachable locally.
+    ``(thumb_path, mtime_ns, size)`` on success, or ``None`` when the API
+    object cannot be fetched.
     """
     settings: Settings = request.app.state.settings
-    if not settings.terabox_enabled or not message.media_path:
+    if not settings.terabox_enabled or not message.terabox_remote_path:
         return None
     cache_root = settings.thumbnail_cache_dir.expanduser().resolve() / str(
         message.telegram_chat_id
@@ -375,19 +362,7 @@ async def _direct_thumb_path(
     if client is None or capabilities is None or not capabilities.available:
         return None
 
-    roots = await asyncio.to_thread(settings.media_storage_roots)
-    _, resolved = await asyncio.to_thread(_resolved_media_paths, roots, message.media_path)
-    mount_root = settings.terabox_mount_dir.expanduser().resolve()
-    try:
-        relative = resolved.relative_to(mount_root)
-    except ValueError:
-        return None
-    # The FUSE mount exposes the drive root, so the mount-relative path is
-    # the drive-absolute remote path (e.g. "/Telegram Archive/..."). Do not
-    # check ``is_file`` first: FUSE attrs answer from cached listings, so a
-    # cold file still reports present and would send us back to the ~40s
-    # slow path. Missing-file errors surface as fetch failures below.
-    remote = str(PurePosixPath("/", *relative.parts))
+    remote = message.terabox_remote_path
 
     is_video = (message.mime_type or "").casefold().startswith("video/")
     started = time.monotonic()
@@ -396,7 +371,7 @@ async def _direct_thumb_path(
             dir=str(settings.thumbnail_cache_dir.expanduser().resolve()),
             prefix=f"thumb-{message.id}-",
         ) as scratch:
-            suffix = Path(message.filename or resolved.name).suffix or ".bin"
+            suffix = Path(message.filename or PurePosixPath(remote).name).suffix or ".bin"
             temp_path = Path(scratch) / f"media{suffix}"
             fetch_kwargs: dict[str, int] = {}
             if is_video:
@@ -749,11 +724,34 @@ def create_router(settings: Settings) -> APIRouter:
                 status_code=303,
             )
 
+        async def evict_media_cache(target: ChatArchiveDeletionTarget) -> None:
+            # Keep cache cleanup best-effort and independent of remote object
+            # deletion. The database target carries the deleted message IDs so
+            # cache keys remain stable even after the rows are gone.
+            message_ids = target.media_message_ids
+            video_cache = getattr(request.app.state, "video_cache", None)
+            if video_cache is not None:
+                for message_id in message_ids:
+                    await video_cache.evict_message(message_id)
+            thumbnail_dir = request.app.state.settings.thumbnail_cache_dir
+            if thumbnail_dir:
+                cache_root = thumbnail_dir.expanduser().resolve() / str(
+                    target.telegram_chat_id
+                )
+                for message_id in message_ids:
+                    await asyncio.to_thread(
+                        (cache_root / f"{message_id}.jpg").unlink, True
+                    )
+                    await asyncio.to_thread(
+                        (cache_root / f"{message_id}.poster.jpg").unlink, True
+                    )
+
         service = ChatArchiveDeletionService(request.app.state.archive)
         result = await service.delete(
             telegram_chat_id,
             request.app.state.settings.download_dir,
             remove_remote=getattr(request.app.state, "media_remote_deleter", None),
+            evict_cache=evict_media_cache,
         )
         if result is None:
             return RedirectResponse(
@@ -1107,17 +1105,17 @@ def create_router(settings: Settings) -> APIRouter:
 
     @router.api_route("/media/{message_id}", methods=["GET", "HEAD"])
     async def media_file(request: Request, message_id: int) -> Response:
-        """Serve media file with byte-range caching for TeraBox mode.
-
-        For TeraBox mode with video_cache enabled, serves from local byte-range
-        cache when available, otherwise streams from FUSE mount while caching.
-        """
+        """Serve local media or delegate remote TeraBox media to the API relay."""
         repository: DashboardRepository = request.app.state.dashboard
         message = await repository.message(message_id)
-        if message is None or message.download_status != "completed" or not message.media_path:
+        if message is None or message.download_status != "completed":
             raise HTTPException(status_code=404, detail="Completed media not found")
 
         settings = request.app.state.settings
+        if settings.terabox_enabled and message.terabox_remote_path:
+            return await media_stream_proxy(request, message_id)
+        if not message.media_path:
+            raise HTTPException(status_code=404, detail="Completed media not found")
         roots = await asyncio.to_thread(settings.media_storage_roots)
         download_root, media_path = await asyncio.to_thread(
             _resolved_media_paths, roots, message.media_path
@@ -1150,16 +1148,15 @@ def create_router(settings: Settings) -> APIRouter:
         # Check if video cache is enabled and this is a video
         is_video = mime_type and mime_type.casefold().startswith("video/")
         video_cache = getattr(request.app.state, "video_cache", None)
-        cache_enabled = is_video and video_cache is not None and settings.video_cache_dir
+        cache_enabled = (
+            settings.terabox_enabled
+            and is_video
+            and video_cache is not None
+            and settings.video_cache_dir
+        )
 
-        async def stream_from_cache_or_fuse() -> AsyncGenerator[bytes, None]:
-            """Stream bytes from cache or FUSE, caching as we go.
-
-            The file handle stays open for the whole request and reads use
-            1 MiB blocks: the previous per-64KiB open/seek/read/close pattern
-            round-trips the network FUSE mount tens of thousands of times on a
-            multi-GB video and stalls playback.
-            """
+        async def stream_from_cache_or_file() -> AsyncGenerator[bytes, None]:
+            """Stream bytes from the local file, caching video ranges."""
             read_size = 1024 * 1024
 
             def _open_file() -> BinaryIO:
@@ -1172,7 +1169,7 @@ def create_router(settings: Settings) -> APIRouter:
                 handle.seek(offset)
 
             if not cache_enabled:
-                # No cache - stream directly from FUSE
+                # No cache - stream directly from the local archive.
                 remaining = content_length
                 current_pos = start
                 handle = await asyncio.to_thread(_open_file)
@@ -1198,7 +1195,7 @@ def create_router(settings: Settings) -> APIRouter:
                 yield cached
                 return
 
-            # Not fully cached - stream from FUSE while caching
+            # Not fully cached - stream from the local archive while caching.
             remaining = content_length
             current_pos = start
             handle = await asyncio.to_thread(_open_file)
@@ -1231,24 +1228,26 @@ def create_router(settings: Settings) -> APIRouter:
             status_code = 200
 
         return StreamingResponse(
-            stream_from_cache_or_fuse(),
+            stream_from_cache_or_file(),
             status_code=status_code,
             media_type=mime_type,
             headers=headers,
         )
 
     @router.api_route("/media/{message_id}/variant", methods=["GET", "HEAD"])
-    async def media_variant(request: Request, message_id: int) -> FileResponse:
+    async def media_variant(request: Request, message_id: int) -> Response:
         """Serve the playable H.264 variant of a video.
 
-        In TeraBox mode with HEVC transcoding, the variant is stored at a
-        predictable path alongside the original. In local mode, the transcode
-        manager handles on-demand transcoding.
+        TeraBox variants are remote objects and use the same API relay as the
+        original. Local mode continues to use the transcode manager.
         """
         repository: DashboardRepository = request.app.state.dashboard
         message = await repository.message(message_id)
         if message is None or message.download_status != "completed":
             raise HTTPException(status_code=404, detail="Completed media not found")
+
+        if request.app.state.settings.terabox_enabled and message.terabox_remote_path:
+            return await media_stream_proxy(request, message_id)
 
         roots = await asyncio.to_thread(request.app.state.settings.media_storage_roots)
 
@@ -1267,22 +1266,8 @@ def create_router(settings: Settings) -> APIRouter:
                     content_disposition_type="inline",
                 )
 
-        # Fallback: the H.264 variant lives at a predictable path alongside the
-        # original. A re-published upload (e.g. after an interrupted sync) may
-        # leave media_variant_path unset even though the variant is on the
-        # mount, so probe for it in TeraBox mode.
         media_path, _ = await _completed_media(request, message_id)
-        if request.app.state.settings.terabox_enabled:
-            sibling = media_path.with_name(f"{media_path.stem}.h264.mp4")
-            if await asyncio.to_thread(sibling.is_file):
-                return FileResponse(
-                    sibling,
-                    media_type="video/mp4",
-                    filename=sibling.name,
-                    content_disposition_type="inline",
-                )
-
-        # Fallback: use transcode manager for local mode (on-demand transcode)
+        # Local mode: use the transcode manager for on-demand transcoding.
         service: MediaVariantService = request.app.state.media_variants
         playable = await service.playable_path(media_path)
         if playable is None or playable == media_path:
@@ -1308,20 +1293,25 @@ def create_router(settings: Settings) -> APIRouter:
         """
         repository: DashboardRepository = request.app.state.dashboard
         message = await repository.message(message_id)
-        if message is None or message.download_status != "completed" or not message.media_path:
+        if (
+            message is None
+            or message.download_status != "completed"
+            or not (message.media_path or message.terabox_remote_path)
+        ):
             raise HTTPException(status_code=404, detail="Completed media not found")
 
         settings: Settings = request.app.state.settings
         client: TeraBoxClient | None = getattr(request.app.state, "terabox_client", None)
-        proxy_url = f"/media/{message_id}/variant" if message.media_variant_path else f"/media/{message_id}"
+        has_variant = bool(
+            message.media_variant_path or message.terabox_variant_remote_path
+        )
+        proxy_url = f"/media/{message_id}/variant" if has_variant else f"/media/{message_id}"
         if client is None or not settings.terabox_enabled:
             return {"source": "proxy", "url": proxy_url}
 
-        roots = await asyncio.to_thread(settings.media_storage_roots)
-        _, resolved = await asyncio.to_thread(_resolved_media_paths, roots, message.media_path)
-        candidates = _terabox_source_candidates(settings, message, resolved)
+        candidates = _terabox_source_candidates(settings, message)
         if not candidates:
-            # Still buffered locally (or outside the mount) — proxy it.
+            # The record is local-only or has not completed its remote upload.
             return {"source": "proxy", "url": proxy_url}
 
         for candidate_remote, media, mime in candidates:
@@ -1364,7 +1354,11 @@ def create_router(settings: Settings) -> APIRouter:
         """
         repository: DashboardRepository = request.app.state.dashboard
         message = await repository.message(message_id)
-        if message is None or message.download_status != "completed" or not message.media_path:
+        if (
+            message is None
+            or message.download_status != "completed"
+            or not message.terabox_remote_path
+        ):
             raise HTTPException(status_code=404, detail="Completed media not found")
 
         settings: Settings = request.app.state.settings
@@ -1372,15 +1366,13 @@ def create_router(settings: Settings) -> APIRouter:
         if client is None or not settings.terabox_enabled:
             raise HTTPException(status_code=404, detail="TeraBox streaming is not available")
 
-        roots = await asyncio.to_thread(settings.media_storage_roots)
-        _, resolved = await asyncio.to_thread(_resolved_media_paths, roots, message.media_path)
-        candidates = _terabox_source_candidates(settings, message, resolved)
+        candidates = _terabox_source_candidates(settings, message)
         if not candidates:
             raise HTTPException(status_code=404, detail="Media is not on the TeraBox drive")
 
         is_head = request.method == "HEAD"
         range_header = request.headers.get("range")
-        filename = message.filename or resolved.name
+        filename = message.filename or PurePosixPath(message.terabox_remote_path).name
         video_cache = getattr(request.app.state, "video_cache", None)
         prefetcher = getattr(request.app.state, "terabox_prefetcher", None)
         relay_response: tuple[Any, int] | None = None
@@ -1388,6 +1380,7 @@ def create_router(settings: Settings) -> APIRouter:
         rng: tuple[int, int] | None = None
         mime_type = ""
         file_size = 0
+        cache_enabled = False
 
         for candidate_remote, _media, mime in candidates:
             try:
@@ -1398,6 +1391,7 @@ def create_router(settings: Settings) -> APIRouter:
                 continue
             file_size = int(entry.get("size", 0))
             mime_type = mime
+            cache_enabled = mime_type.casefold().startswith("video/") and video_cache is not None
             parsed = _parse_single_byte_range(range_header, file_size)
             if parsed is False:
                 return Response(
@@ -1407,7 +1401,7 @@ def create_router(settings: Settings) -> APIRouter:
             rng = parsed
             if is_head:
                 break
-            if video_cache is not None and rng is not None:
+            if cache_enabled and rng is not None:
                 cached_body = await video_cache.get_range(message_id, rng[0], rng[1])
                 if cached_body is not None:
                     break
@@ -1430,7 +1424,7 @@ def create_router(settings: Settings) -> APIRouter:
         # the bandwidth-capped CDN while the user watches, so cached ranges
         # (re-watches, seeks, the rest of the file over time) serve at disk
         # speed instead of the ~25 KB/s TeraBox cap.
-        if prefetcher is not None and mime_type.casefold().startswith("video/"):
+        if prefetcher is not None and cache_enabled:
             prefetcher.ensure(message_id, candidate_remote, file_size)
 
         headers = {
@@ -1465,7 +1459,7 @@ def create_router(settings: Settings) -> APIRouter:
             written = rng[0] if rng else 0
             try:
                 async for chunk in response.aiter_bytes(256 * 1024):
-                    if video_cache is not None:
+                    if cache_enabled:
                         await video_cache.store_range(message_id, written, chunk)
                     written += len(chunk)
                     yield chunk
@@ -1481,22 +1475,56 @@ def create_router(settings: Settings) -> APIRouter:
 
     @router.get("/media/{message_id}/variant-status")
     async def media_variant_status(request: Request, message_id: int) -> dict[str, object]:
-        media_path, _ = await _completed_media(request, message_id)
-        if request.app.state.settings.terabox_enabled:
-            sibling = media_path.with_name(f"{media_path.stem}.h264.mp4")
-            available = await asyncio.to_thread(sibling.is_file)
+        repository: DashboardRepository = request.app.state.dashboard
+        message = await repository.message(message_id)
+        if message is None or message.download_status != "completed":
+            raise HTTPException(status_code=404, detail="Completed media not found")
+        if request.app.state.settings.terabox_enabled and message.terabox_remote_path:
+            client: TeraBoxClient | None = getattr(request.app.state, "terabox_client", None)
+            available = False
+            if client is not None:
+                for remote, label, _mime in _terabox_source_candidates(
+                    request.app.state.settings, message
+                ):
+                    if label != "h264":
+                        continue
+                    try:
+                        available = await client.file_meta(remote) is not None
+                    except TeraBoxError:
+                        available = False
+                    if available:
+                        break
             return VariantStatus(
                 enabled=available,
                 ready=True,
                 transcoding=False,
                 codec="h264" if available else None,
             ).as_dict()
+        media_path, _ = await _completed_media(request, message_id)
         service: MediaVariantService = request.app.state.media_variants
         return service.status(media_path).as_dict()
 
     @router.get("/media/{message_id}/poster")
     async def media_poster(request: Request, message_id: int) -> FileResponse:
         """Serve a cached JPEG poster frame for a video."""
+        repository: DashboardRepository = request.app.state.dashboard
+        message = await repository.message(message_id)
+        if message is None or message.download_status != "completed":
+            raise HTTPException(status_code=404, detail="Completed media not found")
+        if request.app.state.settings.terabox_enabled and message.terabox_remote_path:
+            direct = await _direct_thumb_path(request, message, poster=True)
+            if direct is None:
+                raise HTTPException(status_code=404, detail="Poster not available")
+            poster, mtime_ns, size = direct
+            return FileResponse(
+                poster,
+                media_type="image/jpeg",
+                content_disposition_type="inline",
+                headers={
+                    "Cache-Control": "public, max-age=31536000, immutable",
+                    "ETag": f'W/"{mtime_ns}-{size}"',
+                },
+            )
         media_path, mime_type = await _completed_media(request, message_id)
         if mime_type and not mime_type.casefold().startswith("video/"):
             raise HTTPException(status_code=404, detail="Poster not available")
@@ -1516,8 +1544,8 @@ def create_router(settings: Settings) -> APIRouter:
     ) -> FileResponse:
         """Serve a local WebP thumbnail or poster for fast gallery loading.
 
-        In TeraBox mode, thumbnails/posters are generated at download time and cached
-        locally. If missing, fall back to the full media file from the FUSE mount.
+        In TeraBox mode, thumbnails/posters are generated at download time and
+        cached locally. A cache miss is filled through the TeraBox API.
         """
         repository: DashboardRepository = request.app.state.dashboard
         message = await repository.message(message_id)
@@ -1545,9 +1573,8 @@ def create_router(settings: Settings) -> APIRouter:
                     },
                 )
 
-        # Direct-fetch fallback: pull the media from TeraBox straight via the
-        # CDN, generate the thumbnail, and serve the newly cached JPEG. Cheaper
-        # than reading the cold file through the FUSE mount for thumbnails.
+        # Direct-fetch fallback: pull the media from TeraBox via the API/CDN,
+        # generate the thumbnail, and serve the newly cached JPEG.
         direct = await _direct_thumb_path(request, message, poster=poster)
         if direct is not None:
             thumb_path, mtime_ns, size = direct
@@ -1561,7 +1588,10 @@ def create_router(settings: Settings) -> APIRouter:
                 },
             )
 
-        # Fallback: serve from FUSE mount (full image/video)
+        if settings.terabox_enabled and message.terabox_remote_path:
+            raise HTTPException(status_code=404, detail="Thumbnail unavailable")
+
+        # Local mode fallback: serve the completed file.
         media_path, mime_type = await _completed_media(request, message_id)
         return FileResponse(
             media_path,
@@ -1682,6 +1712,8 @@ def create_router(settings: Settings) -> APIRouter:
                     "media_size",
                     "download_status",
                     "media_path",
+                    "terabox_remote_path",
+                    "terabox_variant_remote_path",
                 )
             )
             yield buffer.getvalue()
@@ -1710,6 +1742,8 @@ def create_router(settings: Settings) -> APIRouter:
                                 message.media_size,
                                 message.download_status,
                                 message.media_path,
+                                message.terabox_remote_path,
+                                message.terabox_variant_remote_path,
                             )
                         )
                     )

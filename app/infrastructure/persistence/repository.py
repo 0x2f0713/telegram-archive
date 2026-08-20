@@ -31,6 +31,8 @@ def _snapshot(message: Message) -> MessageSnapshot:
         media_size=message.media_size,
         download_status=message.download_status,
         download_attempts=message.download_attempts,
+        terabox_remote_path=message.terabox_remote_path,
+        terabox_variant_remote_path=message.terabox_variant_remote_path,
     )
 
 
@@ -124,6 +126,44 @@ class ArchiveRepository:
                 )
                 if path
             )
+            remote_paths = tuple(
+                path
+                for path in await session.scalars(
+                    select(Message.terabox_remote_path)
+                    .where(
+                        Message.telegram_chat_id == telegram_chat_id,
+                        Message.terabox_remote_path.is_not(None),
+                    )
+                    .distinct()
+                )
+                if path
+            )
+            remote_variant_paths = tuple(
+                path
+                for path in await session.scalars(
+                    select(Message.terabox_variant_remote_path)
+                    .where(
+                        Message.telegram_chat_id == telegram_chat_id,
+                        Message.terabox_variant_remote_path.is_not(None),
+                    )
+                    .distinct()
+                )
+                if path
+            )
+            remote_paths = tuple(dict.fromkeys((*remote_paths, *remote_variant_paths)))
+            media_message_ids = tuple(
+                message_id
+                for message_id in await session.scalars(
+                    select(Message.id).where(
+                        Message.telegram_chat_id == telegram_chat_id,
+                        or_(
+                            Message.media_path.is_not(None),
+                            Message.terabox_remote_path.is_not(None),
+                            Message.terabox_variant_remote_path.is_not(None),
+                        ),
+                    )
+                )
+            )
             shared_paths: set[str] = set()
             for offset in range(0, len(recorded_paths), 500):
                 chunk = recorded_paths[offset : offset + 500]
@@ -139,6 +179,33 @@ class ArchiveRepository:
                     )
                     if path
                 )
+            shared_remote_paths: set[str] = set()
+            for offset in range(0, len(remote_paths), 500):
+                chunk = remote_paths[offset : offset + 500]
+                shared_remote_paths.update(
+                    path
+                    for path in await session.scalars(
+                        select(Message.terabox_remote_path)
+                        .where(
+                            Message.telegram_chat_id != telegram_chat_id,
+                            Message.terabox_remote_path.in_(chunk),
+                        )
+                        .distinct()
+                    )
+                    if path
+                )
+                shared_remote_paths.update(
+                    path
+                    for path in await session.scalars(
+                        select(Message.terabox_variant_remote_path)
+                        .where(
+                            Message.telegram_chat_id != telegram_chat_id,
+                            Message.terabox_variant_remote_path.in_(chunk),
+                        )
+                        .distinct()
+                    )
+                    if path
+                )
             await session.execute(
                 delete(Message).where(Message.telegram_chat_id == telegram_chat_id)
             )
@@ -147,6 +214,10 @@ class ArchiveRepository:
                 title=chat.title,
                 message_count=message_count,
                 media_paths=tuple(path for path in recorded_paths if path not in shared_paths),
+                terabox_remote_paths=tuple(
+                    path for path in remote_paths if path not in shared_remote_paths
+                ),
+                media_message_ids=media_message_ids,
             )
 
     async def advance_checkpoint(self, telegram_chat_id: int, message_id: int) -> None:
@@ -308,18 +379,25 @@ class ArchiveRepository:
         message_id: int,
         media_path: Path,
         media_size: int,
-        variant_mount_path: str | None = None,
+        variant_local_path: str | None = None,
+        *,
+        terabox_remote_path: str | None = None,
+        terabox_variant_remote_path: str | None = None,
     ) -> None:
         async with self.database.transaction() as session:
             values = {
                 "download_status": DownloadState.COMPLETED.value,
                 "download_error": None,
-                "media_path": str(media_path),
+                "media_path": None if terabox_remote_path is not None else str(media_path),
                 "media_size": media_size,
                 "updated_at": utc_now(),
             }
-            if variant_mount_path is not None:
-                values["media_variant_path"] = variant_mount_path
+            if variant_local_path is not None:
+                values["media_variant_path"] = variant_local_path
+            if terabox_remote_path is not None:
+                values["media_variant_path"] = None
+                values["terabox_remote_path"] = terabox_remote_path
+                values["terabox_variant_remote_path"] = terabox_variant_remote_path
             await session.execute(update(Message).where(Message.id == message_id).values(values))
 
     async def mark_download_skipped(self, message_id: int, reason: str) -> None:
@@ -384,6 +462,8 @@ class ArchiveRepository:
                             Message.media_path,
                             Message.download_status,
                             Message.media_type,
+                            Message.terabox_remote_path,
+                            Message.terabox_variant_remote_path,
                         )
                         .where(
                             Message.id > last_id,

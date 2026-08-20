@@ -152,6 +152,14 @@ class ArchiveService:
             completed_path = recorded_path if recorded_exists else None
 
             if self.settings.terabox_enabled:
+                if record.download_status == DownloadState.COMPLETED.value and record.terabox_remote_path:
+                    logger.info(
+                        "[SKIP] [%s] Message %s media already archived at %s",
+                        chat.title,
+                        data.telegram_message_id,
+                        record.terabox_remote_path,
+                    )
+                    return ProcessResult(created, False, True)
                 # A buffer file in DOWNLOAD_DIR means the bytes are local but
                 # possibly never uploaded (crash between download and upload,
                 # or a failed unlink after a completed upload). Publish it;
@@ -303,9 +311,14 @@ class ArchiveService:
                 chat_title = chat.title if chat is not None else None
                 if (
                     candidate.download_status == DownloadState.COMPLETED.value
-                    and candidate.media_path
+                    and (
+                        candidate.media_path
+                        or candidate.terabox_remote_path
+                    )
                 ):
-                    if await asyncio.to_thread(Path(candidate.media_path).is_file):
+                    if candidate.terabox_remote_path or await asyncio.to_thread(
+                        Path(candidate.media_path).is_file  # type: ignore[arg-type]
+                    ):
                         skipped += 1
                         if progress:
                             await progress(

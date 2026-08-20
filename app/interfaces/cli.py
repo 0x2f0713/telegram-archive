@@ -98,7 +98,7 @@ def _terabox_uploader(settings: Settings) -> TeraBoxUploader | None:
 
 
 async def _terabox_doctor_checks(settings: Settings) -> tuple[list[tuple[str, str, str]], bool]:
-    """Validate ndus auth, remote archive folder, and the read-only mount."""
+    """Validate ndus auth, remote archive folder, and quota."""
 
     checks: list[tuple[str, str, str]] = []
     failed = False
@@ -121,24 +121,13 @@ async def _terabox_doctor_checks(settings: Settings) -> tuple[list[tuple[str, st
     finally:
         if client is not None:
             await client.aclose()
-    if settings.terabox_mount_dir.expanduser().is_dir():
-        checks.append(("TeraBox mount", "PASS", str(settings.terabox_mount_dir)))
-    else:
-        failed = True
-        checks.append(
-            (
-                "TeraBox mount",
-                "FAIL",
-                f"{settings.terabox_mount_dir} is missing; start the unidisk mount first",
-            )
-        )
     return checks, failed
 
 
 async def _effective_web_settings(settings: Settings) -> Settings:
     """Resolve the web log level before handing control to Uvicorn."""
     database = Database(settings.database_url)
-    await database.initialize()
+    await database.initialize(legacy_terabox_root=settings.terabox_remote_root)
     try:
         return await _effective_settings(settings, database)
     finally:

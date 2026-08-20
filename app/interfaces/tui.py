@@ -335,7 +335,7 @@ class ArchiveTui(App[None]):
 
     async def on_mount(self) -> None:
         self.database = Database(self.settings.database_url)
-        await self.database.initialize()
+        await self.database.initialize(legacy_terabox_root=self.settings.terabox_remote_root)
         self.settings = await _effective_settings(self.settings, self.database)
         self.dashboard = DashboardRepository(self.database)
         self.archive = ArchiveRepository(self.database)

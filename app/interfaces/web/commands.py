@@ -614,15 +614,6 @@ class OperationCommands:
                 await context.log(f"FAIL · TeraBox: {type(exc).__name__}: {exc}", "ERROR")
             finally:
                 await terabox_client.aclose()
-            mount_dir = self.settings.terabox_mount_dir.expanduser()
-            if await asyncio.to_thread(mount_dir.is_dir):
-                await context.log(f"PASS · TeraBox mount is present at {mount_dir}")
-            else:
-                failed = True
-                await context.log(
-                    f"FAIL · TeraBox mount is missing at {mount_dir}; start unidisk first",
-                    "ERROR",
-                )
             await context.progress(
                 progress_current=current_check,
                 detail="Validated TeraBox storage",

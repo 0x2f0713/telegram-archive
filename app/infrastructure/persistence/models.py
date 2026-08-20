@@ -116,6 +116,9 @@ class Message(Base):
     media_type: Mapped[str | None] = mapped_column(String(32))
     media_path: Mapped[str | None] = mapped_column(Text)
     media_variant_path: Mapped[str | None] = mapped_column(Text)
+    #: Canonical remote object identifiers used by the pure TeraBox API path.
+    terabox_remote_path: Mapped[str | None] = mapped_column(Text)
+    terabox_variant_remote_path: Mapped[str | None] = mapped_column(Text)
     media_size: Mapped[int | None] = mapped_column(BigInteger)
     telegram_document_id: Mapped[int | None] = mapped_column(BigInteger)
     mime_type: Mapped[str | None] = mapped_column(String(255))

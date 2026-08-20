@@ -277,22 +277,28 @@ async def test_variant_routes_degrade_when_feature_disabled(tmp_path: Path) -> N
 
 async def test_terabox_variant_served_from_predictable_sibling_without_db_path(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Rows completed via the re-publish path have no media_variant_path, but
-    the H.264 variant sits at a predictable sibling path on the mount. The
-    variant route must serve it and the status route must report it ready."""
+    """Rows without a recorded variant still probe the predictable API sibling."""
     settings = _settings(
         tmp_path,
         storage_mode="terabox",
         terabox_ndus="t",
-        terabox_profile=None,
-        terabox_mount_dir=tmp_path / "mnt",
         terabox_remote_dir="/Telegram Archive",
     )
-    message_id = await _seed_video(settings)
-    media_path = settings.download_dir / "video" / "clip.mp4"
-    sibling = media_path.with_name(f"{media_path.stem}.h264.mp4")
-    sibling.write_bytes(b"cached h264 variant")
+    fake = FakeTeraboxStreamClient(
+        {
+            "/Telegram Archive/clip.h264.mp4": (
+                "https://kul-ddata.terabox.com/file?fid=2",
+                19,
+                False,
+            )
+        },
+        body=b"cached h264 variant",
+        sizes={"/Telegram Archive/clip.h264.mp4": 19},
+    )
+    monkeypatch.setattr("app.interfaces.web.app.create_terabox_client", lambda _s: fake)
+    message_id = await _seed_mount_video(settings)
     application = create_web_app(settings)
 
     async with application.router.lifespan_context(application):
@@ -317,8 +323,6 @@ async def test_terabox_variant_status_reports_disabled_without_sibling(
         tmp_path,
         storage_mode="terabox",
         terabox_ndus="t",
-        terabox_profile=None,
-        terabox_mount_dir=tmp_path / "mnt",
         terabox_remote_dir="/Telegram Archive",
     )
     message_id = await _seed_video(settings)
@@ -439,14 +443,15 @@ async def _seed_mount_video(
             telegram_message_id=42,
         )
     )
-    mount_dir = settings.terabox_mount_dir / "Telegram Archive"
-    media_path = mount_dir / "clip.mp4"
-    media_path.parent.mkdir(parents=True, exist_ok=True)
-    media_path.write_bytes(b"remote video")
+    remote_path = "/Telegram Archive/clip.mp4"
     if completed:
-        variant_path = str(mount_dir / "clip.h264.mp4") if variant else None
+        variant_path = f"{remote_path[:-4]}.h264.mp4" if variant else None
         await archive.mark_download_completed(
-            record.id, media_path, media_path.stat().st_size, variant_mount_path=variant_path
+            record.id,
+            settings.download_dir / "buffer" / "clip.mp4",
+            12,
+            terabox_remote_path=remote_path,
+            terabox_variant_remote_path=variant_path,
         )
     await database.close()
     return record.id
@@ -457,8 +462,6 @@ def _terabox_settings(tmp_path: Path) -> Settings:
         tmp_path,
         storage_mode="terabox",
         terabox_ndus="t",
-        terabox_profile=None,
-        terabox_mount_dir=tmp_path / "mnt",
         terabox_remote_dir="/Telegram Archive",
         video_cache_dir=tmp_path / "vc",
     )
@@ -1408,15 +1411,13 @@ async def test_gallery_and_player_templates_guard_variant_artifacts(
 
 
 async def test_terabox_templates_always_offer_variant_url(tmp_path: Path) -> None:
-    """In TeraBox mode the H.264 variant may exist on the mount even when
+    """In TeraBox mode the H.264 variant may exist remotely even when
     media_variants is disabled and media_variant_path is unset (re-published
     rows), so templates must always attach the variant URLs for videos."""
     settings = _settings(
         tmp_path,
         storage_mode="terabox",
         terabox_ndus="t",
-        terabox_profile=None,
-        terabox_mount_dir=tmp_path / "mnt",
         terabox_remote_dir="/Telegram Archive",
     )
     message_id = await _seed_video(settings)

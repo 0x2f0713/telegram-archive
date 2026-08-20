@@ -22,6 +22,8 @@ class MessageSnapshot:
     media_size: int | None
     download_status: str
     download_attempts: int
+    terabox_remote_path: str | None = None
+    terabox_variant_remote_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +34,8 @@ class RetryCandidate:
     media_path: str | None
     download_status: str
     media_type: str | None
+    terabox_remote_path: str | None = None
+    terabox_variant_remote_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +62,8 @@ class ChatArchiveDeletionTarget:
     title: str
     message_count: int
     media_paths: tuple[str, ...]
+    terabox_remote_paths: tuple[str, ...] = ()
+    media_message_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

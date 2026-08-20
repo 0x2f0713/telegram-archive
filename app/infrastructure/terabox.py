@@ -1,7 +1,7 @@
-"""TeraBox Web API client used to publish archived media to a TeraBox drive.
+"""Pure TeraBox Web API client used to publish and serve archived media.
 
-The unidisk FUSE mount exposing the drive is read-only, so uploads use the
-same Web API protocol as the ``terabox-api`` library bundled with unidisk:
+Uploads and reads use the TeraBox Web API directly. Local files are only
+temporary buffers or disposable application caches:
 
 1. Hash the local file (full MD5, first-slice MD5, CRC32, per-chunk MD5s).
 2. Attempt a server-side ``rapidupload`` dedupe for files >= 256 KB.
@@ -10,8 +10,6 @@ same Web API protocol as the ``terabox-api`` library bundled with unidisk:
    final entry with the chunk MD5 list.
 4. Verify the returned etag and the remote size.
 
-Reads stay on the FUSE mount (``terabox_mount_dir``), which caches blocks on
-the local hard drive, so the web dashboard can stream archived media back.
 """
 
 from __future__ import annotations
@@ -97,7 +95,6 @@ class UploadReceipt:
     """Result of a verified upload: where the bytes live once published."""
 
     remote_path: str
-    mount_path: Path
     size: int
     md5: str
 
@@ -198,7 +195,7 @@ def sign_download(secret: str, payload: str) -> str:
     """RC4-style signature for the ``/api/download`` dlink request.
 
     Mirrors ``getHomeInfo()`` → ``SignDownload(sign3, sign1)`` from the
-    terabox-api library bundled with unidisk: key-schedule the permutation
+    TeraBox Web API: key-schedule the permutation
     with ``secret`` (sign3), then XOR ``payload`` (sign1) with the keystream
     and base64-encode the result.
     """
@@ -327,15 +324,6 @@ class TeraBoxClient:
     def remote_root(self) -> str:
         return sanitize_remote_path(self._settings.terabox_remote_root)
 
-    @property
-    def mount_dir(self) -> Path:
-        return self._settings.terabox_mount_dir
-
-    def mount_path(self, remote_path: str) -> Path:
-        """Local FUSE path where the upload is readable once published."""
-
-        return self.mount_dir / PurePosixPath(remote_path).relative_to("/")
-
     def remote_path(self, media_path: Path) -> str:
         base = self._settings.download_dir.expanduser().resolve()
         target = Path(media_path).expanduser().resolve()
@@ -367,8 +355,7 @@ class TeraBoxClient:
                 location = response.headers.get("location", "")
                 if not location or location.rstrip("/").endswith("login"):
                     raise TeraBoxAuthError(
-                        "TeraBox rejected the ndus cookie; refresh it from the browser "
-                        "or unidisk profile"
+                        "TeraBox rejected the ndus cookie; refresh it from the browser"
                     )
                 target = urlparse(location)
                 origin = f"{target.scheme}://{target.netloc}"
@@ -852,12 +839,12 @@ class TeraBoxClient:
         expected_size: int | None = None,
         limit_bytes: int | None = None,
     ) -> Path:
-        """Download one remote file straight from the CDN, bypassing the FUSE mount.
+        """Download one remote file straight from the TeraBox CDN.
 
         Uses the TeraBox dlink API with resume support; the result is written
-        atomically to ``dest``. Faster than reading through the FUSE mount for
+        atomically to ``dest``. Faster than reopening the remote object for
         cold files because a single sequential stream keeps the CDN's request
-        rate low and avoids the mount's 1 MB block fan-out. ``limit_bytes``
+        rate low and avoids unnecessary request fan-out. ``limit_bytes``
         fetches only the head of the file (enough for ffmpeg to extract a
         video poster) and keeps the suffix so codecs are still sniffed.
         """
@@ -1380,34 +1367,13 @@ class TeraBoxClient:
 
 
 class TeraBoxMediaDeleter:
-    """Deleter adapter for chat-archive deletion of files served from the mount.
-
-    Translates a mount path back into a TeraBox remote path and removes it.
-    Returns True when the remote entry no longer exists afterwards.
-    """
+    """Deleter adapter for chat-archive deletion of remote TeraBox objects."""
 
     def __init__(self, settings: Settings, client: TeraBoxClient) -> None:
         self.settings = settings
         self.client = client
 
-    @staticmethod
-    def _to_remote_path(mount_root: Path, target: Path, root: str) -> str | None:
-        try:
-            relative = target.relative_to(mount_root)
-        except ValueError:
-            return None
-        return str(PurePosixPath(root, *relative.parts))
-
-    async def __call__(self, mount_path: Path) -> bool:
-        mount_root = self.settings.terabox_mount_dir.expanduser().resolve()
-        remote_path = await asyncio.to_thread(
-            self._to_remote_path,
-            mount_root,
-            Path(mount_path),
-            self.client.remote_root,
-        )
-        if remote_path is None:
-            return False
+    async def __call__(self, remote_path: str) -> bool:
         return await self.client.delete(remote_path)
 
 
@@ -1424,7 +1390,7 @@ class TeraBoxUploader:
 
     Translates the buffered download path into a remote path under the
     configured archive folder, uploads with retries, and hands back a receipt
-    pointing at the read-only FUSE mount path used for serving.
+    pointing at the canonical remote object.
     """
 
     RETRIES = 3
@@ -1440,7 +1406,6 @@ class TeraBoxUploader:
         hashes = await self._upload_with_retries(target, remote_path, progress)
         return UploadReceipt(
             remote_path=remote_path,
-            mount_path=self.client.mount_path(remote_path),
             size=hashes.size,
             md5=hashes.file_md5,
         )

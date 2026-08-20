@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from functools import cached_property
 from pathlib import Path
@@ -90,19 +89,13 @@ class Settings(BaseSettings):
     #: Archive storage mode. ``local`` keeps media on the hard drive (the
     #: historical behavior). ``terabox`` uses the hard drive as a temporary
     #: download buffer, uploads each finalized file to TeraBox, verifies the
-    #: upload, then removes the local copy; archived bytes are then served
-    #: through the read-only unidisk FUSE mount.
+    #: upload, then removes the local copy; archived bytes are served through
+    #: the TeraBox Web API and disposable local caches.
     storage_mode: Literal["local", "terabox"] = "local"
 
-    #: TeraBox session cookie token (the ``ndus`` value from the browser or
-    #: the unidisk profile). Required when ``storage_mode`` is ``terabox``.
+    #: TeraBox session cookie token (the ``ndus`` value from the browser).
+    #: Required when ``storage_mode`` is ``terabox``.
     terabox_ndus: SecretStr | None = None
-    #: Path to a unidisk ``terabox.profile.json`` whose ``ndus`` key is used
-    #: when ``terabox_ndus`` is not set directly.
-    terabox_profile: Path | None = Path("/mnt/data/workspace/terabox-drive/terabox.profile.json")
-    #: Read-only root where the unidisk FUSE mount exposes the TeraBox drive.
-    #: Archived media is served from here when not present in the local buffer.
-    terabox_mount_dir: Path = Path("/mnt/data/workspace/terabox-drive/mnt/terabox")
     #: Remote base folder for the archive inside the TeraBox drive.
     terabox_remote_dir: str = "/Telegram Archive"
     #: Chunk size (bytes) for TeraBox superfile2 uploads. 4 MiB is the
@@ -163,8 +156,8 @@ class Settings(BaseSettings):
     #: JPEG poster thumbnails in galleries and players.
     media_variants: bool = True
 
-    #: Local directory for cached WebP thumbnails (used in TeraBox mode to
-    #: serve gallery thumbnails without hitting the FUSE mount).
+    #: Local directory for cached thumbnails (used in TeraBox mode to avoid
+    #: repeating API downloads).
     thumbnail_cache_dir: Path = Path("data/thumbnails")
     #: Maximum pixel dimension (width or height) for generated thumbnails.
     thumbnail_max_dimension: int = Field(default=320, ge=64, le=1280)
@@ -222,20 +215,9 @@ class Settings(BaseSettings):
             ndus = self.terabox_ndus.get_secret_value().strip()
             if ndus:
                 return ndus
-        if self.terabox_profile:
-            profile_path = self.terabox_profile.expanduser()
-            if profile_path.is_file():
-                try:
-                    profile = json.loads(profile_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError) as exc:
-                    raise ConfigurationError(
-                        f"TERABOX_PROFILE is not readable JSON: {profile_path}"
-                    ) from exc
-                if isinstance(profile, dict) and profile.get("ndus"):
-                    return str(profile["ndus"]).strip()
         raise ConfigurationError(
             "TERABOX_NDUS is required when STORAGE_MODE=terabox. Set the ndus cookie "
-            "value directly, or point TERABOX_PROFILE at a unidisk profile JSON."
+            "value directly from an authenticated TeraBox browser session."
         )
 
     @cached_property
@@ -248,18 +230,14 @@ class Settings(BaseSettings):
     def media_storage_roots(self) -> tuple[Path, ...]:
         """Roots where archived media bytes may live, in serving preference order."""
 
-        roots = [self.download_dir]
-        if self.terabox_enabled:
-            roots.append(self.terabox_mount_dir)
-        return tuple(root.expanduser().resolve() for root in roots)
+        return (self.download_dir.expanduser().resolve(),)
 
     def with_terabox_policy(self) -> Settings:
         """Apply TeraBox mode constraints on top of resolved settings.
 
         Remote-only archives keep pristine originals: HEVC variants would rewrite
-        or multiply uploads and cannot be cached usefully on the read-only mount.
-        Faststart remuxing IS enabled (moov atom at start for instant playback).
-        Poster generation is handled via local thumbnail cache (not uploaded).
+        or multiply uploads and are not required for the API-backed cache.
+        Faststart remuxing is enabled and poster generation uses the local cache.
         """
         if not self.terabox_enabled:
             return self

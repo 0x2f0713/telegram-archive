@@ -67,6 +67,51 @@ async def test_download_state_transitions_are_durable(database: Database, tmp_pa
     assert completed.media_size == 123
 
 
+async def test_terabox_completion_stores_remote_paths(database: Database, tmp_path: Path) -> None:
+    repository = ArchiveRepository(database)
+    record, _ = await repository.upsert_message(make_message())
+
+    await repository.mark_download_completed(
+        record.id,
+        tmp_path / "buffer.pdf",
+        123,
+        terabox_remote_path="/Telegram Archive/report.pdf",
+        terabox_variant_remote_path="/Telegram Archive/report.h264.mp4",
+    )
+
+    completed = await repository.get_message_by_id(record.id)
+    assert completed is not None
+    assert completed.media_path is None
+    assert completed.terabox_remote_path == "/Telegram Archive/report.pdf"
+    assert completed.terabox_variant_remote_path == "/Telegram Archive/report.h264.mp4"
+
+
+async def test_database_migrates_legacy_filesystem_paths(tmp_path: Path) -> None:
+    url = f"sqlite:///{tmp_path / 'legacy.db'}"
+    database = Database(url)
+    await database.initialize()
+    repository = ArchiveRepository(database)
+    record, _ = await repository.upsert_message(make_message())
+    await repository.mark_download_completed(
+        record.id,
+        Path("/old/archive/mnt/Telegram Archive/room/clip.mp4"),
+        42,
+        "/old/archive/mnt/Telegram Archive/room/clip.h264.mp4",
+    )
+    await database.close()
+
+    reopened = Database(url)
+    await reopened.initialize()
+    migrated = await ArchiveRepository(reopened).get_message_by_id(record.id)
+    await reopened.close()
+
+    assert migrated is not None
+    assert migrated.media_path is None
+    assert migrated.media_variant_path is None
+    assert migrated.terabox_remote_path == "/Telegram Archive/room/clip.mp4"
+    assert migrated.terabox_variant_remote_path == "/Telegram Archive/room/clip.h264.mp4"
+
+
 async def test_stats_reports_newest_message_per_chat(database: Database) -> None:
     repository = ArchiveRepository(database)
     await repository.upsert_chat(make_chat())

@@ -71,6 +71,8 @@ class MessageView:
     download_status: str
     download_error: str | None
     download_attempts: int
+    terabox_remote_path: str | None = None
+    terabox_variant_remote_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
