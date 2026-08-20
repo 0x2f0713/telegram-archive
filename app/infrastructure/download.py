@@ -56,6 +56,7 @@ class MediaDownloader:
         self.uploader = uploader
         self.video_cache = video_cache
         self._semaphore = asyncio.Semaphore(settings.download_concurrency)
+        self._transcode_semaphore = asyncio.Semaphore(settings.transcode_concurrency)
         self._capabilities: FfmpegCapabilities | None = None
 
     async def _ffmpeg(self) -> FfmpegCapabilities:
@@ -89,7 +90,10 @@ class MediaDownloader:
                 codec = await probe_video_codec(self.settings, capabilities, target)
                 if codec == "hevc":
                     variant_path = target.with_name(f"{target.stem}.h264.mp4")
-                    await transcode_hevc_to_h264(self.settings, capabilities, target, variant_path)
+                    async with self._transcode_semaphore:
+                        await transcode_hevc_to_h264(
+                            self.settings, capabilities, target, variant_path
+                        )
 
             # Poster generation
             if is_terabox and self.settings.terabox_generate_posters:

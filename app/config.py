@@ -115,6 +115,10 @@ class Settings(BaseSettings):
     download_audio: bool = True
     max_file_size_mb: int = Field(default=500, ge=0)
     download_concurrency: int = Field(default=2, ge=1, le=20)
+    #: Maximum number of HEVC->H.264 ffmpeg transcodes per worker process.
+    #: Kept separate from download concurrency because network downloads can
+    #: overlap while the hardware video path remains bounded.
+    transcode_concurrency: int = Field(default=1, ge=1, le=8)
     download_retries: int = Field(default=3, ge=1, le=10)
 
     allowed_extensions: str = ""

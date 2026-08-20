@@ -391,13 +391,14 @@ For bind-mounted files or embedding into another service, see [INTEGRATION.md](I
 
 Posters and HEVC→H.264 variants use a host-side ffmpeg when one is mounted. `FFMPEG_BIN`, `FFPROBE_BIN`, and `FFMPEG_LIB_DIR` point at the binaries and their dynamic libraries; `FFMPEG_LD_LIBRARY_PATH` is applied only to ffmpeg child processes, never the app. Keep `FFMPEG_LIB_DIR` curated (no `libc`/`libm`/`libpthread`) so the container's own runtime is never shadowed. Without ffmpeg, galleries fall back to the original video and no posters are extracted.
 
-Rockchip boards ship an MPP userspace built for their host glibc. In a container with a different glibc, `hevc_rkmpp` **decode** fails at runtime while `h264_rkmpp` **encode** still works, so set `VIDEO_HWACCEL=none` (software decode, hardware encode) there:
+When the host MPP userspace is compatible with the container, `VIDEO_HWACCEL=auto` uses Rockchip hardware decode plus `h264_rkmpp` hardware encode. Transcodes are capped independently from network downloads with `TRANSCODE_CONCURRENCY=1` by default. If the MPP userspace was built against an incompatible glibc and hardware decode fails, set `VIDEO_HWACCEL=none` to retain software decode and hardware encode:
 
 ```dotenv
 FFMPEG_BIN=/usr/bin/ffmpeg
 FFPROBE_BIN=/usr/bin/ffprobe
 FFMPEG_LIB_DIR=./.ffmpeg-libs
-VIDEO_HWACCEL=none
+VIDEO_HWACCEL=auto
+TRANSCODE_CONCURRENCY=1
 ```
 
 ### Remote transcoding node

@@ -56,10 +56,18 @@ services:
       FFMPEG_BIN: /usr/local/bin/ffmpeg
       FFPROBE_BIN: /usr/local/bin/ffprobe
       FFMPEG_LD_LIBRARY_PATH: /opt/host-libs
-      # The host-built mpp userspace expects glibc 2.35; this container runs
-      # 2.36, so hevc_rkmpp DECODE fails at runtime (encode is unaffected).
-      # Software decode keeps transcodes working; hardware encoding stays on.
+      # The host MPP userspace targets glibc 2.35 while this image uses glibc
+      # 2.41; local hevc_rkmpp decode fails MPP initialization. Keep software
+      # decode + hardware encode until the image is rebuilt compatibly.
       VIDEO_HWACCEL: none
+      TRANSCODE_CONCURRENCY: 1
+      # Download-time HEVC transcodes run on the native MPP node. The archive
+      # directory is shared at this same absolute path over NFS.
+      FFMPEG_REMOTE_HOST: namhh@192.168.1.2
+      FFMPEG_REMOTE_BIN: /usr/local/bin/ffmpeg
+      FFMPEG_REMOTE_IDENTITY: /app/.ssh/id_ed25519
+      FFMPEG_REMOTE_KNOWN_HOSTS: /app/.ssh/known_hosts
+      HOST_DOWNLOAD_DIR: /mnt/disk2/telegram-archiver/downloads
     volumes: *all-volumes
     devices: *ffmpeg-devices
     command: listen
@@ -86,10 +94,11 @@ services:
       FFMPEG_BIN: /usr/local/bin/ffmpeg
       FFPROBE_BIN: /usr/local/bin/ffprobe
       FFMPEG_LD_LIBRARY_PATH: /opt/host-libs
-      # The host-built mpp userspace expects glibc 2.35; this container runs
-      # 2.36, so hevc_rkmpp DECODE fails at runtime (encode is unaffected).
-      # Software decode keeps transcodes working; hardware encoding stays on.
+      # The host MPP userspace targets glibc 2.35 while this image uses glibc
+      # 2.41; local hevc_rkmpp decode fails MPP initialization. Keep software
+      # decode + hardware encode until the image is rebuilt compatibly.
       VIDEO_HWACCEL: none
+      TRANSCODE_CONCURRENCY: 1
       # HEVC transcodes run on the Orange Pi 3B (192.168.1.2), which has its
       # own native Rockchip ffmpeg (hw decode + h264_rkmpp encode) and mounts
       # the archive over NFS at the host path. Falls back to a local transcode

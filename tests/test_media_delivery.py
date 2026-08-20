@@ -17,6 +17,7 @@ from app.infrastructure.ffmpeg import (
     moov_offset,
     probe_video_codec,
     remux_faststart,
+    transcode_hevc_to_h264,
 )
 from app.infrastructure.persistence.database import Database
 from app.infrastructure.persistence.repository import ArchiveRepository
@@ -932,6 +933,46 @@ async def test_extract_poster_gates_hwaccel_on_video_hwaccel_setting(
     calls.clear()
     assert await extract_poster(_settings(tmp_path), caps, source, target) is True
     assert "-hwaccel" in calls[0]
+
+
+async def test_download_hevc_transcode_uses_remote_hardware_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(
+        tmp_path,
+        ffmpeg_remote_host="namhh@192.168.1.2",
+        ffmpeg_remote_bin="/usr/local/bin/ffmpeg",
+        ffmpeg_remote_identity="/app/.ssh/id_ed25519",
+        ffmpeg_remote_known_hosts="/app/.ssh/known_hosts",
+        host_download_dir="/mnt/disk2/telegram-archiver/downloads",
+    )
+    caps = FfmpegCapabilities(
+        available=True,
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        h264_encoders=("h264_rkmpp",),
+        hevc_decoder=True,
+    )
+    source = tmp_path / "video room" / "source.mp4"
+    target = source.with_name("source.h264.mp4")
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"hevc")
+    captured: dict[str, object] = {}
+
+    async def fake_remote(
+        _settings: Settings, args: list[str], remote_host: str
+    ) -> tuple[int, str]:
+        captured["args"] = args
+        captured["host"] = remote_host
+        target.with_name(f"{target.name}.part").write_bytes(b"variant")
+        return 0, ""
+
+    monkeypatch.setattr("app.infrastructure.ffmpeg._run_remote_hevc", fake_remote)
+
+    assert await transcode_hevc_to_h264(settings, caps, source, target) is True
+    assert target.read_bytes() == b"variant"
+    assert captured["host"] == "namhh@192.168.1.2"
+    assert captured["args"][:4] == ["-y", "-i", str(source), "-c:v"]
 
 
 class _FakeStream:

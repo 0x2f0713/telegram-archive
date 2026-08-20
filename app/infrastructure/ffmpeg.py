@@ -14,6 +14,7 @@ import asyncio
 import logging
 import os
 import re
+import shlex
 import shutil
 import struct
 from dataclasses import dataclass
@@ -427,10 +428,7 @@ async def transcode_hevc_to_h264(
     if not encoder:
         logger.warning("No H.264 encoder available for HEVC transcode")
         return False
-    args: list[str] = []
-    if hw_decode_enabled(settings, capabilities):
-        args += ["-hwaccel", "rkmpp"]
-    args += [
+    args = [
         "-y",
         "-i",
         str(source),
@@ -448,7 +446,27 @@ async def transcode_hevc_to_h264(
         "mp4",
         str(temp),
     ]
-    returncode, _, stderr = await _run(capabilities.ffmpeg_bin, args, settings)
+    remote_host = settings.ffmpeg_remote_host.strip()
+    if remote_host:
+        returncode, stderr = await _run_remote_hevc(
+            settings, args, remote_host
+        )
+        if returncode != 0 and _ssh_unreachable(stderr):
+            logger.warning(
+                "Remote HEVC transcode unavailable (%s), falling back to local",
+                stderr.strip().splitlines()[-1] if stderr.strip() else "ssh failed",
+            )
+            local_args = args
+            if hw_decode_enabled(settings, capabilities):
+                local_args = ["-hwaccel", "rkmpp", *local_args]
+            returncode, _, stderr = await _run(
+                capabilities.ffmpeg_bin, local_args, settings
+            )
+    else:
+        local_args = args
+        if hw_decode_enabled(settings, capabilities):
+            local_args = ["-hwaccel", "rkmpp", *local_args]
+        returncode, _, stderr = await _run(capabilities.ffmpeg_bin, local_args, settings)
     if returncode != 0:
         logger.warning("HEVC to H.264 transcode failed for %s: %s", source, stderr[-500:])
         try:
@@ -462,3 +480,64 @@ async def transcode_hevc_to_h264(
         logger.warning("HEVC transcode replace failed for %s: %s", target, exc)
         return False
     return True
+
+
+async def _run_remote_hevc(
+    settings: Settings,
+    args: list[str],
+    remote_host: str,
+) -> tuple[int, str]:
+    """Run the HEVC transcode on the configured native MPP host."""
+    host_dir = settings.host_download_dir.strip()
+    if not host_dir:
+        raise RuntimeError("HOST_DOWNLOAD_DIR is required when FFMPEG_REMOTE_HOST is set")
+    container_dir = str(settings.download_dir)
+    translated: list[str] = []
+    for arg in args:
+        if arg.startswith(container_dir):
+            translated.append(host_dir + arg[len(container_dir) :])
+        else:
+            translated.append(arg)
+    # The remote node has the compatible MPP userspace. Force both the
+    # hardware decoder and encoder for this HEVC-only code path.
+    translated = ["-hwaccel", "rkmpp", "-c:v", "hevc_rkmpp", *translated]
+    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+    if settings.ffmpeg_remote_identity.strip():
+        command += ["-i", settings.ffmpeg_remote_identity.strip()]
+    if settings.ffmpeg_remote_known_hosts.strip():
+        command += [
+            "-o",
+            f"UserKnownHostsFile={settings.ffmpeg_remote_known_hosts.strip()}",
+        ]
+    command += [
+        remote_host,
+        settings.ffmpeg_remote_bin,
+        *(shlex.quote(arg) for arg in translated),
+    ]
+    env = dict(os.environ)
+    env.pop("LD_LIBRARY_PATH", None)
+    proc = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    _, stderr = await proc.communicate()
+    return proc.returncode or 0, stderr.decode(errors="replace")
+
+
+_SSH_UNREACHABLE = (
+    "permission denied",
+    "connection refused",
+    "connection timed out",
+    "timed out",
+    "host key verification failed",
+    "could not resolve",
+    "no route to host",
+    "network is unreachable",
+)
+
+
+def _ssh_unreachable(stderr: str) -> bool:
+    lowered = stderr.casefold()
+    return any(marker in lowered for marker in _SSH_UNREACHABLE)

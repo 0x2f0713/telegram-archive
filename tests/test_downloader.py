@@ -1,8 +1,11 @@
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from app.config import Settings
 from app.infrastructure.download import MediaDownloader
+from app.infrastructure.ffmpeg import FfmpegCapabilities
 from app.infrastructure.terabox import TeraBoxError, UploadReceipt
 
 
@@ -236,3 +239,51 @@ async def test_publish_buffered_records_existing_mount_variant(tmp_path: Path) -
     assert result is not None and result.completed
     assert uploader.uploaded == [target]
     assert repository.variant_mount_paths == [str(settings.terabox_mount_dir / "42_report.h264.mp4")]
+
+
+async def test_hevc_transcodes_are_bounded_separately_from_downloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _terabox_settings(tmp_path).model_copy(
+        update={
+            "download_concurrency": 5,
+            "transcode_concurrency": 1,
+            "media_faststart": False,
+            "media_variants": False,
+            "terabox_generate_posters": False,
+        }
+    )
+    downloader = MediaDownloader(settings, RecordingRepository(), FakeUploader(tmp_path / "mnt"))
+    downloader._capabilities = FfmpegCapabilities(
+        available=True,
+        ffmpeg_bin="ffmpeg",
+        ffprobe_bin="ffprobe",
+        h264_encoders=("h264_rkmpp",),
+        hevc_decoder=True,
+    )
+    monkeypatch.setattr("app.infrastructure.download.probe_video_codec", lambda *_: _async_hevc())
+
+    active = 0
+    peak = 0
+    release = asyncio.Event()
+
+    async def fake_transcode(*_args: object) -> bool:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await release.wait()
+        active -= 1
+        return True
+
+    monkeypatch.setattr("app.infrastructure.download.transcode_hevc_to_h264", fake_transcode)
+    first = asyncio.create_task(downloader._optimize(tmp_path / "first.mp4"))
+    second = asyncio.create_task(downloader._optimize(tmp_path / "second.mp4"))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert peak == 1
+    release.set()
+    await asyncio.gather(first, second)
+
+
+async def _async_hevc() -> str:
+    return "hevc"
