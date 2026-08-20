@@ -1072,6 +1072,14 @@ class TeraBoxClient:
         hashes = await asyncio.to_thread(hash_file, Path(local_path), self.chunk_size)
         if hashes.size == 0:
             raise TeraBoxError("Cannot upload an empty file")
+        current_stats = await asyncio.to_thread(local_path.stat)
+        if (
+            current_stats.st_size != hashes.size
+            or current_stats.st_mtime_ns != stats.st_mtime_ns
+        ):
+            raise TeraBoxError(
+                "Local upload buffer changed while hashing; refusing to upload an unstable file"
+            )
         upload = TeraBoxUpload(remote_path=remote_path, hashes=hashes)
         if hashes.size >= SLICE_SIZE and await self._rapid_upload(upload):
             logger.info("TeraBox dedupe hit: %s already existed remotely", remote_path)

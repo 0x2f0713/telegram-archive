@@ -26,6 +26,7 @@ from app.infrastructure.persistence.repository import ArchiveRepository
 from app.infrastructure.terabox import TeraBoxError, UploadReceipt
 from app.infrastructure.transcode import POSTER_SUFFIX
 from app.infrastructure.video_cache import VideoRangeCache
+from app.utils.file_lock import media_file_lock
 
 logger = logging.getLogger(__name__)
 DownloadProgressCallback = Callable[[int, int], None]
@@ -144,6 +145,22 @@ class MediaDownloader:
         upload_progress: DownloadProgressCallback | None = None,
         prepare_progress: DownloadProgressCallback | None = None,
     ) -> DownloadResult:
+        """Download and publish one file under a shared per-path lock."""
+
+        async with media_file_lock(target):
+            return await self._download_locked(
+                record, raw_message, target, progress, upload_progress, prepare_progress
+            )
+
+    async def _download_locked(
+        self,
+        record: MessageSnapshot,
+        raw_message: object,
+        target: Path,
+        progress: DownloadProgressCallback | None = None,
+        upload_progress: DownloadProgressCallback | None = None,
+        prepare_progress: DownloadProgressCallback | None = None,
+    ) -> DownloadResult:
         temp_path = target.with_name(f"{target.name}.part")
         async with self._semaphore:
             for attempt in range(1, self.settings.download_retries + 1):
@@ -158,7 +175,15 @@ class MediaDownloader:
                     )
                     if not downloaded_path or not await asyncio.to_thread(temp_path.is_file):
                         raise OSError("Telegram returned no completed media file")
+                    downloaded_size = await asyncio.to_thread(temp_path.stat)
+                    expected_size = getattr(record, "media_size", None)
+                    if expected_size is not None and downloaded_size.st_size != expected_size:
+                        raise OSError(
+                            "Telegram download size "
+                            f"{downloaded_size.st_size} does not match expected {expected_size}"
+                        )
                     size = await asyncio.to_thread(self._finalize, temp_path, target)
+                    await self._validate_video(target)
                     # Optimize (faststart, poster, HEVC transcode) BEFORE upload in TeraBox mode
                     # so the optimized file gets uploaded. The preparing report keeps the
                     # operation monitor alive while ffmpeg works on the local file.
@@ -204,6 +229,17 @@ class MediaDownloader:
                     await self.repository.mark_download_failed(record.id, error)
                     return DownloadResult(False, None, None, error)
         return DownloadResult(False, None, None, "Download retry loop ended unexpectedly")
+
+    async def _validate_video(self, target: Path) -> None:
+        """Reject a corrupt video before ffmpeg or TeraBox can consume it."""
+
+        if target.suffix.casefold() not in _VIDEO_SUFFIXES:
+            return
+        capabilities = await self._ffmpeg()
+        if not capabilities.available:
+            return
+        if await probe_video_codec(self.settings, capabilities, target) is None:
+            raise OSError(f"Downloaded video is invalid or incomplete: {target.name}")
 
     @staticmethod
     def _prepare_target(target: Path, temp_path: Path) -> None:
@@ -345,6 +381,24 @@ class MediaDownloader:
         buffered_path: Path,
         progress: DownloadProgressCallback | None = None,
     ) -> DownloadResult | None:
+        """Publish a buffer while excluding concurrent download/upload readers."""
+
+        async with media_file_lock(buffered_path):
+            try:
+                return await self._publish_buffered_locked(message_id, buffered_path, progress)
+            except OSError as exc:
+                error = f"Invalid buffered media: {exc}"
+                logger.warning("%s", error)
+                await self.repository.mark_download_failed(message_id, error)
+                await asyncio.to_thread(buffered_path.unlink, True)
+                return DownloadResult(False, buffered_path, None, error)
+
+    async def _publish_buffered_locked(
+        self,
+        message_id: int,
+        buffered_path: Path,
+        progress: DownloadProgressCallback | None = None,
+    ) -> DownloadResult | None:
         """Publish an existing DOWNLOAD_DIR file to remote storage.
 
         Returns None when no uploader is configured (local storage mode).
@@ -355,5 +409,8 @@ class MediaDownloader:
         if record is None:
             logger.warning("Cannot publish buffered file: message %s not found", message_id)
             return None
+        if not await asyncio.to_thread(buffered_path.is_file):
+            return DownloadResult(False, buffered_path, None, "Buffered media disappeared")
+        await self._validate_video(buffered_path)
         await self.repository.mark_download_start(message_id, buffered_path)
         return await self._publish_to_uploader(record, buffered_path, progress)
