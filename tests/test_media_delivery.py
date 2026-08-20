@@ -20,12 +20,14 @@ from app.infrastructure.ffmpeg import (
 )
 from app.infrastructure.persistence.database import Database
 from app.infrastructure.persistence.repository import ArchiveRepository
+from app.infrastructure.prefetch import TeraBoxPrefetcher
 from app.infrastructure.transcode import (
     POSTER_SUFFIX,
     VARIANT_SUFFIX,
     VariantManager,
     is_faststart,
 )
+from app.infrastructure.video_cache import CHUNK_SIZE, VideoRangeCache
 from app.interfaces.web.app import create_web_app
 from tests.helpers import make_chat, make_message
 
@@ -457,6 +459,7 @@ def _terabox_settings(tmp_path: Path) -> Settings:
         terabox_profile=None,
         terabox_mount_dir=tmp_path / "mnt",
         terabox_remote_dir="/Telegram Archive",
+        video_cache_dir=tmp_path / "vc",
     )
 
 
@@ -596,6 +599,7 @@ async def test_media_stream_relay_forwards_range_request(
     application = create_web_app(settings)
 
     async with application.router.lifespan_context(application):
+        application.state.terabox_prefetcher = None  # keep the relay test deterministic
         transport = httpx.ASGITransport(app=application)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get(
@@ -624,6 +628,7 @@ async def test_media_stream_relay_serves_full_body_without_range(
     application = create_web_app(settings)
 
     async with application.router.lifespan_context(application):
+        application.state.terabox_prefetcher = None  # keep the relay test deterministic
         transport = httpx.ASGITransport(app=application)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get(f"/media/{message_id}/stream")
@@ -647,6 +652,7 @@ async def test_media_stream_relay_head_returns_headers_without_body(
     application = create_web_app(settings)
 
     async with application.router.lifespan_context(application):
+        application.state.terabox_prefetcher = None  # keep the relay test deterministic
         transport = httpx.ASGITransport(app=application)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             plain = await client.head(f"/media/{message_id}/stream")
@@ -719,6 +725,128 @@ async def test_media_stream_relay_unavailable_returns_404(tmp_path: Path) -> Non
 
     assert local.status_code == 404
     assert missing.status_code == 404
+
+
+async def test_video_cache_is_cached_detects_chunk_coverage(tmp_path: Path) -> None:
+    cache = VideoRangeCache(tmp_path / "vc", 100 * 1024 * 1024, 7 * 24 * 3600)
+    await cache.initialize()
+    await cache.store_range(7, 0, b"x" * CHUNK_SIZE)
+    await cache.store_range(7, CHUNK_SIZE, b"y" * CHUNK_SIZE)
+
+    assert await cache.is_cached(7, 0, 5) is True
+    assert await cache.is_cached(7, CHUNK_SIZE - 1, CHUNK_SIZE + 5) is True
+    assert await cache.is_cached(7, 0, CHUNK_SIZE + 5) is True
+    assert await cache.is_cached(7, 2 * CHUNK_SIZE, 2 * CHUNK_SIZE + 10) is False
+    assert await cache.is_cached(7, CHUNK_SIZE + 100, 2 * CHUNK_SIZE + 5) is False
+    assert await cache.is_cached(99, 0, 5) is False
+
+
+async def test_terabox_prefetcher_fills_whole_file_in_parallel_windows(
+    tmp_path: Path,
+) -> None:
+    remote = "/Telegram Archive/clip.mp4"
+    body = bytes(range(256)) * 4096  # 1 MiB, fits in one prefetch window
+    fake = FakeTeraboxStreamClient(
+        {remote: ("https://kul-ddata.terabox.com/file?fid=1", len(body), False)},
+        body=body,
+        sizes={remote: len(body)},
+    )
+    cache = VideoRangeCache(tmp_path / "vc", 100 * 1024 * 1024, 7 * 24 * 3600)
+    await cache.initialize()
+    prefetcher = TeraBoxPrefetcher(fake, cache)
+
+    await prefetcher._fill(7, remote, len(body))
+
+    assert await cache.is_cached(7, 0, len(body) - 1) is True
+    assert await cache.get_range(7, 0, len(body) - 1) == body
+    assert set(fake.range_requests) == {
+        "bytes=0-262143",
+        "bytes=262144-524287",
+        "bytes=524288-786431",
+        "bytes=786432-1048575",
+    }
+
+
+async def test_terabox_prefetcher_skips_already_cached_windows(tmp_path: Path) -> None:
+    remote = "/Telegram Archive/clip.mp4"
+    body = bytes(range(256)) * 4096
+    fake = FakeTeraboxStreamClient(
+        {remote: ("https://kul-ddata.terabox.com/file?fid=1", len(body), False)},
+        body=body,
+        sizes={remote: len(body)},
+    )
+    cache = VideoRangeCache(tmp_path / "vc", 100 * 1024 * 1024, 7 * 24 * 3600)
+    await cache.initialize()
+    await cache.store_range(7, 0, body)
+    prefetcher = TeraBoxPrefetcher(fake, cache)
+
+    await prefetcher._fill(7, remote, len(body))
+
+    assert fake.range_requests == []
+    assert await cache.is_cached(7, 0, len(body) - 1) is True
+
+
+async def test_media_stream_relay_serves_cached_ranges_without_cdn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _terabox_settings(tmp_path)
+    fake = FakeTeraboxStreamClient(
+        {"/Telegram Archive/clip.mp4": ("https://kul-ddata.terabox.com/file?fid=1", 12, False)},
+        sizes={"/Telegram Archive/clip.mp4": 12},
+    )
+    monkeypatch.setattr("app.interfaces.web.app.create_terabox_client", lambda _s: fake)
+    message_id = await _seed_mount_video(settings)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        await application.state.video_cache.store_range(message_id, 0, b"stream body")
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            ranged = await client.get(
+                f"/media/{message_id}/stream", headers={"Range": "bytes=0-5"}
+            )
+            full = await client.get(
+                f"/media/{message_id}/stream", headers={"Range": "bytes=0-"}
+            )
+
+    assert ranged.status_code == 206
+    assert ranged.content == b"stream"
+    assert ranged.headers["content-range"] == "bytes 0-5/12"
+    assert full.status_code == 206
+    assert full.content == b"stream body"
+    assert full.headers["content-range"] == "bytes 0-10/12"
+    assert fake.range_requests == []
+
+
+async def test_media_stream_relay_stores_bytes_and_kicks_prefetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _terabox_settings(tmp_path)
+    fake = FakeTeraboxStreamClient(
+        {"/Telegram Archive/clip.mp4": ("https://kul-ddata.terabox.com/file?fid=1", 12, False)},
+        sizes={"/Telegram Archive/clip.mp4": 12},
+    )
+    monkeypatch.setattr("app.interfaces.web.app.create_terabox_client", lambda _s: fake)
+    message_id = await _seed_mount_video(settings)
+    application = create_web_app(settings)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                f"/media/{message_id}/stream", headers={"Range": "bytes=0-5"}
+            )
+        # The relay stored 0-5 while streaming; the background prefetcher
+        # fills the remaining tail of the file without another relay request.
+        for _ in range(100):
+            if await application.state.video_cache.is_cached(message_id, 0, 11):
+                break
+            await asyncio.sleep(0.01)
+
+    assert response.status_code == 206
+    assert response.content == b"stream"
+    assert await application.state.video_cache.get_range(message_id, 0, 11) == b"stream body"
+    assert await application.state.video_cache.is_cached(message_id, 0, 11) is True
 
 
 async def test_moov_offset_and_faststart_detection(tmp_path: Path) -> None:

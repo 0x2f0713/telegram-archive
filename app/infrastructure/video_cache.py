@@ -131,6 +131,24 @@ class VideoRangeCache:
             await self._save_index()
             return bytes(result)
 
+    async def is_cached(self, message_id: int, start: int, end: int) -> bool:
+        """Return True when every chunk covering ``[start, end]`` is cached.
+
+        Cheaper than :meth:`get_range` for prefetch planning: checks chunk
+        presence without reading any file bytes.
+        """
+        await self.initialize()
+        async with self._lock:
+            chunks = self._index.get(message_id)
+            if not chunks:
+                return False
+            chunk_start = (start // CHUNK_SIZE) * CHUNK_SIZE
+            while chunk_start <= end:
+                if chunk_start not in chunks:
+                    return False
+                chunk_start += CHUNK_SIZE
+            return True
+
     async def store_range(self, message_id: int, start: int, data: bytes) -> None:
         """Store a byte range in the cache."""
         await self.initialize()

@@ -1381,7 +1381,10 @@ def create_router(settings: Settings) -> APIRouter:
         is_head = request.method == "HEAD"
         range_header = request.headers.get("range")
         filename = message.filename or resolved.name
+        video_cache = getattr(request.app.state, "video_cache", None)
+        prefetcher = getattr(request.app.state, "terabox_prefetcher", None)
         relay_response: tuple[Any, int] | None = None
+        cached_body: bytes | None = None
         rng: tuple[int, int] | None = None
         mime_type = ""
         file_size = 0
@@ -1404,6 +1407,10 @@ def create_router(settings: Settings) -> APIRouter:
             rng = parsed
             if is_head:
                 break
+            if video_cache is not None and rng is not None:
+                cached_body = await video_cache.get_range(message_id, rng[0], rng[1])
+                if cached_body is not None:
+                    break
             range_spec = f"bytes={rng[0]}-{rng[1]}" if rng else None
             try:
                 relay_response = await client.stream_remote(candidate_remote, range_spec=range_spec)
@@ -1419,6 +1426,13 @@ def create_router(settings: Settings) -> APIRouter:
         else:
             raise HTTPException(status_code=502, detail="TeraBox streaming failed")
 
+        # Background continuous buffering: keep filling the disk cache from
+        # the bandwidth-capped CDN while the user watches, so cached ranges
+        # (re-watches, seeks, the rest of the file over time) serve at disk
+        # speed instead of the ~25 KB/s TeraBox cap.
+        if prefetcher is not None and mime_type.casefold().startswith("video/"):
+            prefetcher.ensure(message_id, candidate_remote, file_size)
+
         headers = {
             "Accept-Ranges": "bytes",
             "Cache-Control": "no-cache",
@@ -1433,6 +1447,12 @@ def create_router(settings: Settings) -> APIRouter:
             headers["Content-Length"] = str(file_size)
             return Response(status_code=200, headers=headers, media_type=mime_type)
 
+        if cached_body is not None:
+            start = rng[0]
+            headers["Content-Length"] = str(len(cached_body))
+            headers["Content-Range"] = f"bytes {start}-{start + len(cached_body) - 1}/{file_size}"
+            return Response(status_code=206, headers=headers, media_type=mime_type, content=cached_body)
+
         response, _size = relay_response
         upstream_length = response.headers.get("content-length")
         upstream_range = response.headers.get("content-range")
@@ -1442,8 +1462,12 @@ def create_router(settings: Settings) -> APIRouter:
             headers["Content-Range"] = upstream_range
 
         async def relay_body() -> AsyncIterator[bytes]:
+            written = rng[0] if rng else 0
             try:
                 async for chunk in response.aiter_bytes(256 * 1024):
+                    if video_cache is not None:
+                        await video_cache.store_range(message_id, written, chunk)
+                    written += len(chunk)
                     yield chunk
             finally:
                 await response.aclose()

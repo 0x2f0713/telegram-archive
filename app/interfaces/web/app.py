@@ -30,6 +30,7 @@ from app.infrastructure.persistence.read_models import DashboardRepository
 from app.infrastructure.persistence.repository import ArchiveRepository
 from app.infrastructure.persistence.selection import ChatSelectionRepository
 from app.infrastructure.persistence.settings import RuntimeSettingsRepository
+from app.infrastructure.prefetch import TeraBoxPrefetcher
 from app.infrastructure.telegram.client import (
     accessible_dialogs,
     connect_authorized,
@@ -231,6 +232,15 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
             video_cache_dir, video_cache_max_size, video_cache_max_age
         )
         await app.state.video_cache.initialize()
+
+        # Background CDN→disk prefetcher: fills the video cache continuously
+        # while a user watches, so playback reads local disk instead of the
+        # bandwidth-capped TeraBox CDN.
+        app.state.terabox_prefetcher = None
+        if app.state.terabox_client is not None:
+            app.state.terabox_prefetcher = TeraBoxPrefetcher(
+                app.state.terabox_client, app.state.video_cache
+            )
 
         app.state.csrf_token = secrets.token_urlsafe(32)
         app.state.telegram_auth = TelegramQrAuthManager(overridden)
