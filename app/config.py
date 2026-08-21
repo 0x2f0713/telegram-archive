@@ -86,8 +86,9 @@ class Settings(BaseSettings):
     #: value is secret-bearing and therefore stays environment-only.
     tg_mtproto_proxy: SecretStr | None = None
     #: Automatically discover and probe proxies from the configured provider
-    #: when no explicit TG_MTPROTO_PROXY link is supplied.
-    tg_mtproto_proxy_auto: bool = True
+    #: when no explicit TG_MTPROTO_PROXY link is supplied. Opt in explicitly
+    #: because public proxy availability and performance are variable.
+    tg_mtproto_proxy_auto: bool = False
     tg_mtproto_proxy_provider_url: str = "https://mtpro.xyz/mtproto"
     tg_mtproto_proxy_cache_file: Path = Path("data/mtproto_proxy_cache.json")
     tg_mtproto_proxy_probe_limit: int = Field(default=24, ge=1, le=100)

@@ -51,6 +51,7 @@ async def test_prepare_proxy_selects_fastest_probe_and_updates_settings(
         _env_file=None,
         tg_api_id=123,
         tg_api_hash="hash",
+        tg_mtproto_proxy_auto=True,
         tg_mtproto_proxy_cache_file=tmp_path / "proxy-cache.json",
     )
 
