@@ -122,6 +122,12 @@ class Settings(BaseSettings):
     download_audio: bool = True
     max_file_size_mb: int = Field(default=500, ge=0)
     download_concurrency: int = Field(default=2, ge=1, le=20)
+    #: Explicit Telegram request size in KiB. Zero keeps Telethon's
+    #: file-size-aware automatic sizing (128/256/512 KiB).
+    telegram_download_part_size_kb: int = Field(default=0, ge=0, le=512)
+    #: Number of files that may upload to TeraBox concurrently. Chunks within
+    #: one upload remain sequential for protocol and retry safety.
+    terabox_upload_concurrency: int = Field(default=1, ge=1, le=4)
     #: Maximum number of HEVC->H.264 ffmpeg transcodes per worker process.
     #: Kept separate from download concurrency because network downloads can
     #: overlap while the hardware video path remains bounded.
@@ -206,6 +212,15 @@ class Settings(BaseSettings):
         if normalized not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
             raise ValueError("LOG_LEVEL must be CRITICAL, ERROR, WARNING, INFO, or DEBUG")
         return normalized
+
+    @field_validator("telegram_download_part_size_kb")
+    @classmethod
+    def validate_telegram_download_part_size(cls, value: int) -> int:
+        if value not in {0, 128, 256, 512}:
+            raise ValueError(
+                "TELEGRAM_DOWNLOAD_PART_SIZE_KB must be 0, 128, 256, or 512"
+            )
+        return value
 
     def require_telegram_credentials(self) -> tuple[int, str]:
         """Return Telegram credentials or raise a safe, secret-free error."""

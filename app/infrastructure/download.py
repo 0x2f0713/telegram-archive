@@ -83,8 +83,22 @@ class MediaUploader(Protocol):
     ) -> UploadReceipt: ...
 
 
+class TelegramDownloadClient(Protocol):
+    """Public Telethon surface needed for explicit download request sizing."""
+
+    async def download_file(
+        self,
+        input_location: object,
+        file: str,
+        *,
+        part_size_kb: int,
+        file_size: int | None = None,
+        progress_callback: DownloadProgressCallback | None = None,
+    ) -> str | bytes | None: ...
+
+
 class MediaDownloader:
-    """Download one file at a time under a configurable global semaphore."""
+    """Download files under bounded network, upload, and transcode semaphores."""
 
     def __init__(
         self,
@@ -99,7 +113,8 @@ class MediaDownloader:
         self.uploader = uploader
         self.video_cache = video_cache
         self.proxy_manager = proxy_manager
-        self._semaphore = asyncio.Semaphore(settings.download_concurrency)
+        self._download_semaphore = asyncio.Semaphore(settings.download_concurrency)
+        self._upload_semaphore = asyncio.Semaphore(settings.terabox_upload_concurrency)
         self._transcode_semaphore = asyncio.Semaphore(settings.transcode_concurrency)
         self._capabilities: FfmpegCapabilities | None = None
 
@@ -205,16 +220,15 @@ class MediaDownloader:
         prepare_progress: DownloadProgressCallback | None = None,
     ) -> DownloadResult:
         temp_path = target.with_name(f"{target.name}.part")
-        async with self._semaphore:
-            if self.proxy_manager is not None:
-                self.proxy_manager.begin_transfer()
+        transfer_started = False
+        try:
             attempt = 0
             while attempt < self.settings.download_retries:
                 attempt += 1
                 try:
                     await self.repository.mark_download_start(record.id, target)
                     await asyncio.to_thread(self._prepare_target, target, temp_path)
-                    download_kwargs = {"file": str(temp_path)}
+                    download_kwargs: dict[str, object] = {"file": str(temp_path)}
                     expected_total = getattr(record, "media_size", None)
                     if (
                         self.proxy_manager is not None
@@ -236,10 +250,29 @@ class MediaDownloader:
                         download_kwargs["progress_callback"] = guarded_progress
                     elif progress is not None:
                         download_kwargs["progress_callback"] = progress
-                    downloaded_path = await raw_message.download_media(  # type: ignore[attr-defined]
-                        **download_kwargs
-                    )
-                    if not downloaded_path or not await asyncio.to_thread(temp_path.is_file):
+
+                    download_queue_started_at = monotonic()
+                    async with self._download_semaphore:
+                        download_queue_wait = monotonic() - download_queue_started_at
+                        if self.proxy_manager is not None:
+                            self.proxy_manager.begin_transfer()
+                            transfer_started = True
+                        try:
+                            download_started_at = monotonic()
+                            await self._download_media(
+                                raw_message,
+                                temp_path,
+                                expected_total,
+                                download_kwargs,
+                            )
+                            download_elapsed = max(0.001, monotonic() - download_started_at)
+                        finally:
+                            if transfer_started:
+                                end_transfer = getattr(self.proxy_manager, "end_transfer", None)
+                                if callable(end_transfer):
+                                    end_transfer()
+                                transfer_started = False
+                    if not await asyncio.to_thread(temp_path.is_file):
                         raise OSError("Telegram returned no completed media file")
                     downloaded_size = await asyncio.to_thread(temp_path.stat)
                     expected_size = getattr(record, "media_size", None)
@@ -248,6 +281,15 @@ class MediaDownloader:
                             "Telegram download size "
                             f"{downloaded_size.st_size} does not match expected {expected_size}"
                         )
+                    logger.info(
+                        "Downloaded %s (%s bytes in %.2fs, %.2f MB/s, queue_wait=%.2fs, attempts=%s)",
+                        target.name,
+                        downloaded_size.st_size,
+                        download_elapsed,
+                        downloaded_size.st_size / download_elapsed / 1_000_000,
+                        download_queue_wait,
+                        attempt,
+                    )
                     size = await asyncio.to_thread(self._finalize, temp_path, target)
                     await self._validate_video(target)
                     # Optimize (faststart, poster, HEVC transcode) BEFORE upload in TeraBox mode
@@ -255,7 +297,13 @@ class MediaDownloader:
                     # operation monitor alive while ffmpeg works on the local file.
                     if prepare_progress is not None:
                         prepare_progress(0, size)
+                    prepare_started_at = monotonic()
                     variant_path = await self._optimize(target, record)
+                    logger.info(
+                        "Prepared %s in %.2fs",
+                        target.name,
+                        max(0.001, monotonic() - prepare_started_at),
+                    )
                     if self.uploader is not None:
                         return await self._publish_to_uploader(
                             record, target, progress, variant_path, upload_progress
@@ -304,7 +352,51 @@ class MediaDownloader:
                     error = f"{type(exc).__name__}: {exc}"
                     await self.repository.mark_download_failed(record.id, error)
                     return DownloadResult(False, None, None, error)
+        finally:
+            if transfer_started:
+                end_transfer = getattr(self.proxy_manager, "end_transfer", None)
+                if callable(end_transfer):
+                    end_transfer()
         return DownloadResult(False, None, None, "Download retry loop ended unexpectedly")
+
+    async def _download_media(
+        self,
+        raw_message: object,
+        temp_path: Path,
+        expected_total: int | None,
+        download_kwargs: dict[str, object],
+    ) -> str | bytes | None:
+        """Download through Telethon with optional explicit request sizing.
+
+        Telethon's high-level ``download_media`` does not expose ``part_size_kb``.
+        Real Telethon messages retain their client, allowing the public low-level
+        ``download_file`` API to be used when an operator explicitly selects a
+        request size. Test doubles and unsupported media retain the high-level
+        path, which is also the safest default because it handles file references
+        that expire during long transfers.
+        """
+
+        part_size_kb = self.settings.telegram_download_part_size_kb
+        client = getattr(raw_message, "_client", None) or getattr(raw_message, "client", None)
+        download_file = getattr(client, "download_file", None)
+        if part_size_kb and callable(download_file):
+            low_level_kwargs: dict[str, object] = {
+                "file": str(temp_path),
+                "part_size_kb": part_size_kb,
+            }
+            if expected_total is not None:
+                low_level_kwargs["file_size"] = expected_total
+            if "progress_callback" in download_kwargs:
+                low_level_kwargs["progress_callback"] = download_kwargs["progress_callback"]
+            try:
+                return await download_file(raw_message, **low_level_kwargs)
+            except TypeError as exc:
+                logger.debug(
+                    "Falling back to Telethon download_media for %s: %s",
+                    temp_path.name,
+                    exc,
+                )
+        return await raw_message.download_media(**download_kwargs)  # type: ignore[attr-defined]
 
     async def _validate_video(self, target: Path) -> None:
         """Reject a corrupt video before ffmpeg or TeraBox can consume it."""
@@ -349,7 +441,31 @@ class MediaDownloader:
         assert self.uploader is not None
         upload_callback = upload_progress if upload_progress is not None else progress
         try:
-            receipt = await self.uploader.upload(target, upload_callback)
+            upload_queue_started_at = monotonic()
+            async with self._upload_semaphore:
+                upload_queue_wait = monotonic() - upload_queue_started_at
+                upload_started_at = monotonic()
+                receipt = await self.uploader.upload(target, upload_callback)
+                upload_elapsed = max(0.001, monotonic() - upload_started_at)
+                logger.info(
+                    "Uploaded %s (%s bytes in %.2fs, %.2f MB/s, queue_wait=%.2fs)",
+                    target.name,
+                    receipt.size,
+                    upload_elapsed,
+                    receipt.size / upload_elapsed / 1_000_000,
+                    upload_queue_wait,
+                )
+                variant_receipt: UploadReceipt | None = None
+                if variant_path is not None and self.settings.terabox_store_both:
+                    try:
+                        variant_receipt = await self.uploader.upload(variant_path, upload_callback)
+                        logger.info(
+                            "Uploaded H.264 variant %s (%s bytes)",
+                            variant_receipt.remote_path,
+                            variant_receipt.size,
+                        )
+                    except Exception as exc:
+                        logger.warning("Failed to upload H.264 variant: %s", exc)
         except asyncio.CancelledError:
             await self.repository.mark_download_failed(record.id, "Upload interrupted")
             raise
@@ -363,19 +479,7 @@ class MediaDownloader:
             receipt.size,
             receipt.md5,
         )
-        variant_remote_path: str | None = None
-        if variant_path is not None and self.settings.terabox_store_both:
-            try:
-                variant_receipt = await self.uploader.upload(variant_path, upload_callback)
-                variant_remote_path = variant_receipt.remote_path
-                logger.info(
-                    "Uploaded H.264 variant %s to TeraBox (%s bytes, md5=%s)",
-                    variant_receipt.remote_path,
-                    variant_receipt.size,
-                    variant_receipt.md5,
-                )
-            except Exception as exc:
-                logger.warning("Failed to upload H.264 variant: %s", exc)
+        variant_remote_path = variant_receipt.remote_path if variant_receipt is not None else None
         await self.repository.mark_download_completed(
             record.id,
             target,

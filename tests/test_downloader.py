@@ -40,6 +40,26 @@ class SuccessfulMessage:
         return file
 
 
+class ChunkedClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def download_file(self, input_location: object, *, file: str, **kwargs) -> None:
+        self.calls.append({"input_location": input_location, "file": file, **kwargs})
+        await asyncio.to_thread(Path(file).write_bytes, b"complete")
+        callback = kwargs.get("progress_callback")
+        if callback is not None:
+            callback(8, kwargs.get("file_size", 8))
+
+
+class ChunkedMessage:
+    def __init__(self) -> None:
+        self._client = ChunkedClient()
+
+    async def download_media(self, **_kwargs: object) -> str:
+        raise AssertionError("explicit part-size downloads should use the client adapter")
+
+
 class ProgressMessage:
     async def download_media(self, *, file: str, progress_callback) -> str:
         await asyncio.to_thread(Path(file).write_bytes, b"complete")
@@ -104,6 +124,33 @@ async def test_download_forwards_per_file_progress(tmp_path: Path) -> None:
 
     assert result.completed
     assert updates == [(2, 8), (8, 8)]
+
+
+async def test_explicit_part_size_uses_public_telethon_download_file(
+    tmp_path: Path,
+) -> None:
+    repository = RecordingRepository()
+    settings = Settings(
+        _env_file=None,
+        download_retries=1,
+        telegram_download_part_size_kb=512,
+    )
+    downloader = MediaDownloader(settings, repository)  # type: ignore[arg-type]
+    message = ChunkedMessage()
+    target = tmp_path / "42_report.pdf"
+    record = type(
+        "Record",
+        (),
+        {"id": 1, "telegram_chat_id": 12345, "media_size": len(b"complete")},
+    )()
+
+    result = await downloader.download(record, message, target)  # type: ignore[arg-type]
+
+    assert result.completed
+    assert message._client.calls[0]["part_size_kb"] == 512
+    assert message._client.calls[0]["file_size"] == len(b"complete")
+    assert message._client.calls[0]["input_location"] is message
+
 
 
 async def test_direct_large_download_does_not_apply_proxy_speed_guard(
@@ -195,6 +242,35 @@ class FakeUploader:
         )
 
 
+class BlockingUploader(FakeUploader):
+    def __init__(self, remote_root: str) -> None:
+        super().__init__(remote_root)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.active = 0
+        self.peak_active = 0
+
+    async def upload(self, target: Path, progress=None) -> UploadReceipt:
+        self.active += 1
+        self.peak_active = max(self.peak_active, self.active)
+        self.started.set()
+        try:
+            await self.release.wait()
+            return await super().upload(target, progress)
+        finally:
+            self.active -= 1
+
+
+class TrackingMessage(SuccessfulMessage):
+    def __init__(self) -> None:
+        self.downloaded = asyncio.Event()
+
+    async def download_media(self, *, file: str) -> str:
+        result = await super().download_media(file=file)
+        self.downloaded.set()
+        return result
+
+
 def _terabox_settings(tmp_path: Path) -> Settings:
     return Settings(
         _env_file=None,
@@ -270,6 +346,42 @@ async def test_download_records_completion_before_removing_buffer(tmp_path: Path
     assert result.completed
     assert repository.buffer_present_at_completion is True
     assert not target.exists()
+
+
+async def test_telegram_download_slot_is_released_before_terabox_upload(
+    tmp_path: Path,
+) -> None:
+    settings = _terabox_settings(tmp_path).model_copy(
+        update={"download_concurrency": 1, "terabox_upload_concurrency": 1}
+    )
+    settings.download_dir.mkdir(parents=True, exist_ok=True)
+    repository = RecordingRepository()
+    uploader = BlockingUploader(settings.terabox_remote_root)
+    downloader = MediaDownloader(settings, repository, uploader)  # type: ignore[arg-type]
+    first_message = TrackingMessage()
+    second_message = TrackingMessage()
+    first_target = settings.download_dir / "first.bin"
+    second_target = settings.download_dir / "second.bin"
+    first_record = type("Record", (), {"id": 1, "telegram_chat_id": 12345})()
+    second_record = type("Record", (), {"id": 2, "telegram_chat_id": 12345})()
+
+    first_task = asyncio.create_task(
+        downloader.download(first_record, first_message, first_target)  # type: ignore[arg-type]
+    )
+    await uploader.started.wait()
+    second_task = asyncio.create_task(
+        downloader.download(second_record, second_message, second_target)  # type: ignore[arg-type]
+    )
+    await second_message.downloaded.wait()
+
+    assert not second_task.done()
+    assert uploader.peak_active == 1
+
+    uploader.release.set()
+    first_result, second_result = await asyncio.gather(first_task, second_task)
+
+    assert first_result.completed and second_result.completed
+    assert uploader.peak_active == 1
 
 
 async def test_publish_buffered_returns_none_in_local_mode(tmp_path: Path) -> None:

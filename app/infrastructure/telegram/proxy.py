@@ -275,6 +275,7 @@ class MTProtoProxyManager:
         self.current_index = 0
         self.client: TelegramClient | None = None
         self._lock = asyncio.Lock()
+        self._active_transfers = 0
         self._tried_indices: set[int] = {0} if candidates else set()
 
     @property
@@ -289,8 +290,14 @@ class MTProtoProxyManager:
     def begin_transfer(self) -> None:
         """Allow each new media transfer to try every candidate once."""
 
+        self._active_transfers += 1
         if self.candidates and len(self._tried_indices) >= len(self.candidates):
             self._tried_indices = {self.current_index}
+
+    def end_transfer(self) -> None:
+        """Release a media transfer lease held by the downloader."""
+
+        self._active_transfers = max(0, self._active_transfers - 1)
 
     async def rotate(self) -> bool:
         """Reconnect the attached client through the next candidate."""
@@ -298,6 +305,15 @@ class MTProtoProxyManager:
         if self.client is None or len(self.candidates) < 2:
             return False
         async with self._lock:
+            # A Telethon client owns the connection shared by all media tasks.
+            # Disconnecting it while another transfer is active would interrupt
+            # a healthy download. The caller can retry later on the next file.
+            if self._active_transfers > 1:
+                logger.warning(
+                    "Deferring MTProto proxy rotation while %s media transfers are active",
+                    self._active_transfers,
+                )
+                return False
             for offset in range(1, len(self.candidates)):
                 index = (self.current_index + offset) % len(self.candidates)
                 if index in self._tried_indices:

@@ -106,6 +106,45 @@ async def test_proxy_manager_rotates_attached_client() -> None:
     assert client.proxies[-1] == second.tuple
 
 
+@pytest.mark.asyncio
+async def test_proxy_manager_defers_rotation_while_another_transfer_is_active() -> None:
+    first = MTProtoProxy("first.example", 443, _secret())
+    second = MTProtoProxy("second.example", 443, _secret())
+    manager = MTProtoProxyManager(Settings(_env_file=None), (first, second))
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.proxies: list[tuple[str, int, str]] = []
+            self.connected = True
+            self.disconnects = 0
+
+        def set_proxy(self, proxy) -> None:
+            self.proxies.append(proxy)
+
+        async def disconnect(self) -> None:
+            self.disconnects += 1
+            self.connected = False
+
+        async def connect(self) -> None:
+            self.connected = True
+
+        def is_connected(self) -> bool:
+            return self.connected
+
+    client = FakeClient()
+    manager.attach(client)  # type: ignore[arg-type]
+    manager.begin_transfer()
+    manager.begin_transfer()
+
+    assert await manager.rotate() is False
+    assert client.disconnects == 0
+    assert manager.current is first
+
+    manager.end_transfer()
+    manager.end_transfer()
+    assert await manager.rotate() is True
+
+
 def test_download_rate_guard_ignores_small_files() -> None:
     guard = DownloadRateGuard(2 * 1024 * 1024)
     guard.observe(2 * 1024 * 1024, 2 * 1024 * 1024)

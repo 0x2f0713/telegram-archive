@@ -9,6 +9,29 @@ def test_web_default_port_is_8686() -> None:
     assert Settings(_env_file=None).web_port == 8686
 
 
+def test_transfer_tuning_defaults_are_conservative() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.telegram_download_part_size_kb == 0
+    assert settings.terabox_upload_concurrency == 1
+
+
+@pytest.mark.parametrize("value", [1, 64, 384, 513])
+def test_invalid_telegram_download_part_size_is_rejected(value: int) -> None:
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, telegram_download_part_size_kb=value)
+
+
+def test_transfer_tuning_environment_values_are_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TELEGRAM_DOWNLOAD_PART_SIZE_KB", "512")
+    monkeypatch.setenv("TERABOX_UPLOAD_CONCURRENCY", "3")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.telegram_download_part_size_kb == 512
+    assert settings.terabox_upload_concurrency == 3
+
+
 def test_environment_configuration_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TARGET_CHATS", "-1001, -1002,-1001")
     monkeypatch.setenv("DOWNLOAD_PHOTOS", "false")
