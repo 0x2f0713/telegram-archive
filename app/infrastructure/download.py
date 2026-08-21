@@ -216,7 +216,11 @@ class MediaDownloader:
                     await asyncio.to_thread(self._prepare_target, target, temp_path)
                     download_kwargs = {"file": str(temp_path)}
                     expected_total = getattr(record, "media_size", None)
-                    if expected_total is not None and expected_total >= MIN_SPEED_FILE_BYTES:
+                    if (
+                        self.proxy_manager is not None
+                        and expected_total is not None
+                        and expected_total >= MIN_SPEED_FILE_BYTES
+                    ):
                         rate_guard = DownloadRateGuard(expected_total)
 
                         def guarded_progress(

@@ -188,6 +188,49 @@ class OperationCommands:
 
         def report(filename: str, current: int, total: int, phase: str = "downloading") -> None:
             nonlocal pending_force, pending_update, reporter_task
+
+            if phase == "failed":
+                tasks.pop(filename, None)
+                for phase_name in ("downloading", "uploading", "preparing"):
+                    states.pop(f"{phase_name}:{filename}", None)
+                    last_report.pop(f"{phase_name}:{filename}", None)
+
+                downloading = [
+                    task for task in tasks.values() if task["status"] == "downloading"
+                ]
+                uploading = [task for task in tasks.values() if task["status"] == "uploading"]
+                preparing = [task for task in tasks.values() if task["status"] == "preparing"]
+                aggregate_download = round(sum(task["speed"] for task in downloading))
+                aggregate_upload = round(sum(task["speed"] for task in uploading))
+                pending_update = {
+                    "phase": (
+                        "downloading"
+                        if downloading
+                        else "preparing"
+                        if preparing
+                        else "uploading"
+                        if uploading
+                        else "idle"
+                    ),
+                    "detail": f"Transfer failed: {filename}",
+                    "download_filename": filename,
+                    "download_current": 0,
+                    "download_total": total,
+                    "download_percent": None,
+                    "download_speed": aggregate_download,
+                    "upload_speed": aggregate_upload,
+                    "transfer_speed": aggregate_download + aggregate_upload,
+                    "download_tasks": list(tasks.values()),
+                }
+                pending_force = True
+                if reporter_task is None or reporter_task.done():
+                    reporter_task = asyncio.create_task(
+                        publish(),
+                        name="operation-download-progress",
+                    )
+                    reporter_task.add_done_callback(publish_done)
+                return
+
             now = monotonic()
             # Throttle per file AND per phase so a download→upload transition is
             # never suppressed by the immediately preceding download report.

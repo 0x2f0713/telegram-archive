@@ -184,6 +184,37 @@ async def test_download_reporter_aggregates_speed_across_active_files(
     assert updates[-1]["download_speed"] == 0
 
 
+async def test_download_reporter_removes_terminally_failed_files(tmp_path: Path) -> None:
+    del tmp_path
+    updates: list[dict[str, object]] = []
+
+    class Context:
+        async def progress(self, **values: object) -> None:
+            updates.append(values)
+
+    reporter = OperationCommands._download_reporter(Context())  # type: ignore[arg-type]
+    for index in range(1, 11):
+        reporter(f"failed-{index}.mp4", 1024, 10_000)
+        await asyncio.sleep(0)
+
+    assert len(updates[-1]["download_tasks"]) == 10
+    reporter("failed-1.mp4", 0, 0, "failed")
+    await asyncio.sleep(0)
+
+    tasks = updates[-1]["download_tasks"]
+    assert isinstance(tasks, list)
+    assert len(tasks) == 9
+    assert all(task["filename"] != "failed-1.mp4" for task in tasks)
+    assert "failed-1.mp4" in str(updates[-1]["detail"])
+
+    for index in range(2, 11):
+        reporter(f"failed-{index}.mp4", 0, 0, "failed")
+        await asyncio.sleep(0)
+
+    assert updates[-1]["download_tasks"] == []
+    assert updates[-1]["phase"] == "idle"
+
+
 async def test_download_reporter_coalesces_callback_bursts(tmp_path: Path) -> None:
     del tmp_path
     updates: list[dict[str, object]] = []

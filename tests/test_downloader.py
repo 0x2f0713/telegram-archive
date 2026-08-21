@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from app.config import Settings
-from app.infrastructure.download import MediaDownloader
+from app.infrastructure.download import MIN_SPEED_FILE_BYTES, MediaDownloader
 from app.infrastructure.ffmpeg import FfmpegCapabilities
 from app.infrastructure.terabox import TeraBoxError, UploadReceipt
 
@@ -45,6 +45,13 @@ class ProgressMessage:
         await asyncio.to_thread(Path(file).write_bytes, b"complete")
         progress_callback(2, 8)
         progress_callback(8, 8)
+        return file
+
+
+class LargeProgressMessage:
+    async def download_media(self, *, file: str, progress_callback) -> str:
+        await asyncio.to_thread(Path(file).write_bytes, b"x" * MIN_SPEED_FILE_BYTES)
+        progress_callback(MIN_SPEED_FILE_BYTES, MIN_SPEED_FILE_BYTES)
         return file
 
 
@@ -97,6 +104,77 @@ async def test_download_forwards_per_file_progress(tmp_path: Path) -> None:
 
     assert result.completed
     assert updates == [(2, 8), (8, 8)]
+
+
+async def test_direct_large_download_does_not_apply_proxy_speed_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = RecordingRepository()
+    settings = Settings(_env_file=None, download_retries=1)
+    downloader = MediaDownloader(settings, repository)  # type: ignore[arg-type]
+    target = tmp_path / "42_large.bin"
+    record = type(
+        "Record",
+        (),
+        {"id": 1, "telegram_chat_id": 12345, "media_size": MIN_SPEED_FILE_BYTES},
+    )()
+
+    def unexpected_guard(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("direct downloads must not install the proxy speed guard")
+
+    monkeypatch.setattr(
+        "app.infrastructure.download.DownloadRateGuard.observe", unexpected_guard
+    )
+    result = await downloader.download(
+        record,
+        LargeProgressMessage(),
+        target,
+        lambda _current, _total: None,
+    )  # type: ignore[arg-type]
+
+    assert result.completed
+    assert target.is_file()
+
+
+async def test_proxy_large_download_keeps_speed_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = RecordingRepository()
+    settings = Settings(_env_file=None, download_retries=1)
+
+    class ProxyManager:
+        def begin_transfer(self) -> None:
+            return None
+
+        async def rotate(self) -> bool:
+            return False
+
+    downloader = MediaDownloader(
+        settings,
+        repository,  # type: ignore[arg-type]
+        proxy_manager=ProxyManager(),  # type: ignore[arg-type]
+    )
+    observed: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        "app.infrastructure.download.DownloadRateGuard.observe",
+        lambda _guard, current, total: observed.append((current, total)),
+    )
+    target = tmp_path / "42_large.bin"
+    record = type(
+        "Record",
+        (),
+        {"id": 1, "telegram_chat_id": 12345, "media_size": MIN_SPEED_FILE_BYTES},
+    )()
+
+    result = await downloader.download(
+        record,
+        LargeProgressMessage(),
+        target,
+        lambda _current, _total: None,
+    )  # type: ignore[arg-type]
+
+    assert result.completed
+    assert observed == [(MIN_SPEED_FILE_BYTES, MIN_SPEED_FILE_BYTES)]
 
 
 class FakeUploader:

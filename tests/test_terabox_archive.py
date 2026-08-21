@@ -80,7 +80,12 @@ class PublishingDownloader:
         return DownloadResult(True, buffered_path, buffered_path.stat().st_size)
 
 
-def _archive(settings: Settings, repository: RecordingRepository, downloader) -> ArchiveService:
+def _archive(
+    settings: Settings,
+    repository: RecordingRepository,
+    downloader,
+    progress=None,
+) -> ArchiveService:
     return ArchiveService(
         settings,
         repository,  # type: ignore[arg-type]
@@ -89,6 +94,7 @@ def _archive(settings: Settings, repository: RecordingRepository, downloader) ->
         content_types_of,
         lambda _error: None,
         lambda _error: False,
+        download_progress=progress,
     )
 
 
@@ -132,7 +138,15 @@ async def test_terabox_mode_publish_failure_records_failure(tmp_path: Path) -> N
     downloader = PublishingDownloader(
         repository, settings.terabox_remote_root, publish_error="upload refused"
     )
-    archive = _archive(settings, repository, downloader)
+    updates: list[tuple[str, int, int, str]] = []
+    archive = _archive(
+        settings,
+        repository,
+        downloader,
+        lambda filename, current, total, phase: updates.append(
+            (filename, current, total, phase)
+        ),
+    )
 
     target = output_path(settings.download_dir, chat, make_message())
     target.parent.mkdir(parents=True)
@@ -144,6 +158,7 @@ async def test_terabox_mode_publish_failure_records_failure(tmp_path: Path) -> N
     assert result.skipped is False
     assert repository.failed == ["upload refused"]
     assert repository.completed == []
+    assert updates == [(target.name, 0, 0, "failed")]
 
 
 async def test_terabox_mode_without_buffer_downloads_normally(tmp_path: Path) -> None:

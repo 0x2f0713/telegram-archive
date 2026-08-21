@@ -130,6 +130,12 @@ class ArchiveService:
             self.content_classifier(raw_message) & self.content_types
         )
 
+    def _report_terminal_failure(self, target: Path) -> None:
+        """Remove a terminally failed transfer from live operation progress."""
+
+        if self.download_progress:
+            self.download_progress(target.name, 0, 0, "failed")
+
     async def process_message(
         self, raw_message: object, chat: ChatInfo, *, edited: bool = False
     ) -> ProcessResult:
@@ -172,11 +178,19 @@ class ArchiveService:
                         def upload_progress(current: int, total: int) -> None:
                             self.download_progress(target.name, current, total, "uploading")
 
-                    publish_result = await self.downloader.publish_buffered(
-                        record.id, target, upload_progress
-                    )
+                    try:
+                        publish_result = await self.downloader.publish_buffered(
+                            record.id, target, upload_progress
+                        )
+                    except asyncio.CancelledError:
+                        self._report_terminal_failure(target)
+                        raise
+                    except Exception:
+                        self._report_terminal_failure(target)
+                        raise
                     if publish_result is not None and publish_result.completed:
                         return ProcessResult(created, True, False)
+                    self._report_terminal_failure(target)
                     return ProcessResult(created, False, False)
             elif not completed_path and await asyncio.to_thread(target.is_file):
                 completed_path = target
@@ -214,9 +228,16 @@ class ArchiveService:
                 def prepare_progress(current: int, total: int) -> None:
                     self.download_progress(target.name, current, total, "preparing")
 
-            result = await self.downloader.download(
-                record, raw_message, target, progress, upload_progress, prepare_progress
-            )
+            try:
+                result = await self.downloader.download(
+                    record, raw_message, target, progress, upload_progress, prepare_progress
+                )
+            except asyncio.CancelledError:
+                self._report_terminal_failure(target)
+                raise
+            except Exception:
+                self._report_terminal_failure(target)
+                raise
             if result.completed and result.path and result.size is not None:
                 logger.info(
                     "[%s] Downloaded %s (%s)",
@@ -226,6 +247,7 @@ class ArchiveService:
                 )
                 return ProcessResult(created, True, False)
 
+            self._report_terminal_failure(target)
             logger.error(
                 "[%s] Download failed for message %s: %s",
                 chat.title,
