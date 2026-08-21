@@ -40,6 +40,7 @@ from app.infrastructure.telegram.client import (
     create_readonly_client,
     resolve_accessible_chats,
 )
+from app.infrastructure.telegram.proxy import prepare_mtproto_proxy
 from app.utils.logging import format_bytes
 
 logger = logging.getLogger(__name__)
@@ -337,6 +338,7 @@ class ArchiveTui(App[None]):
         self.database = Database(self.settings.database_url)
         await self.database.initialize(legacy_terabox_root=self.settings.terabox_remote_root)
         self.settings = await _effective_settings(self.settings, self.database)
+        self.settings, _proxy_manager = await prepare_mtproto_proxy(self.settings)
         self.dashboard = DashboardRepository(self.database)
         self.archive = ArchiveRepository(self.database)
         self.selections = ChatSelectionRepository(self.database)

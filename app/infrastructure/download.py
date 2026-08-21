@@ -7,6 +7,7 @@ import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
+from time import monotonic
 from typing import Protocol
 
 from telethon.errors import FloodWaitError, RPCError
@@ -23,6 +24,7 @@ from app.infrastructure.ffmpeg import (
     transcode_hevc_to_h264,
 )
 from app.infrastructure.persistence.repository import ArchiveRepository
+from app.infrastructure.telegram.proxy import MTProtoProxyManager
 from app.infrastructure.terabox import TeraBoxError, UploadReceipt
 from app.infrastructure.transcode import POSTER_SUFFIX
 from app.infrastructure.video_cache import VideoRangeCache
@@ -31,7 +33,46 @@ from app.utils.file_lock import media_file_lock
 logger = logging.getLogger(__name__)
 DownloadProgressCallback = Callable[[int, int], None]
 
+MIN_SUSTAINED_SPEED_BYTES = 1_000_000
+MIN_SPEED_FILE_BYTES = 4 * 1024 * 1024
+SPEED_GRACE_BYTES = 1 * 1024 * 1024
+SPEED_GRACE_SECONDS = 3.0
+SPEED_LOW_DURATION_SECONDS = 5.0
+
 _VIDEO_SUFFIXES = frozenset({".mp4", ".mkv", ".mov", ".m4v", ".webm", ".avi"})
+
+
+class SlowDownloadError(ConnectionError):
+    """Raised when a sufficiently large transfer misses the speed floor."""
+
+
+class DownloadRateGuard:
+    """Check sustained per-file throughput while Telethon reports progress."""
+
+    def __init__(self, expected_total: int | None) -> None:
+        self.expected_total = expected_total or 0
+        self.started_at = monotonic()
+        self.low_since: float | None = None
+
+    def observe(self, current: int, total: int) -> None:
+        expected_total = total or self.expected_total
+        if expected_total < MIN_SPEED_FILE_BYTES:
+            return
+        now = monotonic()
+        if current < SPEED_GRACE_BYTES or now - self.started_at < SPEED_GRACE_SECONDS:
+            return
+        measured_bytes = max(0, current - SPEED_GRACE_BYTES)
+        measured_seconds = max(0.001, now - self.started_at - SPEED_GRACE_SECONDS)
+        speed = measured_bytes / measured_seconds
+        if speed < MIN_SUSTAINED_SPEED_BYTES:
+            self.low_since = self.low_since or now
+            if current >= expected_total or now - self.low_since >= SPEED_LOW_DURATION_SECONDS:
+                raise SlowDownloadError(
+                    f"sustained download speed {speed / 1_000_000:.2f} MB/s is below "
+                    f"the required {MIN_SUSTAINED_SPEED_BYTES / 1_000_000:.2f} MB/s"
+                )
+        else:
+            self.low_since = None
 
 
 class MediaUploader(Protocol):
@@ -51,11 +92,13 @@ class MediaDownloader:
         repository: ArchiveRepository,
         uploader: MediaUploader | None = None,
         video_cache: VideoRangeCache | None = None,
+        proxy_manager: MTProtoProxyManager | None = None,
     ) -> None:
         self.settings = settings
         self.repository = repository
         self.uploader = uploader
         self.video_cache = video_cache
+        self.proxy_manager = proxy_manager
         self._semaphore = asyncio.Semaphore(settings.download_concurrency)
         self._transcode_semaphore = asyncio.Semaphore(settings.transcode_concurrency)
         self._capabilities: FfmpegCapabilities | None = None
@@ -163,12 +206,31 @@ class MediaDownloader:
     ) -> DownloadResult:
         temp_path = target.with_name(f"{target.name}.part")
         async with self._semaphore:
-            for attempt in range(1, self.settings.download_retries + 1):
+            if self.proxy_manager is not None:
+                self.proxy_manager.begin_transfer()
+            attempt = 0
+            while attempt < self.settings.download_retries:
+                attempt += 1
                 try:
                     await self.repository.mark_download_start(record.id, target)
                     await asyncio.to_thread(self._prepare_target, target, temp_path)
                     download_kwargs = {"file": str(temp_path)}
-                    if progress is not None:
+                    expected_total = getattr(record, "media_size", None)
+                    if expected_total is not None and expected_total >= MIN_SPEED_FILE_BYTES:
+                        rate_guard = DownloadRateGuard(expected_total)
+
+                        def guarded_progress(
+                            current: int,
+                            total: int,
+                            _guard: DownloadRateGuard = rate_guard,
+                            _progress: DownloadProgressCallback | None = progress,
+                        ) -> None:
+                            _guard.observe(current, total)
+                            if _progress is not None:
+                                _progress(current, total)
+
+                        download_kwargs["progress_callback"] = guarded_progress
+                    elif progress is not None:
                         download_kwargs["progress_callback"] = progress
                     downloaded_path = await raw_message.download_media(  # type: ignore[attr-defined]
                         **download_kwargs
@@ -200,6 +262,16 @@ class MediaDownloader:
                 except asyncio.CancelledError:
                     await self.repository.mark_download_failed(record.id, "Download interrupted")
                     raise
+                except SlowDownloadError as exc:
+                    logger.warning("%s: %s", target.name, exc)
+                    if self.proxy_manager is not None and await self.proxy_manager.rotate():
+                        attempt -= 1
+                        continue
+                    error = f"SlowDownloadError: {exc}"
+                    if attempt == self.settings.download_retries:
+                        await self.repository.mark_download_failed(record.id, error)
+                        return DownloadResult(False, None, None, error)
+                    await asyncio.sleep(min(30, 2 ** (attempt - 1)))
                 except FloodWaitError as exc:
                     wait_seconds = max(1, int(exc.seconds))
                     logger.warning("Telegram FloodWait: waiting %s seconds", wait_seconds)

@@ -37,6 +37,7 @@ from app.infrastructure.telegram.client import (
     create_readonly_client,
     resolve_accessible_chats,
 )
+from app.infrastructure.telegram.proxy import prepare_mtproto_proxy
 from app.infrastructure.telegram.session_account import read_session_account_id
 from app.infrastructure.terabox import (
     TeraBoxMediaDeleter,
@@ -182,6 +183,7 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
         runtime_settings = RuntimeSettingsRepository(database)
         resolution = await load_runtime_settings(settings, runtime_settings)
         overridden = resolution.settings.with_terabox_policy()
+        overridden, proxy_manager = await prepare_mtproto_proxy(overridden)
         configure_logging(overridden.log_level)
         logger.info("SQLite connection pool active: %s", database.engine.sync_engine.pool.status())
         app.state.base_settings = settings
@@ -251,7 +253,12 @@ def create_web_app(settings: Settings | None = None) -> FastAPI:
             executors={},
         )
         operations.configure_executors(
-            OperationCommands(operations, database, video_cache=app.state.video_cache).executors()
+            OperationCommands(
+                operations,
+                database,
+                video_cache=app.state.video_cache,
+                proxy_manager=proxy_manager,
+            ).executors()
         )
         app.state.operations = operations
         app.state.account_user_id = read_session_account_id(overridden.tg_session_name)

@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from telethon import TelegramClient, types
+from telethon import TelegramClient, connection, types
 from telethon.crypto import AuthKey
 from telethon.errors import FloodWaitError, RPCError
 from telethon.sessions import MemorySession
@@ -111,6 +111,19 @@ def load_readonly_session(session_name: Path | str) -> ReadOnlySession:
         connection.close()
 
 
+def _network_options(settings: Settings) -> dict[str, object]:
+    """Build the optional Telethon MTProto-proxy connection settings."""
+
+    proxy = settings.mtproto_proxy_config
+    if proxy is None:
+        return {}
+    logger.info("Telegram MTProto proxy enabled for %s:%s", proxy[0], proxy[1])
+    return {
+        "connection": connection.ConnectionTcpMTProxyRandomizedIntermediate,
+        "proxy": proxy,
+    }
+
+
 def create_client(settings: Settings) -> TelegramClient:
     api_id, api_hash = settings.require_telegram_credentials()
     session_path = settings.tg_session_name.expanduser()
@@ -125,6 +138,7 @@ def create_client(settings: Settings) -> TelegramClient:
         request_retries=5,
         flood_sleep_threshold=60,
         catch_up=True,
+        **_network_options(settings),
     )
 
 
@@ -146,6 +160,7 @@ def create_readonly_client(settings: Settings) -> TelegramClient:
         retry_delay=2,
         request_retries=5,
         flood_sleep_threshold=60,
+        **_network_options(settings),
     )
 
 

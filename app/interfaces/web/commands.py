@@ -45,6 +45,7 @@ from app.infrastructure.telegram.client import (
     is_transient_telegram_error,
     resolve_accessible_chats,
 )
+from app.infrastructure.telegram.proxy import MTProtoProxyManager
 from app.infrastructure.telegram.translation import content_types_of, message_data
 from app.infrastructure.terabox import TeraBoxClient, TeraBoxUploader, create_terabox_client
 from app.infrastructure.transcode import POSTER_SUFFIX, is_faststart
@@ -66,6 +67,7 @@ class OperationCommands:
         database: Database,
         readonly_client_factory: Callable[[Settings], Any] = create_readonly_client,
         video_cache: Any | None = None,
+        proxy_manager: MTProtoProxyManager | None = None,
     ) -> None:
         self.manager = manager
         self.database = database
@@ -73,6 +75,7 @@ class OperationCommands:
         #: Short-lived operations share the account without writing the session
         #: file, so they never lock the archiver's Telethon SQLite session.
         self.readonly_client_factory = readonly_client_factory
+        self.proxy_manager = proxy_manager
 
     @property
     def settings(self) -> Settings:
@@ -131,7 +134,11 @@ class OperationCommands:
 
         repository = ArchiveRepository(self.database)
         downloader = MediaDownloader(
-            self.settings, repository, self._terabox_uploader(), self.video_cache
+            self.settings,
+            repository,
+            self._terabox_uploader(),
+            self.video_cache,
+            self.proxy_manager,
         )
         return (
             repository,
@@ -317,6 +324,8 @@ class OperationCommands:
         content_types = self._content_types(context.parameters)
         repository, archive = self._archive_stack(content_types, self._download_reporter(context))
         client = self.readonly_client_factory(self.settings)
+        if self.proxy_manager is not None:
+            self.proxy_manager.attach(client)
         try:
             await context.progress(
                 force=True,
@@ -429,6 +438,8 @@ class OperationCommands:
         content_types = self._content_types(context.parameters)
         repository, archive = self._archive_stack(content_types, self._download_reporter(context))
         client = self.readonly_client_factory(self.settings)
+        if self.proxy_manager is not None:
+            self.proxy_manager.attach(client)
         try:
             await context.progress(
                 force=True,
@@ -473,6 +484,8 @@ class OperationCommands:
         content_types = self._content_types(context.parameters)
         repository, archive = self._archive_stack(content_types, self._download_reporter(context))
         client = self.readonly_client_factory(self.settings)
+        if self.proxy_manager is not None:
+            self.proxy_manager.attach(client)
         try:
             await context.progress(
                 force=True,
@@ -624,6 +637,8 @@ class OperationCommands:
                 return
 
         client = self.readonly_client_factory(self.settings)
+        if self.proxy_manager is not None:
+            self.proxy_manager.attach(client)
         repository, _archive = self._archive_stack()
         try:
             await connect_authorized(client)

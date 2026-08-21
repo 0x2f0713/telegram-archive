@@ -4,12 +4,17 @@ This how-to guide is for developers and operators integrating Telegram Archiver 
 
 ## Runtime contract
 
-The application requires Python 3.12+, writable persistent storage, outbound access to Telegram, and this environment contract. `TG_API_HASH`, `WEB_SESSION_SECRET`, and the resulting Telegram session data are secrets in this example:
+The application requires Python 3.12+, writable persistent storage, outbound access to Telegram, and this environment contract. `TG_API_HASH`, `TG_MTPROTO_PROXY` when configured, `WEB_SESSION_SECRET`, and the resulting Telegram session data are secrets in this example:
 
 ```dotenv
 TG_API_ID=123456
 TG_API_HASH=private_value
 TG_SESSION_NAME=/persistent/data/telegram_session
+# Optional: a current tg://proxy?... or https://t.me/proxy?... link.
+TG_MTPROTO_PROXY_AUTO=true
+TG_MTPROTO_PROXY_PROVIDER_URL=https://mtpro.xyz/mtproto
+# Optional exact override; leave blank for automatic discovery.
+TG_MTPROTO_PROXY=
 DATABASE_URL=sqlite:////persistent/data/archive.db
 DOWNLOAD_DIR=/persistent/downloads
 TARGET_CHATS=-1001234567890
@@ -22,6 +27,8 @@ TUI_REFRESH_SECONDS=5
 ```
 
 Configuration precedence is: constructor arguments used by an embedding process, environment variables, values from `.env`, then code defaults. `TARGET_CHATS` and enabled entries in `CONFIG_FILE` are merged. YAML is only a chat-selection source and cannot carry credentials.
+
+The application already uses Telegram's MTProto API directly. Automatic discovery uses MTPro.XYZ, applies a selected proxy to every Telethon client including media downloads, and rotates candidates when sufficiently large transfers remain below 1,000,000 bytes/s. This is an enforced best-effort floor, not a guarantee against external network conditions or Telegram rate limits.
 
 Chat selection has a separate durable policy layer. With no `archive_selection_policy` row, workers use the merged environment/YAML IDs. An operator can save `specific` or `all` mode from the web Chats page or TUI; that SQLite policy then overrides environment targets for every process using the database. Selecting **Environment defaults** deletes the override. `all` means all dialogs returned by Telegram to the authenticated account at each worker startup, not all cached rows and never inaccessible entities.
 

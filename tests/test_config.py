@@ -45,6 +45,33 @@ def test_missing_credentials_do_not_expose_secrets() -> None:
         settings.require_telegram_credentials()
 
 
+def test_mtproto_proxy_link_is_parsed_without_losing_secret() -> None:
+    settings = Settings(
+        _env_file=None,
+        tg_mtproto_proxy=(
+            "https://t.me/proxy?server=proxy.example&port=443&"
+            "secret=ee00000000000000000000000000000000"
+        ),
+    )
+
+    assert settings.mtproto_proxy_config == (
+        "proxy.example",
+        443,
+        "ee00000000000000000000000000000000",
+    )
+
+
+def test_invalid_mtproto_proxy_link_fails_without_exposing_secret() -> None:
+    settings = Settings(
+        _env_file=None,
+        tg_mtproto_proxy="tg://proxy?server=proxy.example&port=443&secret=too-short",
+    )
+
+    with pytest.raises(ConfigurationError, match="secret") as error:
+        _ = settings.mtproto_proxy_config
+    assert "too-short" not in str(error.value)
+
+
 def test_yaml_enabled_must_be_boolean(tmp_path: Path) -> None:
     yaml_file = tmp_path / "chats.yml"
     yaml_file.write_text("chats:\n  - id: -1001\n    enabled: 'false'\n", encoding="utf-8")

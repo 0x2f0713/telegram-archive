@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 from functools import cached_property
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import parse_qs, urlparse
 
 import yaml
 from pydantic import Field, SecretStr, ValidationError, field_validator
@@ -79,6 +82,16 @@ class Settings(BaseSettings):
     tg_api_id: int | None = None
     tg_api_hash: SecretStr | None = None
     tg_session_name: Path = Path("data/telegram_session")
+    #: Optional MTProto proxy link copied from Telegram or MTPro.XYZ. The
+    #: value is secret-bearing and therefore stays environment-only.
+    tg_mtproto_proxy: SecretStr | None = None
+    #: Automatically discover and probe proxies from the configured provider
+    #: when no explicit TG_MTPROTO_PROXY link is supplied.
+    tg_mtproto_proxy_auto: bool = True
+    tg_mtproto_proxy_provider_url: str = "https://mtpro.xyz/mtproto"
+    tg_mtproto_proxy_cache_file: Path = Path("data/mtproto_proxy_cache.json")
+    tg_mtproto_proxy_probe_limit: int = Field(default=24, ge=1, le=100)
+    tg_mtproto_proxy_connect_timeout: int = Field(default=10, ge=2, le=60)
 
     target_chats: str = ""
     config_file: Path | None = None
@@ -203,6 +216,75 @@ class Settings(BaseSettings):
                 "and add credentials from https://my.telegram.org."
             )
         return self.tg_api_id, api_hash
+
+    @property
+    def mtproto_proxy_config(self) -> tuple[str, int, str] | None:
+        """Return ``(host, port, secret)`` for an optional MTProto proxy.
+
+        Telegram and public proxy lists commonly expose either a ``tg://``
+        link or an HTTPS deep link. Keeping the link in one environment value
+        avoids separately handling a host, port, and secret in deployment
+        configuration while still allowing Pydantic to redact it.
+        """
+
+        if self.tg_mtproto_proxy is None:
+            return None
+        raw = self.tg_mtproto_proxy.get_secret_value().strip()
+        if not raw:
+            return None
+
+        parsed = urlparse(raw)
+        if parsed.scheme not in {"tg", "http", "https"}:
+            raise ConfigurationError(
+                "TG_MTPROTO_PROXY must be a tg://proxy or https://t.me/proxy link"
+            )
+        if parsed.scheme == "tg" and parsed.netloc.casefold() != "proxy":
+            raise ConfigurationError("TG_MTPROTO_PROXY must use the tg://proxy link format")
+        if parsed.scheme in {"http", "https"} and parsed.path.rstrip("/").casefold() != "/proxy":
+            raise ConfigurationError("TG_MTPROTO_PROXY must use a Telegram /proxy link")
+
+        values = parse_qs(parsed.query, keep_blank_values=True)
+
+        def required_query_value(name: str) -> str:
+            entries = values.get(name, [])
+            if len(entries) != 1 or not entries[0].strip():
+                raise ConfigurationError(
+                    f"TG_MTPROTO_PROXY must contain exactly one non-empty {name} value"
+                )
+            return entries[0].strip()
+
+        host = required_query_value("server")
+        raw_port = required_query_value("port")
+        secret = required_query_value("secret")
+        try:
+            port = int(raw_port)
+        except ValueError:
+            raise ConfigurationError("TG_MTPROTO_PROXY port must be an integer") from None
+        if not 1 <= port <= 65535:
+            raise ConfigurationError("TG_MTPROTO_PROXY port must be between 1 and 65535")
+
+        self._validate_mtproto_secret(secret)
+        return host, port, secret
+
+    @staticmethod
+    def _validate_mtproto_secret(secret: str) -> None:
+        """Validate the part of an MTProxy secret Telethon will consume."""
+
+        candidate = secret[2:] if secret[:2].casefold() in {"ee", "dd"} else secret
+        try:
+            decoded = bytes.fromhex(candidate)
+        except ValueError:
+            try:
+                padded = candidate + "=" * (-len(candidate) % 4)
+                decoded = base64.b64decode(padded.encode("ascii"), validate=True)
+            except (UnicodeEncodeError, ValueError, binascii.Error):
+                raise ConfigurationError(
+                    "TG_MTPROTO_PROXY contains an invalid MTProto secret"
+                ) from None
+        if len(decoded) < 16:
+            raise ConfigurationError(
+                "TG_MTPROTO_PROXY secret must contain at least 16 decoded bytes"
+            )
 
     @property
     def terabox_enabled(self) -> bool:

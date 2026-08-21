@@ -46,6 +46,7 @@ from app.infrastructure.telegram.client import (
     login,
     resolve_accessible_chats,
 )
+from app.infrastructure.telegram.proxy import MTProtoProxyManager, prepare_mtproto_proxy
 from app.infrastructure.telegram.translation import content_types_of, message_data
 from app.infrastructure.terabox import TeraBoxUploader, create_terabox_client
 from app.utils.logging import configure_logging, format_bytes
@@ -173,8 +174,15 @@ async def _archive_stack(
     database = Database(settings.database_url)
     await database.initialize()
     repository = ArchiveRepository(database)
-    effective = await _effective_settings(settings, database)
-    downloader = MediaDownloader(effective, repository, _terabox_uploader(effective))
+    try:
+        effective = await _effective_settings(settings, database)
+        effective, proxy_manager = await prepare_mtproto_proxy(effective)
+    except Exception:
+        await database.close()
+        raise
+    downloader = MediaDownloader(
+        effective, repository, _terabox_uploader(effective), proxy_manager=proxy_manager
+    )
     return (
         database,
         repository,
@@ -192,12 +200,17 @@ async def _archive_stack(
     )
 
 
+def _proxy_manager_for_archive(archive: ArchiveService) -> MTProtoProxyManager | None:
+    return getattr(getattr(archive, "downloader", None), "proxy_manager", None)
+
+
 @app.command("login")
 def login_command() -> None:
     """Interactively authenticate and save the local Telethon session."""
 
     async def command() -> None:
         settings = _settings()
+        settings, _proxy_manager = await prepare_mtproto_proxy(settings)
         client = create_client(settings)
         try:
             await login(client)
@@ -213,6 +226,7 @@ def chats_command() -> None:
 
     async def command() -> None:
         settings = _settings()
+        settings, _proxy_manager = await prepare_mtproto_proxy(settings)
         database = Database(settings.database_url)
         repository = ArchiveRepository(database)
         selection_service = _chat_selection_service(settings, repository)
@@ -271,6 +285,9 @@ def sync_command(
 
         database, repository, archive, effective = await _archive_stack(settings, selected_types)
         client = create_readonly_client(effective)
+        proxy_manager = _proxy_manager_for_archive(archive)
+        if proxy_manager is not None:
+            proxy_manager.attach(client)
         try:
             await connect_authorized(client)
             all_chats = await _chat_selection_service(effective, repository).resolve_with_client(
@@ -330,6 +347,9 @@ def listen_command(
         selected_types = _parse_content_types(content_types)
         database, repository, archive, effective = await _archive_stack(settings, selected_types)
         client = create_client(effective)
+        proxy_manager = _proxy_manager_for_archive(archive)
+        if proxy_manager is not None:
+            proxy_manager.attach(client)
         try:
             await connect_authorized(client)
             chats = await _chat_selection_service(effective, repository).resolve_with_client(client)
@@ -504,6 +524,9 @@ def retry_failed_command(
         selected_types = _parse_content_types(content_types)
         database, repository, archive, effective = await _archive_stack(settings, selected_types)
         client = create_readonly_client(effective)
+        proxy_manager = _proxy_manager_for_archive(archive)
+        if proxy_manager is not None:
+            proxy_manager.attach(client)
         try:
             await connect_authorized(client)
             chats = await _chat_selection_service(effective, repository).resolve_with_client(client)
@@ -529,6 +552,7 @@ def doctor_command() -> None:
 
     async def command() -> None:
         settings = _settings()
+        settings, _proxy_manager = await prepare_mtproto_proxy(settings)
         checks: list[tuple[str, str, str]] = []
         failed = False
 

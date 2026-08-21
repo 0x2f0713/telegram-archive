@@ -34,6 +34,21 @@ Telegram currently permits one `api_id` per phone number. If the page already sh
 
 The `API_HASH` is a secret. Telegram login codes, a 2FA password, and the resulting Telethon `.session` file are also secrets. Never paste them into logs, issue trackers, shell history, or source control.
 
+### Automatic MTProto proxy
+
+The archiver already uses Telegram's MTProto API directly. By default it now fetches current proxy entries from [MTPro.XYZ's MTProto list](https://mtpro.xyz/mtproto), probes reachable candidates, and applies the fastest reachable proxy to every Telegram client. An MTProto proxy changes the network route; it does not remove Telegram rate limits and cannot guarantee a bandwidth floor when the public proxies are overloaded.
+
+```dotenv
+TG_MTPROTO_PROXY_AUTO=true
+TG_MTPROTO_PROXY_PROVIDER_URL=https://mtpro.xyz/mtproto
+TG_MTPROTO_PROXY_PROBE_LIMIT=24
+TG_MTPROTO_PROXY_CONNECT_TIMEOUT=10
+```
+
+For sufficiently large files (at least 4 MiB), downloads enforce a sustained minimum of 1,000,000 bytes/s after startup grace. If a transfer remains below that rate, the worker reconnects through another discovered candidate and retries. If no candidate meets the threshold, the file is marked failed rather than silently using a direct connection.
+
+To bypass discovery and use one exact proxy, set `TG_MTPROTO_PROXY` to a current `tg://proxy?...` or `https://t.me/proxy?...` link. The link contains a proxy secret; never commit it.
+
 ## Local installation
 
 ```bash

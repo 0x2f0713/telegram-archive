@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
   "Telethon>=1.36,<2",
+  "python-socks[asyncio]>=2.5,<3",
   "SQLAlchemy>=2.0,<3",
   "aiosqlite>=0.20,<1",
   "pydantic>=2.9,<3",
